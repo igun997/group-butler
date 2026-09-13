@@ -140,9 +140,10 @@ func (p *fakePairingStore) Clear(_ context.Context, _, id string) error {
 // fakeDeviceStore stands in for the SQL auth store: it hands out devices and
 // records deletions, which is the only part of the store logout touches.
 type fakeDeviceStore struct {
-	mu      sync.Mutex
-	device  *store.Device
-	deleted []*store.Device
+	mu        sync.Mutex
+	device    *store.Device
+	deleted   []*store.Device
+	deleteErr error
 }
 
 func (d *fakeDeviceStore) NewDevice() *store.Device {
@@ -163,6 +164,9 @@ func (d *fakeDeviceStore) GetAllDevices(context.Context) ([]*store.Device, error
 func (d *fakeDeviceStore) DeleteDevice(_ context.Context, device *store.Device) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.deleteErr != nil {
+		return d.deleteErr
+	}
 	d.deleted = append(d.deleted, device)
 	return nil
 }
@@ -178,6 +182,7 @@ type fakeClient struct {
 	logouts     int
 	qr          chan whatsmeow.QRChannelItem
 	pairCode    string
+	logoutErr   error
 }
 
 func newFakeClient() *fakeClient {
@@ -201,7 +206,7 @@ func (c *fakeClient) Logout(context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.logouts++
-	return nil
+	return c.logoutErr
 }
 func (c *fakeClient) IsConnected() bool { return true }
 func (c *fakeClient) GetQRChannel(context.Context) (<-chan whatsmeow.QRChannelItem, error) {
@@ -426,5 +431,88 @@ func TestRestoreInstancesReconnectsOnlyOwnDevice(t *testing.T) {
 	client.mu.Unlock()
 	if connects != 1 {
 		t.Errorf("connects = %d, want 1", connects)
+	}
+}
+
+// ---- DELETE must not claim success before cleanup succeeds (blocker 2) ----
+
+func TestDeleteInstanceKeepsTheRowWhenLogoutFails(t *testing.T) {
+	phone := types.NewJID("628990000001:5", types.DefaultUserServer)
+	repo := newFakeInstanceRepo(InstanceRow{
+		ID: "inst_1", OrganizationID: "org_default", Label: "Bot",
+		Mode: modeQR, Status: stateConnected, PhoneNumber: "628990000001",
+	})
+	devices := &fakeDeviceStore{device: &store.Device{ID: &phone}}
+	client := newFakeClient()
+	client.logoutErr = errors.New("whatsapp refused the logout")
+	mgr := testManager(repo, newFakePairingStore(), devices, client)
+	defer mgr.shutdown(context.Background())
+	mgr.put(newSession(mgr, InstanceRow{ID: "inst_1", OrganizationID: "org_default", Mode: modeQR}, &store.Device{ID: &phone}, client))
+
+	rec := callJSON(t, mgr.api(), http.MethodDelete, "/instances/inst_1", "dev-secret", "")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 when logout fails: %s", rec.Code, rec.Body.String())
+	}
+	repo.mu.Lock()
+	deleted := repo.deleted["inst_1"]
+	repo.mu.Unlock()
+	if deleted {
+		t.Fatal("the row was soft-deleted even though logout failed")
+	}
+	if mgr.get("inst_1") == nil {
+		t.Fatal("the live session was discarded on a failed logout")
+	}
+	if rec := callJSON(t, mgr.api(), http.MethodGet, "/instances/inst_1", "dev-secret", ""); rec.Code != http.StatusOK {
+		t.Fatalf("instance unreadable after a failed delete: %d", rec.Code)
+	}
+}
+
+func TestDeleteInstanceKeepsTheRowWhenDeviceDeleteFails(t *testing.T) {
+	phone := types.NewJID("628990000001:5", types.DefaultUserServer)
+	repo := newFakeInstanceRepo(InstanceRow{
+		ID: "inst_1", OrganizationID: "org_default", Label: "Bot",
+		Mode: modeQR, Status: stateConnected, PhoneNumber: "628990000001",
+	})
+	devices := &fakeDeviceStore{device: &store.Device{ID: &phone}, deleteErr: errors.New("auth store write failed")}
+	client := newFakeClient()
+	// Nothing is linked yet, so logout is a no-op; the device delete is the
+	// step that fails and must stop the deletion.
+	client.logoutErr = whatsmeow.ErrNotLoggedIn
+	mgr := testManager(repo, newFakePairingStore(), devices, client)
+	defer mgr.shutdown(context.Background())
+	mgr.put(newSession(mgr, InstanceRow{ID: "inst_1", OrganizationID: "org_default", Mode: modeQR}, &store.Device{ID: &phone}, client))
+
+	rec := callJSON(t, mgr.api(), http.MethodDelete, "/instances/inst_1", "dev-secret", "")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 when the auth device cannot be deleted: %s", rec.Code, rec.Body.String())
+	}
+	repo.mu.Lock()
+	deleted := repo.deleted["inst_1"]
+	repo.mu.Unlock()
+	if deleted {
+		t.Fatal("the row was soft-deleted even though the auth device was not deleted")
+	}
+}
+
+func TestDeleteInstanceSucceedsWhenNothingIsLinkedYet(t *testing.T) {
+	repo := newFakeInstanceRepo(InstanceRow{
+		ID: "inst_1", OrganizationID: "org_default", Label: "Bot",
+		Mode: modeQR, Status: statePairing, PhoneNumber: "",
+	})
+	client := newFakeClient()
+	client.logoutErr = whatsmeow.ErrNotLoggedIn
+	mgr := testManager(repo, newFakePairingStore(), &fakeDeviceStore{}, client)
+	defer mgr.shutdown(context.Background())
+	mgr.put(newSession(mgr, InstanceRow{ID: "inst_1", OrganizationID: "org_default", Mode: modeQR}, &store.Device{}, client))
+
+	rec := callJSON(t, mgr.api(), http.MethodDelete, "/instances/inst_1", "dev-secret", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for an instance that was never linked: %s", rec.Code, rec.Body.String())
+	}
+	repo.mu.Lock()
+	deleted := repo.deleted["inst_1"]
+	repo.mu.Unlock()
+	if !deleted {
+		t.Fatal("an unlinked instance must still be deletable")
 	}
 }

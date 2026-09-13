@@ -205,6 +205,9 @@ func (a *api) writeInstanceError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "label_conflict", err.Error())
 	case errors.Is(err, errWrongMode), errors.Is(err, errPairingNotReady):
 		writeError(w, http.StatusConflict, "invalid_state", err.Error())
+	case errors.Is(err, errLogoutFailed), errors.Is(err, errDeviceDeleteFailed), errors.Is(err, errCleanupFailed):
+		// Recoverable: nothing was soft-deleted, so the owner may retry.
+		writeError(w, http.StatusBadGateway, "instance_cleanup_failed", err.Error())
 	case errors.Is(err, errInvalidRequest):
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 	default:

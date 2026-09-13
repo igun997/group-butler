@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -47,6 +48,12 @@ var (
 	errLabelConflict    = errors.New("instance label already exists")
 	errWrongMode        = errors.New("instance is not in code-pairing mode")
 	errPairingNotReady  = errors.New("pairing is not ready for a code yet")
+
+	// Cleanup errors are recoverable: DELETE failed, but the instance and its
+	// credentials are still in the state they were, so the owner can retry.
+	errLogoutFailed       = errors.New("logout failed")
+	errDeviceDeleteFailed = errors.New("delete auth device failed")
+	errCleanupFailed      = errors.New("cleanup failed")
 )
 
 // InstanceRow is the worker's view of one `instances` document: the identity
@@ -600,7 +607,10 @@ func (m *manager) createInstance(ctx context.Context, req createInstanceRequest)
 
 // deleteInstance is the one path that must invalidate a device: log out,
 // delete the auth device, clear pairing material and soft-delete the row
-// (§6.5). Graceful shutdown deliberately does none of this.
+// (§6.5). Each step is a precondition for the next: a failed logout or device
+// deletion leaves the row and the session untouched so the owner can retry,
+// because claiming a soft-delete over a live credential would hide a device
+// that still exists. Graceful shutdown deliberately does none of this.
 func (m *manager) deleteInstance(ctx context.Context, id string) error {
 	row, err := m.instances.Get(ctx, m.orgID, id)
 	if err != nil {
@@ -610,29 +620,57 @@ func (m *manager) deleteInstance(ctx context.Context, id string) error {
 		return errInstanceNotFound
 	}
 	if s := m.get(id); s != nil {
-		s.mu.Lock()
-		client := s.client
-		s.mu.Unlock()
-		if client != nil {
-			if err := client.Logout(ctx); err != nil {
-				logf("instance %s: logout: %v", id, err)
-			}
+		if err := m.logoutSession(ctx, s); err != nil {
+			return err
 		}
-		m.discard(s)
 	}
-	if phone := normalizePhone(row.PhoneNumber); phone != "" {
-		if device, err := m.deviceForPhone(ctx, phone); err != nil {
-			logf("instance %s: find auth device: %v", id, err)
-		} else if device != nil {
-			if err := m.devices.DeleteDevice(ctx, device); err != nil {
-				logf("instance %s: delete auth device: %v", id, err)
-			}
-		}
+	if err := m.deleteAuthDevice(ctx, *row); err != nil {
+		return err
 	}
 	if err := m.pairing.Clear(ctx, m.orgID, id); err != nil {
-		logf("instance %s: clear pairing material: %v", id, err)
+		return fmt.Errorf("%w: clear pairing material: %v", errCleanupFailed, err)
 	}
 	return m.instances.SoftDelete(ctx, m.orgID, id)
+}
+
+// logoutSession invalidates one linked device. ErrNotLoggedIn means there is
+// nothing to unlink — an unpaired instance — which is a success, not a failure;
+// any other error leaves the session live and is reported so DELETE can refuse.
+func (m *manager) logoutSession(ctx context.Context, s *session) error {
+	s.mu.Lock()
+	client := s.client
+	s.mu.Unlock()
+	if client == nil {
+		m.discard(s)
+		return nil
+	}
+	if err := client.Logout(ctx); err != nil && !errors.Is(err, whatsmeow.ErrNotLoggedIn) {
+		return fmt.Errorf("%w: %v", errLogoutFailed, err)
+	}
+	m.discard(s)
+	return nil
+}
+
+// deleteAuthDevice removes the stored credential for the instance's own phone.
+// A successful Logout already deleted it, so this only finds work in the
+// not-logged-in case (an orphaned device row); a store error is reported rather
+// than ignored.
+func (m *manager) deleteAuthDevice(ctx context.Context, row InstanceRow) error {
+	phone := normalizePhone(row.PhoneNumber)
+	if phone == "" {
+		return nil
+	}
+	device, err := m.deviceForPhone(ctx, phone)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errDeviceDeleteFailed, err)
+	}
+	if device == nil {
+		return nil
+	}
+	if err := m.devices.DeleteDevice(ctx, device); err != nil {
+		return fmt.Errorf("%w: %v", errDeviceDeleteFailed, err)
+	}
+	return nil
 }
 
 // ---- Mongo repositories --------------------------------------------------
