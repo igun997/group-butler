@@ -253,3 +253,80 @@ func (s *groupStore) FindOne(ctx context.Context, orgID, instanceID, groupJID st
 	}
 	return &doc
 }
+
+// ListForInstance is the R11 read model: every group this instance has observed,
+// with its ID and current name. Assigned groups come first, then the most
+// recently active — the order the dashboard list renders and the order the
+// canonical index serves (§5.1). The returned stamp is the newest sync any row
+// has seen, which is what the dashboard shows as "last synced".
+func (s *groupStore) ListForInstance(ctx context.Context, orgID, instanceID string) ([]groupListRow, *string, error) {
+	cursor, err := s.coll.Find(ctx, bson.D{
+		{Key: "organizationId", Value: orgID},
+		{Key: "instanceId", Value: instanceID},
+	}, options.Find().SetSort(bson.D{
+		{Key: "config.assigned", Value: -1},
+		{Key: "observed.lastActivityAt", Value: -1},
+	}))
+	if err != nil {
+		return nil, nil, fmt.Errorf("list groups for %s/%s: %w", orgID, instanceID, err)
+	}
+	defer func() { _ = cursor.Close(ctx) }()
+
+	rows := make([]groupListRow, 0, 8)
+	var newest time.Time
+	var syncedAt *string
+	for cursor.Next(ctx) {
+		var doc groupDoc
+		if err := cursor.Decode(&doc); err != nil {
+			return nil, nil, fmt.Errorf("decode group row: %w", err)
+		}
+		if last := doc.Observed.LastSyncedAt; last.After(newest) {
+			newest = last
+			stamp := last.UTC().Format(time.RFC3339)
+			syncedAt = &stamp
+		}
+		rows = append(rows, rowFromDoc(&doc))
+	}
+	if err := cursor.Err(); err != nil {
+		return nil, nil, fmt.Errorf("iterate groups for %s/%s: %w", orgID, instanceID, err)
+	}
+	return rows, syncedAt, nil
+}
+
+// rowFromDoc projects a stored document into the wire row. It is the one place
+// that decides what the dashboard sees, so an unknown name is always labelled
+// rather than served as an empty string with no explanation (§6.6.6).
+func rowFromDoc(doc *groupDoc) groupListRow {
+	row := groupListRow{
+		GroupJID:         doc.GroupJID,
+		Name:             doc.Observed.Subject,
+		NameSource:       nameSource(doc.Observed),
+		NameSetBy:        doc.Observed.SubjectSetBy,
+		ParticipantCount: doc.Observed.ParticipantCount,
+		IsAnnounce:       doc.Observed.IsAnnounce,
+		IsLocked:         doc.Observed.IsLocked,
+		State:            string(doc.Observed.State),
+		MessageCount:     doc.Observed.MessageCount,
+		Assigned:         doc.Config.Assigned,
+		Whitelisted:      doc.Config.Whitelisted,
+	}
+	if !doc.Observed.SubjectUpdatedAt.IsZero() {
+		stamp := doc.Observed.SubjectUpdatedAt.UTC().Format(time.RFC3339)
+		row.NameSetAt = &stamp
+	}
+	if !doc.Observed.LastActivityAt.IsZero() {
+		stamp := doc.Observed.LastActivityAt.UTC().Format(time.RFC3339)
+		row.LastActivityAt = &stamp
+	}
+	return row
+}
+
+// nameSource reports where the row's name came from. A missing name is reported
+// as a fallback even if no source was ever recorded: the dashboard must be able
+// to say "we do not know this group's name yet" instead of showing a blank.
+func nameSource(o Observed) string {
+	if o.Subject == "" || o.SubjectSource == "" {
+		return string(SubjectFromFallback)
+	}
+	return string(o.SubjectSource)
+}

@@ -19,17 +19,18 @@ type groupClient interface {
 
 // SyncSummary is the §6.6.6 report of one full sync: what the snapshot held and
 // what it changed. `Unchanged` is the write-amplification witness — a steady
-// state must not look like work.
+// state must not look like work. The JSON tags are the wire spelling the BFF
+// mirrors in `packages/shared`.
 type SyncSummary struct {
-	Source          SyncSource
-	DurationMs      int64
-	Total           int
-	Added           int
-	SubjectUpdated  int
-	MetadataUpdated int
-	MarkedLeft      int
-	SubjectRejected int
-	Unchanged       int
+	Source          SyncSource `json:"source"`
+	DurationMs      int64      `json:"durationMs"`
+	Total           int        `json:"total"`
+	Added           int        `json:"added"`
+	SubjectUpdated  int        `json:"subjectUpdated"`
+	MetadataUpdated int        `json:"metadataUpdated"`
+	MarkedLeft      int        `json:"markedLeft"`
+	SubjectRejected int        `json:"subjectRejected"`
+	Unchanged       int        `json:"unchanged"`
 }
 
 // runGroupSync performs the authoritative membership snapshot (§6.6.5):
