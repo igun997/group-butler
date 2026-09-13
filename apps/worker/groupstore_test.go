@@ -101,6 +101,9 @@ func TestUpsertGroupFromSync_SeedsDefaultsOnInsert(t *testing.T) {
 	if doc.CreatedAt.IsZero() || doc.UpdatedAt.IsZero() {
 		t.Error("createdAt/updatedAt must be stamped on insert")
 	}
+	if doc.Observed.SubjectHistory == nil {
+		t.Error("subjectHistory must persist as an array, not null: the read model expects the documented ring")
+	}
 }
 
 func TestUpsertGroupFromSync_IsIdempotent(t *testing.T) {

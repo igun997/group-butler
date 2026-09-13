@@ -79,6 +79,14 @@ var counterFields = map[string]bool{
 // claim the group was just synced, or the staleness/repair threshold computed
 // from `lastSyncedAt` would never fire again.
 func observedFields(o Observed, fromSync bool) bson.D {
+	// A nil slice marshals to BSON null, and the read model expects the
+	// documented ring: a group with no renames yet must have an empty array, not
+	// a null the BFF would have to special-case (and cannot fix — it never writes
+	// observed.*).
+	history := o.SubjectHistory
+	if history == nil {
+		history = []SubjectHistoryEntry{}
+	}
 	fields := bson.D{
 		{Key: "observed.subject", Value: o.Subject},
 		{Key: "observed.subjectSearch", Value: o.SubjectSearch},
@@ -87,7 +95,7 @@ func observedFields(o Observed, fromSync bool) bson.D {
 		{Key: "observed.subjectSetBy", Value: o.SubjectSetBy},
 		{Key: "observed.subjectSetByLid", Value: o.SubjectSetByLID},
 		{Key: "observed.subjectSource", Value: o.SubjectSource},
-		{Key: "observed.subjectHistory", Value: o.SubjectHistory},
+		{Key: "observed.subjectHistory", Value: history},
 		{Key: "observed.topic", Value: o.Topic},
 		{Key: "observed.topicUpdatedAt", Value: o.TopicUpdatedAt},
 		{Key: "observed.isAnnounce", Value: o.IsAnnounce},
