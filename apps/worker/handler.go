@@ -225,10 +225,21 @@ type persistJob interface {
 	persist(ctx context.Context, m *manager) error
 }
 
+// persistDrainTimeout bounds the shutdown drain. The worker context is already
+// cancelled by then, so the drain gets its own deadline rather than inheriting a
+// dead one; a job that cannot finish inside it is the only kind counted as
+// dropped at shutdown.
+const persistDrainTimeout = 10 * time.Second
+
 // persistQueue is the §6.2 boundary between the protocol goroutine and the
 // database: the callback only enqueues, and a fixed set of workers performs the
 // writes. It is bounded, and overflow is counted — a slow database must degrade
 // visibly, never stall WhatsApp event delivery.
+//
+// Shutdown stops admission and then *drains every accepted job* under a bounded
+// context before the workers exit: work that was accepted is processed, not
+// discarded, and only a full buffer, a rejected admission, or a deadline cut-off
+// is counted as dropped.
 type persistQueue struct {
 	mu      sync.Mutex
 	ch      chan persistJob
@@ -237,7 +248,11 @@ type persistQueue struct {
 	failed  atomic.Int64
 	workers int
 
-	stopOnce sync.Once
+	closeOnce   sync.Once
+	abandonOnce sync.Once
+
+	// drainTimeout bounds the shutdown drain; a test can shorten it.
+	drainTimeout time.Duration
 }
 
 func newPersistQueue(size, workers int) *persistQueue {
@@ -247,61 +262,100 @@ func newPersistQueue(size, workers int) *persistQueue {
 	if workers < 1 {
 		workers = 1
 	}
-	return &persistQueue{ch: make(chan persistJob, size), workers: workers}
+	return &persistQueue{
+		ch:           make(chan persistJob, size),
+		workers:      workers,
+		drainTimeout: persistDrainTimeout,
+	}
 }
 
-// enqueue returns immediately. A full (or stopped) queue counts the job as
+// enqueue returns immediately. A full (or closed) queue counts the job as
 // dropped and says so rather than blocking the event loop.
 func (q *persistQueue) enqueue(job persistJob) {
 	if q == nil {
 		return
 	}
 	q.mu.Lock()
-	stopped := q.stopped
-	sent := false
-	if !stopped {
-		select {
-		case q.ch <- job:
-			sent = true
-		default:
-		}
-	}
-	q.mu.Unlock()
-	if sent {
+	if q.stopped {
+		q.mu.Unlock()
+		q.dropped.Add(1)
+		logf("event persistence stopped, dropping %T", job)
 		return
 	}
-	q.dropped.Add(1)
-	if stopped {
-		logf("event persistence stopped, dropping %T", job)
-	} else {
+	select {
+	case q.ch <- job:
+		q.mu.Unlock()
+	default:
+		q.mu.Unlock()
+		q.dropped.Add(1)
 		logf("event persistence queue full, dropping %T", job)
 	}
 }
 
-// run owns the workers until ctx is cancelled, then drains what is left and
-// counts it as dropped.
+// close stops admission and closes the channel, which is what lets the workers
+// drain the buffer. Admission and the close share the lock, so a producer can
+// never send on a closed channel.
+func (q *persistQueue) close() {
+	if q == nil {
+		return
+	}
+	q.closeOnce.Do(func() {
+		q.mu.Lock()
+		q.stopped = true
+		close(q.ch)
+		q.mu.Unlock()
+	})
+}
+
+// run owns the workers until ctx is cancelled, then stops admission and drains
+// every accepted job under the drain deadline before returning. Jobs still in
+// flight when the deadline passes fail (their context is cancelled); jobs the
+// deadline cut off are the only shutdown drops.
 func (q *persistQueue) run(ctx context.Context, m *manager) {
 	if q == nil {
 		return
 	}
+	// The workers use their own context: on the shutdown path ctx is already
+	// cancelled, and the accepted work must still be allowed to land.
+	drainCtx, cancelDrain := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	for i := 0; i < q.workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			q.worker(ctx, m)
+			q.worker(drainCtx, m)
 		}()
 	}
+
+	<-ctx.Done()
+	q.close()
+	timer := time.AfterFunc(q.drainTimeout, cancelDrain)
 	wg.Wait()
+	timer.Stop()
+	cancelDrain()
+	q.abandon()
 }
 
 func (q *persistQueue) worker(ctx context.Context, m *manager) {
 	for {
+		if ctx.Err() != nil {
+			// The drain deadline passed: stop pulling jobs. Whatever is left is
+			// counted once by abandon().
+			return
+		}
 		select {
 		case <-ctx.Done():
-			q.stop()
 			return
-		case job := <-q.ch:
+		case job, ok := <-q.ch:
+			if !ok {
+				return
+			}
+			if ctx.Err() != nil {
+				// The deadline landed between the select and here; the job was
+				// accepted but cannot be allowed to run with a dead context.
+				q.dropped.Add(1)
+				return
+			}
 			if err := job.persist(ctx, m); err != nil {
 				q.failed.Add(1)
 				logf("event persistence %T: %v", job, err)
@@ -310,20 +364,16 @@ func (q *persistQueue) worker(ctx context.Context, m *manager) {
 	}
 }
 
-// stop closes the queue to producers; the first caller drains the buffer so a
-// shutdown counts exactly what it abandoned.
-func (q *persistQueue) stop() {
-	q.stopOnce.Do(func() {
-		q.mu.Lock()
-		q.stopped = true
-		q.mu.Unlock()
+// abandon counts the accepted jobs the drain deadline cut off. It is the only
+// shutdown-time drop, and it is attempted exactly once.
+func (q *persistQueue) abandon() {
+	q.abandonOnce.Do(func() {
 		for {
-			select {
-			case <-q.ch:
-				q.dropped.Add(1)
-			default:
+			_, ok := <-q.ch
+			if !ok {
 				return
 			}
+			q.dropped.Add(1)
 		}
 	})
 }
