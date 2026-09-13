@@ -61,12 +61,19 @@ export const MESSAGE_MAX_LIMIT = 200;
 /** The query is quoted text, so it also has a bounded length. */
 const MAX_QUERY_LENGTH = 256;
 
-/** Thrown for a cursor the repository did not mint; the route maps it to a 400. */
+/** The invalid cursor error; the route maps it to a 400. */
 export class InvalidMessageCursorError extends Error {
   constructor() {
     super("invalid message cursor");
     this.name = "InvalidMessageCursorError";
   }
+}
+
+/** The keyset a cursor walks: the full ordering key of one row. */
+interface MessageCursorKey {
+  timestamp: Date;
+  waMessageId: string;
+  instanceId: string;
 }
 
 /** A stored `messages` document, read only through the projection below. */
@@ -90,10 +97,13 @@ type MessageDoc = {
 };
 
 /**
- * The newest first — `waMessageId` breaks a timestamp tie so the cursor has a
- * total order to walk, and so two rows can never swap between pages.
+ * Newest first. `waMessageId` alone does not make the order total — the
+ * `uniq_message` index only guarantees it within `(organizationId, instanceId)`
+ * — so `instanceId` is the final component. Without it, two instances sharing a
+ * timestamp and a message id would tie, and a keyset cursor over the tie could
+ * drop or repeat one of them.
  */
-const SORT = { timestamp: -1, waMessageId: -1 } as const;
+const SORT = { timestamp: -1, waMessageId: -1, instanceId: -1 } as const;
 
 /**
  * Never fetch `raw.message`: it is a truncated protobuf tree (up to
@@ -158,24 +168,33 @@ function toRow(doc: MessageDoc): MessageRow {
 
 /** The opaque keyset of one row, safe to hand to a client as a cursor. */
 export function encodeMessageCursor(row: MessageRow): string {
-  return Buffer.from(JSON.stringify([row.timestamp, row.waMessageId]), "utf8").toString("base64url");
+  return Buffer.from(
+    JSON.stringify([row.timestamp, row.waMessageId, row.instanceId]),
+    "utf8",
+  ).toString("base64url");
 }
 
-function decodeMessageCursor(cursor: string): { timestamp: Date; waMessageId: string } {
+function decodeMessageCursor(cursor: string): MessageCursorKey {
   let parsed: unknown;
   try {
     parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
   } catch {
     throw new InvalidMessageCursorError();
   }
-  if (!Array.isArray(parsed) || parsed.length !== 2) throw new InvalidMessageCursorError();
-  const [timestamp, waMessageId] = parsed as [unknown, unknown];
-  if (typeof timestamp !== "string" || typeof waMessageId !== "string" || waMessageId === "") {
+  if (!Array.isArray(parsed) || parsed.length !== 3) throw new InvalidMessageCursorError();
+  const [timestamp, waMessageId, instanceId] = parsed as [unknown, unknown, unknown];
+  if (
+    typeof timestamp !== "string" ||
+    typeof waMessageId !== "string" ||
+    typeof instanceId !== "string" ||
+    waMessageId === "" ||
+    instanceId === ""
+  ) {
     throw new InvalidMessageCursorError();
   }
   const at = new Date(timestamp);
   if (!Number.isFinite(at.getTime())) throw new InvalidMessageCursorError();
-  return { timestamp: at, waMessageId };
+  return { timestamp: at, waMessageId, instanceId };
 }
 
 /**
@@ -210,9 +229,15 @@ function messageFilter(input: MessageSearchInput): Filter<Document> {
   if (range.$gte || range.$lte) filter.timestamp = range;
 
   if (input.cursor) {
-    const { timestamp, waMessageId } = decodeMessageCursor(input.cursor);
+    const { timestamp, waMessageId, instanceId } = decodeMessageCursor(input.cursor);
     filter.$and = [
-      { $or: [{ timestamp: { $lt: timestamp } }, { timestamp, waMessageId: { $lt: waMessageId } }] },
+      {
+        $or: [
+          { timestamp: { $lt: timestamp } },
+          { timestamp, waMessageId: { $lt: waMessageId } },
+          { timestamp, waMessageId, instanceId: { $lt: instanceId } },
+        ],
+      },
     ];
   }
   return filter;
@@ -221,21 +246,26 @@ function messageFilter(input: MessageSearchInput): Filter<Document> {
 /**
  * R4: the dashboard's advanced search (§6.4) — one query over the folded search
  * text, the flattened raw tree and the media filename, narrowed by the §5.1
- * compound filters and walked by a keyset on `(timestamp, waMessageId)`.
+ * compound filters and walked by a keyset on `(timestamp, waMessageId,
+ * instanceId)`.
  *
  * A free-text term is answered by two index-backed branches, because MongoDB
  * rejects `$text` inside `$or` (verified against the production index set):
  *
  * - the weighted `messages_text` index (`$text` over `text`, `rawSearch` and
  *   `media.fileName`), which is the token/ranked search §6.4 specifies;
- * - an anchored, escaped prefix over the case-folded `textSearch` field, backed
- *   by `messages_typeahead`, which is what keeps type-ahead working before a
- *   word is complete.
+ * - the case-folded `textSearch` field, which is what keeps type-ahead working
+ *   before a word is complete.
  *
- * The branches are unioned and de-duplicated here, then ordered and cut to the
- * page. Fetching `limit` rows from each branch is enough: any row in the global
- * top `limit` is within the top `limit` of every branch that contains it, so the
- * keyset cursor stays exact and no branch ever scans the collection.
+ * Each branch is cursor-filtered and asks the database for exactly one page, so
+ * neither branch can return more than `limit` rows. Where the branch's filter
+ * can ride the `(timestamp, waMessageId, instanceId)` order the plan is a pure
+ * index scan; where it cannot — a `$text` match, which the text index holds in
+ * score order, not time order — the plan is a top-k sort bounded to the page
+ * (`limitAmount`), not a sort of the whole match set. That bound is asserted in
+ * the index-contract tests below. The two pages are then unioned, de-duplicated
+ * by message identity and cut to the page, so at most `2 × limit` rows are ever
+ * held at once.
  */
 export async function searchMessages(db: Db, input: MessageSearchInput): Promise<MessageRow[]> {
   const limit = clampMessageLimit(input.limit);
@@ -275,13 +305,14 @@ export async function searchMessages(db: Db, input: MessageSearchInput): Promise
   return [...byIdentity.values()].sort(compareRows).slice(0, limit);
 }
 
-/** Newest first; a absent timestamp sorts last, `waMessageId` breaks the tie. */
+/** Newest first; a absent timestamp sorts last, `waMessageId` and `instanceId` break the ties. */
 function compareRows(left: MessageRow, right: MessageRow): number {
   const leftAt = left.timestamp ?? "";
   const rightAt = right.timestamp ?? "";
   if (leftAt !== rightAt) return leftAt < rightAt ? 1 : -1;
-  if (left.waMessageId === right.waMessageId) return 0;
-  return left.waMessageId < right.waMessageId ? 1 : -1;
+  if (left.waMessageId !== right.waMessageId) return left.waMessageId < right.waMessageId ? 1 : -1;
+  if (left.instanceId === right.instanceId) return 0;
+  return left.instanceId < right.instanceId ? 1 : -1;
 }
 
 /**

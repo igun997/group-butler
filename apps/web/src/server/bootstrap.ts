@@ -43,11 +43,14 @@ export const INDEXES: Record<string, IndexDescription[]> = {
     { name: "media_status", key: { organizationId: 1, "media.status": 1, timestamp: -1 } },
     { name: "sender_stream", key: { organizationId: 1, senderJid: 1, timestamp: -1 } },
     // The cross-instance stream's keyset order (`/api/messages`): tenant
-    // equality, then the exact `(timestamp, waMessageId)` descending order the
-    // cursor walks, so a page never needs a blocking sort.
-    { name: "messages_stream", key: { organizationId: 1, timestamp: -1, waMessageId: -1 } },
+    // equality, then the exact `(timestamp, waMessageId, instanceId)`
+    // descending order the cursor walks. `instanceId` is last because
+    // `waMessageId` is only unique within an instance — without it two
+    // instances' equal timestamp+id would tie and the cursor could lose one.
+    { name: "messages_stream", key: { organizationId: 1, timestamp: -1, waMessageId: -1, instanceId: -1 } },
     // The per-group stream's keyset order (`/api/groups/[id]/messages`): the
-    // three equality terms first, then the same descending pair.
+    // three equality terms first, then the same descending pair. The instance
+    // is an equality term here, so it is already constant for the sort.
     {
       name: "messages_group_stream",
       key: { organizationId: 1, instanceId: 1, groupJid: 1, timestamp: -1, waMessageId: -1 },

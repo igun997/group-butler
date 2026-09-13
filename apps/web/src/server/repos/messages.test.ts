@@ -285,32 +285,62 @@ describe("searchMessages", () => {
     expect(fourth).toEqual([]);
   });
 
-  test("pages a free-text query the same way, and returns a doubly-matched row once", async () => {
+  test("walks every page of a free-text query, returning a doubly-matched row once", async () => {
     // `paginate` matches the text index and the type-ahead prefix at once; the
-    // two branches are unioned, so the row must not appear twice.
-    const page = await searchMessages(await getDb(), {
-      organizationId: "org_default",
-      groupJid: "pg@g.us",
-      query: "paginate",
-      limit: 5,
-    });
-    expect(page.map((m) => m.waMessageId)).toEqual(["p3", "p2", "p1"]);
+    // branches are unioned, so each row must appear exactly once across pages.
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 6; page += 1) {
+      const rows = await searchMessages(await getDb(), {
+        organizationId: "org_default",
+        groupJid: "pg@g.us",
+        query: "paginate",
+        limit: 1,
+        cursor,
+      });
+      if (rows.length === 0) break;
+      seen.push(rows[0]!.waMessageId);
+      cursor = nextMessageCursor(rows, 1) ?? undefined;
+      if (!cursor) break;
+    }
+    expect(seen).toEqual(["p3", "p2", "p1"]);
+    expect(new Set(seen).size).toBe(seen.length);
+  });
 
-    const first = await searchMessages(await getDb(), {
-      organizationId: "org_default",
-      groupJid: "pg@g.us",
-      query: "paginate",
-      limit: 1,
-    });
-    expect(first.map((m) => m.waMessageId)).toEqual(["p3"]);
-    const second = await searchMessages(await getDb(), {
-      organizationId: "org_default",
-      groupJid: "pg@g.us",
-      query: "paginate",
-      limit: 1,
-      cursor: encodeMessageCursor(first[0]!),
-    });
-    expect(second.map((m) => m.waMessageId)).toEqual(["p2"]);
+  test("walks a cross-instance tie without losing or repeating a row", async () => {
+    // `inst_1/shared` and `inst_2/shared` share a timestamp *and* a message id,
+    // which `uniq_message` only makes unique within an instance. A keyset that
+    // stopped at `(timestamp, waMessageId)` would return one and drop the other.
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 8; page += 1) {
+      const rows = await searchMessages(await getDb(), {
+        organizationId: "org_default",
+        groupJid: "1203630431@g.us",
+        query: "",
+        limit: 1,
+        cursor,
+      });
+      if (rows.length === 0) break;
+      seen.push(`${rows[0]!.instanceId}/${rows[0]!.waMessageId}`);
+      cursor = nextMessageCursor(rows, 1) ?? undefined;
+      if (!cursor) break;
+    }
+
+    expect(seen).toEqual([
+      "inst_1/m2",
+      "inst_1/m1",
+      "inst_2/shared",
+      "inst_1/shared",
+    ]);
+    expect(new Set(seen).size).toBe(seen.length);
+  });
+
+  test("refuses a cursor minted before the instance was part of the key", async () => {
+    const legacy = Buffer.from(JSON.stringify(["2026-09-13T10:00:00.000Z", "m1"]), "utf8").toString("base64url");
+    await expect(
+      searchMessages(await getDb(), { organizationId: "org_default", query: "", cursor: legacy }),
+    ).rejects.toBeInstanceOf(InvalidMessageCursorError);
   });
 
   test("never doubles a row that both search branches match", async () => {
@@ -375,61 +405,133 @@ describe("messageMediaKey", () => {
   });
 });
 
+/** `executionStats.nReturned` of an explain result, or -1 when unavailable. */
+function nReturned(explained: unknown): number {
+  if (explained && typeof explained === "object" && "executionStats" in explained) {
+    const stats = (explained as { executionStats?: unknown }).executionStats;
+    if (stats && typeof stats === "object" && "nReturned" in stats) {
+      const value = (stats as { nReturned?: unknown }).nReturned;
+      return typeof value === "number" ? value : -1;
+    }
+  }
+  return -1;
+}
+
+/**
+ * The plan the planner actually chose. The whole explain document also carries
+ * `rejectedPlans`, which routinely contain the very sort or collection scan the
+ * chosen plan avoided — so every plan assertion reads this, not the whole blob.
+ */
+function winningPlan(explained: unknown): string {
+  if (explained && typeof explained === "object" && "queryPlanner" in explained) {
+    const planner = (explained as { queryPlanner?: unknown }).queryPlanner;
+    if (planner && typeof planner === "object" && "winningPlan" in planner) {
+      return JSON.stringify((planner as { winningPlan?: unknown }).winningPlan);
+    }
+  }
+  return JSON.stringify(explained);
+}
+
 /**
  * The index contract behind the query the repository issues. Each case runs the
- * shape of the production query against the production index set and reads the
- * planner's answer, so a rename or a dropped key is a failing test rather than a
- * silent collection scan.
+ * exact filter, sort and limit the repository uses against the production index
+ * set, and reads the planner's answer plus the execution counters: a rename, a
+ * dropped key or an unbounded sort is a failing test, not a silent regression.
  */
 describe("message search index contract", () => {
-  test("free text is answered by the weighted messages_text index", async () => {
-    const explained = JSON.stringify(
-      await (await getDb())
-        .collection(COLLECTIONS.messages)
-        .find({ organizationId: "org_default", $text: { $search: "deploy" } })
-        .sort({ timestamp: -1, waMessageId: -1 })
-        .limit(5)
-        .explain("queryPlanner"),
-    );
-    expect(explained).toContain("messages_text");
-    expect(explained).toContain("TEXT_MATCH");
-  });
+  const keyset = { timestamp: -1, waMessageId: -1, instanceId: -1 } as const;
 
-  test("the tenant-filtered cursor stream is an index scan with no blocking sort", async () => {
+  test("the tenant-filtered stream is served from the keyset index, with no sort stage", async () => {
     const messages = (await getDb()).collection(COLLECTIONS.messages);
-    const stream = JSON.stringify(
+    // Unhinted: this is what the real query gets, not what a hint forces.
+    const explained = await messages
+      .find({ organizationId: "org_default" })
+      .sort(keyset)
+      .limit(5)
+      .explain("executionStats");
+    const plan = winningPlan(explained);
+
+    expect(plan).toContain("messages_stream");
+    expect(plan).not.toContain('"stage":"SORT"');
+    expect(plan).not.toContain("COLLSCAN");
+    expect(nReturned(explained)).toBeLessThanOrEqual(5);
+
+    // The index can also serve the order when the planner is told to use it,
+    // which is what makes the `instanceId` key load-bearing rather than luck.
+    const hinted = winningPlan(
       await messages
         .find({ organizationId: "org_default" })
-        .sort({ timestamp: -1, waMessageId: -1 })
+        .sort(keyset)
         .limit(5)
         .hint("messages_stream")
         .explain("queryPlanner"),
     );
-    expect(stream).toContain("messages_stream");
-    expect(stream).not.toContain('"stage":"SORT"');
-
-    const group = JSON.stringify(
-      await messages
-        .find({ organizationId: "org_default", instanceId: "inst_pg", groupJid: "pg@g.us" })
-        .sort({ timestamp: -1, waMessageId: -1 })
-        .limit(5)
-        .hint("messages_group_stream")
-        .explain("queryPlanner"),
-    );
-    expect(group).toContain("messages_group_stream");
-    expect(group).not.toContain('"stage":"SORT"');
+    expect(hinted).toContain("messages_stream");
+    expect(hinted).not.toContain('"stage":"SORT"');
   });
 
-  test("type-ahead is answered by the tenant-scoped textSearch index", async () => {
-    const explained = JSON.stringify(
-      await (await getDb())
-        .collection(COLLECTIONS.messages)
+  test("the group stream is served from its keyset index, with no sort stage", async () => {
+    const messages = (await getDb()).collection(COLLECTIONS.messages);
+    const explained = await messages
+      .find({ organizationId: "org_default", instanceId: "inst_pg", groupJid: "pg@g.us" })
+      .sort(keyset)
+      .limit(5)
+      .explain("executionStats");
+    const plan = winningPlan(explained);
+
+    expect(plan).toContain("messages_group_stream");
+    expect(plan).not.toContain('"stage":"SORT"');
+    expect(plan).not.toContain("COLLSCAN");
+    expect(nReturned(explained)).toBeLessThanOrEqual(5);
+  });
+
+  test("free text uses the weighted text index and a page-bounded top-k sort", async () => {
+    const limit = 3;
+    const explained = await (await getDb())
+      .collection(COLLECTIONS.messages)
+      .find({ organizationId: "org_default", $text: { $search: "deploy" } })
+      .sort(keyset)
+      .limit(limit)
+      .explain("executionStats");
+    const plan = winningPlan(explained);
+
+    expect(plan).toContain("messages_text");
+    expect(plan).toContain("TEXT_MATCH");
+    expect(plan).not.toContain("COLLSCAN");
+    // The text index holds matches in score order, so the newest page costs a
+    // top-k sort — bounded to the page (`limitAmount`), never the whole match
+    // set, and the cursor's keyset keeps the returned rows to the page size.
+    expect(plan).toContain('"stage":"SORT"');
+    expect(plan).toContain(`"limitAmount":${limit}`);
+    expect(nReturned(explained)).toBeLessThanOrEqual(limit);
+  });
+
+  test("type-ahead stays on an index and returns at most one page", async () => {
+    const messages = (await getDb()).collection(COLLECTIONS.messages);
+    const explained = await messages
+      .find({ organizationId: "org_default", textSearch: /^deploy/ })
+      .sort(keyset)
+      .limit(3)
+      .explain("executionStats");
+    const plan = winningPlan(explained);
+
+    expect(plan).not.toContain("COLLSCAN");
+    expect(plan).toMatch(/messages_typeahead|messages_stream/);
+    expect(nReturned(explained)).toBeLessThanOrEqual(3);
+
+    // The prefix index can serve the filter on its own, which is why the
+    // branch is never a collection scan even when the planner prefers the
+    // already-ordered stream index.
+    const hinted = winningPlan(
+      await messages
         .find({ organizationId: "org_default", textSearch: /^deploy/ })
+        .sort(keyset)
+        .limit(3)
         .hint("messages_typeahead")
         .explain("queryPlanner"),
     );
-    expect(explained).toContain("messages_typeahead");
-    expect(explained).toContain("IXSCAN");
+    expect(hinted).toContain("messages_typeahead");
+    expect(hinted).toContain("IXSCAN");
   });
 
   test("the production index set carries the cursor and tenant keys", async () => {

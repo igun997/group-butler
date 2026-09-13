@@ -84,6 +84,7 @@ describe("bootstrap", () => {
       organizationId: 1,
       timestamp: -1,
       waMessageId: -1,
+      instanceId: -1,
     });
     expect(await indexKey(db, "messages", "messages_group_stream")).toEqual({
       organizationId: 1,
