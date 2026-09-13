@@ -562,8 +562,8 @@ org/<organizationId>/instance/<instanceId>/group/<groupJid-safe>/<YYYY>/<MM>/<wa
 rules cheap. `extensionForMime` follows the reference, with `bin` for unparsed and a `.json`
 sidecar (`<waMessageId>.meta.json`) holding the descriptor, immutable and useful even if Mongo is
 lost. The same client talks to the real R2 endpoint in development and production — derived as
-`https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com` unless `R2_ENDPOINT` is explicitly set for a
-jurisdiction-specific endpoint — with **no path-style addressing and no local emulator**.
+`https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com` — the only endpoint the code can produce. There is
+no endpoint variable, so there is **no override, no path-style addressing and no local emulator**.
 
 #### 6.3.4 Reading media (R2 + R3 together)
 After upload, the worker reads what it can **without external calls**:
@@ -793,7 +793,6 @@ never forwards raw worker JSON to the browser.
 | `ORGANIZATION_ID` | `org_default` | stamped on everything the worker writes |
 | `WHATSMEOW_DB_URI` | `file:/data/whatsmeow.db?_foreign_keys=on` | sqlite on the mounted volume |
 | `R2_ACCOUNT_ID` | *(required for media)* | account-scoped endpoint `https://<account>.r2.cloudflarestorage.com` |
-| `R2_ENDPOINT` | *(empty)* | optional explicit override (jurisdiction-specific endpoint); never a local emulator |
 | `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_PUBLIC_URL` | — | unconfigured ⇒ media handling disabled, logged loudly |
 | `MEDIA_*` | `26214400` / `4` / `45s` / `5m` | max bytes, concurrency, timeout, janitor interval |
 | `MEDIA_ENRICH_ENABLED` | `false` | §9 |
@@ -974,7 +973,7 @@ content; §11.5).
 | `WORKER_SECRET` | must equal the worker's |
 | `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL` | OpenAI-compatible endpoint |
 | `AI_MAX_TOKENS_PER_DAY` | global ceiling, instance override in Mongo |
-| `R2_ACCOUNT_ID`, `R2_ENDPOINT`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | for presigning and metadata display; real R2 in every environment |
+| `R2_ACCOUNT_ID`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | for presigning and metadata display; real R2 in every environment. The endpoint is derived from `R2_ACCOUNT_ID` in code — there is no endpoint variable to set |
 | `R2_PRESIGN_TTL_SECONDS` | default `300` |
 | `RETENTION_MESSAGES_DAYS` | `0` = keep forever |
 
@@ -1254,7 +1253,7 @@ What the script MUST do:
    **R2 preflight, before anything else starts:** `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
    `R2_SECRET_ACCESS_KEY` and `R2_BUCKET` must be present and not left as `REPLACE_WITH_*`
    placeholders; the endpoint is derived as `https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com`
-   unless `R2_ENDPOINT` is explicitly set, and must be `https://`. The failure lists each missing
+   with no way to point it anywhere else. The failure lists each missing
    variable with where to obtain it (R2 → Overview / Manage API Tokens) and points at
    `.env.example`. An authenticated probe runs when the `aws` CLI is available; otherwise a
    reachability probe accepts 200/301/403 (403 proves the endpoint is live and credential-gated)
@@ -1268,9 +1267,9 @@ only; `dev:down` → compose down. Contract tests for the script and for `.env.e
 `scripts/dev.test.ts` (§14.5), including a test that asserts no MinIO/path-style remnant exists.
 
 Both the R2 client (Go, `aws-sdk-go-v2/service/s3`) and the presigner (TS,
-`@aws-sdk/client-s3` + `s3-request-presigner`) talk to the real R2 endpoint: `R2_ENDPOINT` when set,
-otherwise derived from `R2_ACCOUNT_ID`. There is no path-style flag, no emulator branch and no
-environment-specific storage code path.
+`@aws-sdk/client-s3` + `s3-request-presigner`) talk to the real R2 endpoint, which both services derive
+from `R2_ACCOUNT_ID` as `https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com`. There is no endpoint
+variable, no path-style flag, no emulator branch and no environment-specific storage code path.
 
 ### 13.1 Environment examples
 - **Root `.env.example`** — the file `scripts/dev.sh` sources (`set -a; . ./.env; set +a`). Must be
@@ -1279,7 +1278,7 @@ environment-specific storage code path.
   `WORKER_SECRET=dev-secret`, `OWNER_EMAIL=owner@local`, `OWNER_PASSWORD=changeme`,
   `AUTH_SECRET=<≥32-char dev placeholder>`), while the R2 block is **required for media** and ships
   as explicit `REPLACE_WITH_*` placeholders the developer fills from their Cloudflare dashboard —
-  `R2_ACCOUNT_ID`, `R2_ENDPOINT` (empty = derived), `R2_BUCKET` (a **dev** bucket), `R2_ACCESS_KEY_ID`,
+  `R2_ACCOUNT_ID`, `R2_BUCKET` (a **dev** bucket), `R2_ACCESS_KEY_ID`,
   `R2_SECRET_ACCESS_KEY`. The file contains no real secrets and no production identifiers, and the
   launcher treats a placeholder as missing.
 - **`apps/web/.env.production.example`** and **`apps/worker/.env.production.example`** — deployment
@@ -1376,7 +1375,7 @@ runs without Docker or network and fails loudly if the script erodes:
 | D4 | `dev script forwards signals and cleans up` | declares `trap … INT TERM EXIT`, starts each child via `setsid`, and terminates with a process-group `kill -TERM -<pid>` plus a SIGKILL escalation |
 | D5 | `.env.example` is sourceable and complete` | `bash -eu -c 'set -a; . .env.example'` exits 0; every key in the shared `REQUIRED_ENV` list is present |
 | D6 | `no real secrets in env examples` | no value matches live-key shapes (`AKIA…`, `sk-…`, 40+ hex, `mongodb+srv://`) outside an explicit `PLACEHOLDER`/dev-local exception list |
-| D7 | `R2 preflight is mandatory, and storage is real R2 everywhere` | the dev compose file contains no object-storage service (no `minio`, no host `9000`); the script, `.env.example` and compose contain none of `R2_FORCE_PATH_STYLE` / `forcePathStyle` / `UsePathStyle` / `path-style`; running the launcher with an R2 value missing or left as `REPLACE_WITH_*` exits 1 and names the variable together with where to obtain it |
+| D7 | `R2 preflight is mandatory, and storage is real R2 everywhere` | the dev compose file contains no object-storage service (no `minio`, no host `9000`); the script, `.env.example` and compose contain none of `R2_ENDPOINT` / `R2_FORCE_PATH_STYLE` / `forcePathStyle` / `UsePathStyle` / `path-style`; running the launcher with an R2 value missing or left as `REPLACE_WITH_*` exits 1 and names the variable together with where to obtain it |
 
 D2/D5/D6/D7 run in CI (`ci.yml`, §12.2); D1/D3/D4 are static and run in the default suite.
 

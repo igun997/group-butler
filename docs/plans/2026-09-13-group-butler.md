@@ -160,6 +160,10 @@ Two tooling facts verified on bun 1.3.14 while executing this task, both now enc
 - **`packages/shared/src/index.ts` exists from this task** as an empty module (`export {}`) so
   `tsc --noEmit -p tsconfig.json` has an input; without it the package's `lint` fails with
   `error TS18003: No inputs were found in config file`. Task 5 adds the real exports to that file.
+- **`@types/bun` is a devDependency of `packages/shared` from this task.** `tsconfig.json` includes
+  `test/`, so the first test file makes `lint` fail without Bun/Node type declarations
+  (`Cannot find module 'bun:test'`, `Property 'dir' does not exist on type 'ImportMeta'`). With
+  `@types/bun` installed, TypeScript picks it up automatically — no `types` array needed.
 
 **Step 6: Commit**
 
@@ -238,7 +242,7 @@ Expected: FAIL — `Cannot find module '../src/env-contract'`.
 export const REQUIRED_ENV = [
   "ORGANIZATION_ID", "MONGODB_URI", "MONGODB_DB", "LOG_LEVEL",
   "PORT", "WORKER_URL", "WORKER_SECRET", "WHATSMEOW_DB_URI", "ENVIRONMENT",
-  "R2_ACCOUNT_ID", "R2_ENDPOINT", "R2_BUCKET", "R2_ACCESS_KEY_ID",
+  "R2_ACCOUNT_ID", "R2_BUCKET", "R2_ACCESS_KEY_ID",
   "R2_SECRET_ACCESS_KEY", "R2_PUBLIC_URL", "R2_PRESIGN_TTL_SECONDS",
   "OWNER_EMAIL", "OWNER_PASSWORD", "OWNER_PASSWORD_HASH", "AUTH_SECRET", "LOGIN_RATE_LIMIT",
   "AI_BASE_URL", "AI_API_KEY", "AI_MODEL", "AI_MAX_TOKENS_PER_DAY",
@@ -310,12 +314,11 @@ WHATSMEOW_DB_URI=file:./.localdata/whatsmeow.db?_foreign_keys=on
 # R2 → Manage API Tokens (Access Key ID / Secret). Use a DEV bucket, never the
 # production one.
 # The dev launcher refuses to start with an actionable message if any of the
-# five values below is missing or left as a placeholder.
+# four values below is missing or left as a placeholder.
+#
+# The endpoint is NOT configurable: it is derived in code as
+#   https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com
 R2_ACCOUNT_ID=REPLACE_WITH_R2_ACCOUNT_ID
-# Optional explicit endpoint. Leave EMPTY to derive
-# https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com (the normal case). Set it
-# only for a jurisdiction-specific or gateway endpoint.
-R2_ENDPOINT=
 R2_BUCKET=group-butler-dev
 R2_ACCESS_KEY_ID=REPLACE_WITH_R2_ACCESS_KEY_ID
 R2_SECRET_ACCESS_KEY=REPLACE_WITH_R2_SECRET_ACCESS_KEY
@@ -397,7 +400,6 @@ MONGODB_DB=group_butler
 ORGANIZATION_ID=org_default
 WHATSMEOW_DB_URI=file:/data/whatsmeow.db?_foreign_keys=on   # keep /data persistent
 R2_ACCOUNT_ID=
-R2_ENDPOINT=            # leave empty to derive https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com
 R2_BUCKET=
 R2_ACCESS_KEY_ID=
 R2_SECRET_ACCESS_KEY=
@@ -431,7 +433,6 @@ AI_API_KEY=
 AI_MODEL=
 AI_MAX_TOKENS_PER_DAY=200000
 R2_ACCOUNT_ID=
-R2_ENDPOINT=            # leave empty to derive https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com
 R2_BUCKET=
 R2_ACCESS_KEY_ID=
 R2_SECRET_ACCESS_KEY=
@@ -647,12 +648,12 @@ describe("D6: no real secrets in env examples", () => {
 });
 
 describe("D7: R2 preflight is mandatory and actionable", () => {
-  test("media storage is real R2 everywhere: no MinIO, no path-style flag", () => {
+  test("media storage is real R2 everywhere: no emulator, no endpoint override, no path-style", () => {
     const compose = readFileSync(join(root, "infra/dev/docker-compose.yml"), "utf8");
     expect(compose).not.toMatch(/minio/i);
     expect(compose).not.toContain("9000");
     const all = [script, readFileSync(examplePath, "utf8"), compose].join("\n");
-    for (const banned of ["R2_FORCE_PATH_STYLE", "forcePathStyle", "UsePathStyle", "path-style"]) {
+    for (const banned of ["R2_FORCE_PATH_STYLE", "forcePathStyle", "UsePathStyle", "path-style", "R2_ENDPOINT"]) {
       expect(all).not.toContain(banned);
     }
   });
@@ -750,8 +751,9 @@ wait_for_mongo() {
 
 # --- R2 preflight ------------------------------------------------------------
 # Media persistence needs real Cloudflare R2 credentials. There is no local
-# emulator to fall back on, so a missing or placeholder value is a hard, early,
-# actionable failure rather than a runtime surprise deep in the ingest path.
+# emulator to fall back on and no endpoint to configure, so a missing or
+# placeholder value is a hard, early, actionable failure rather than a runtime
+# surprise deep in the ingest path.
 r2_missing() { [[ -z "${1:-}" || "${1}" == REPLACE_WITH_* ]]; }
 
 validate_r2() {
@@ -772,33 +774,27 @@ validate_r2() {
     die "fill these in .env (see .env.example) and re-run: bun run dev:local"
   fi
 
-  # Endpoint: derived from the account id unless explicitly overridden.
-  if [[ -z "${R2_ENDPOINT:-}" ]]; then
-    R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-  fi
-  case "$R2_ENDPOINT" in
-    https://*) : ;;
-    *) die "R2_ENDPOINT must be an https:// endpoint (got '$R2_ENDPOINT')" ;;
-  esac
-  export R2_ENDPOINT
+  # The only endpoint that exists is derived from the account id — there is
+  # nothing to override, which is what keeps emulators out of the picture.
+  local endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
   # Authenticated probe when the AWS CLI is available; a reachability probe
   # always runs. 403 is acceptable here: it proves the endpoint is live and
   # credential-gated, which is exactly what an unauthenticated request should see.
   if command -v aws >/dev/null 2>&1; then
     if ! AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
-         aws --endpoint-url "$R2_ENDPOINT" s3api head-bucket --bucket "$R2_BUCKET" >/dev/null 2>&1; then
-      die "R2 rejected the credentials or bucket '$R2_BUCKET' at $R2_ENDPOINT — check the token's R2 permissions and the bucket name"
+         aws --endpoint-url "$endpoint" s3api head-bucket --bucket "$R2_BUCKET" >/dev/null 2>&1; then
+      die "R2 rejected the credentials or bucket '$R2_BUCKET' at $endpoint — check the token's R2 permissions and the bucket name"
     fi
-    log "r2 ok (authenticated): bucket=$R2_BUCKET endpoint=$R2_ENDPOINT"
+    log "r2 ok (authenticated): bucket=$R2_BUCKET endpoint=$endpoint"
     return 0
   fi
   local code
-  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$R2_ENDPOINT/$R2_BUCKET" || echo 000)"
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$endpoint/$R2_BUCKET" || echo 000)"
   case "$code" in
-    200|301|403) log "r2 reachable: bucket=$R2_BUCKET endpoint=$R2_ENDPOINT (install the aws CLI for an authenticated check)" ;;
-    000) die "cannot reach $R2_ENDPOINT — check your network/VPN and that R2_ACCOUNT_ID is correct" ;;
-    *) die "unexpected response $code from $R2_ENDPOINT/$R2_BUCKET — check R2_ENDPOINT and the bucket name" ;;
+    200|301|403) log "r2 reachable: bucket=$R2_BUCKET endpoint=$endpoint (install the aws CLI for an authenticated check)" ;;
+    000) die "cannot reach $endpoint — check your network/VPN and that R2_ACCOUNT_ID is correct" ;;
+    *) die "unexpected response $code from $endpoint/$R2_BUCKET — check R2_ACCOUNT_ID and the bucket name" ;;
   esac
 }
 
@@ -904,7 +900,7 @@ exists anywhere).
 **Step 6: Acceptance — `--check`**
 
 Run: `cp .env.example .env` and fill the five R2 values from your Cloudflare dashboard
-(`R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`; leave `R2_ENDPOINT` empty),
+(`R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`),
 then `bun run dev:check`
 Expected: `[dev] r2 ok …` (authenticated when the `aws` CLI is present, otherwise a reachability line),
 ending in `check ok: env present and complete (incl. R2), mongo replica set healthy (apps not started)`, exit 0.
@@ -1801,14 +1797,13 @@ func TestExtensionForMime(t *testing.T) {
 }
 
 func TestR2EndpointDerivation(t *testing.T) {
+	// Config deliberately has no endpoint field: the only endpoint that can ever
+	// be produced is the account-scoped Cloudflare R2 host.
 	if got := r2Endpoint(Config{R2AccountID: "abc123"}); got != "https://abc123.r2.cloudflarestorage.com" {
 		t.Errorf("derived endpoint = %q, want the account-scoped R2 host", got)
 	}
-	if got := r2Endpoint(Config{R2AccountID: "abc123", R2Endpoint: "https://r2.example.com"}); got != "https://r2.example.com" {
-		t.Errorf("explicit endpoint = %q, want the configured value to win", got)
-	}
 	if got := r2Endpoint(Config{}); got != "" {
-		t.Errorf("endpoint with no configuration = %q, want empty so media stays disabled", got)
+		t.Errorf("endpoint with no account id = %q, want empty so media stays disabled", got)
 	}
 }
 ```
@@ -1931,9 +1926,10 @@ Expected: FAIL — `undefined: objectKeyAt`, `mustDate`, `extensionForMime`, `ne
 and falls back to `bin`. `Upload(ctx, data, key, mime)` → `uploadResult{Key, Size, PublicURL}`
 (`PublicURL` only when `R2_PUBLIC_URL` is set). `Download(ctx, key)` → bytes + MIME.
 `options` set `Region: "auto"`, `BaseEndpoint: aws.String(r2Endpoint(cfg))` and the static credentials
-— **no `UsePathStyle`, no endpoint override**: `r2Endpoint` returns `R2_ENDPOINT` when set and otherwise
-derives `https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com`. Development and production therefore run the
-identical code path against the identical real service.
+— **no `UsePathStyle`, no endpoint override**: `r2Endpoint(cfg)` is the only way an endpoint is ever
+produced, and it derives `https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com` (returning `""` when no
+account id is configured, which keeps media disabled rather than reaching anywhere else). Development
+and production therefore run the identical code path against the identical real service.
 
 **Step 4: Implement `media.go`**
 
@@ -3599,11 +3595,15 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 let client: S3Client | null = null;
 
+/** The only endpoint this project can ever use: the account-scoped R2 host. */
+export function r2Endpoint(accountId: string | undefined): string {
+  return accountId ? `https://${accountId}.r2.cloudflarestorage.com` : "";
+}
+
 function s3(): S3Client {
   if (client) return client;
-  const endpoint =
-    process.env.R2_ENDPOINT || (process.env.R2_ACCOUNT_ID ? `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com` : "");
-  if (!endpoint) throw new Error("R2_ACCOUNT_ID (or R2_ENDPOINT) is required to presign media");
+  const endpoint = r2Endpoint(process.env.R2_ACCOUNT_ID);
+  if (!endpoint) throw new Error("R2_ACCOUNT_ID is required to presign media");
   client = new S3Client({
     region: "auto",
     endpoint,
