@@ -1,8 +1,9 @@
 "use client";
 
-import { type ReactNode, useCallback, useEffect, useId, useRef, useState } from "react";
+import { type MouseEvent, type ReactNode, useCallback, useId, useRef, useState } from "react";
 import { CommandPalette, type PaletteCommand } from "./command-palette";
-import { signOut } from "./sign-out";
+import { trapTabKey } from "./focus-trap";
+import { signOutAndRedirect } from "./sign-out";
 import { Toaster } from "./toaster";
 
 /**
@@ -53,6 +54,13 @@ export interface AppShellProps {
  * small-viewport sheet (R-M2), and sign-out. Reduced-motion and
  * reduced-transparency are handled by the token layer the shell consumes, not
  * re-decided here (§3.2, R-A9).
+ *
+ * The registry navigation is rendered twice — once as the desktop sidebar and
+ * once inside the small-viewport `<dialog>` — because the element that gives the
+ * sheet its modal semantics is the `dialog`, and a modal sheet cannot also be
+ * the inline sidebar. Only one is ever exposed: below `md` the sidebar is
+ * `display: none`, and the sheet is `display: none` until it is opened, so the
+ * accessibility tree holds exactly one `nav` landmark at a time.
  */
 export function AppShell({
   title,
@@ -63,40 +71,40 @@ export function AppShell({
   children,
 }: AppShellProps) {
   const navId = useId();
-  const nav = useRef<HTMLElement>(null);
+  const sheetId = useId();
+  const sheet = useRef<HTMLDialogElement>(null);
   const navTrigger = useRef<HTMLButtonElement>(null);
+  const heading = useRef<HTMLHeadingElement>(null);
   const [rail, setRail] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
   const [signOutFailed, setSignOutFailed] = useState(false);
 
-  const closeNav = useCallback(() => {
-    setNavOpen(false);
+  const openSheet = useCallback(() => {
+    // Focus the trigger first so the browser restores focus to it on close (R-A1).
     navTrigger.current?.focus();
+    sheet.current?.showModal();
+    setNavOpen(true);
   }, []);
 
-  /*
-   * The small-viewport navigation sheet (R-M2): opening it moves focus into the
-   * nav, and `Esc` closes it and returns focus to its trigger (R-A1). The sheet
-   * is a `<nav>` and not a native `dialog`, so the focus move is the one piece of
-   * behaviour it cannot inherit and has to own.
-   */
-  useEffect(() => {
-    if (!navOpen) return;
-    nav.current?.querySelector<HTMLElement>(".app-shell__nav-link")?.focus();
-    function onKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape") closeNav();
-    }
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [navOpen, closeNav]);
+  const closeSheet = useCallback(() => sheet.current?.close(), []);
+
+  const onSheetClose = useCallback(() => {
+    setNavOpen(false);
+    // The trigger is the restore target (R-A1). If the viewport has since hidden
+    // it — the sheet outlived the small viewport — focus the workspace heading
+    // instead of leaving focus on the document.
+    const trigger = navTrigger.current;
+    if (trigger && trigger.getClientRects().length > 0) trigger.focus();
+    else heading.current?.focus();
+  }, []);
 
   const runSignOut = useCallback(async () => {
     setSigningOut(true);
     setSignOutFailed(false);
-    const ended = await signOut();
+    const ended = await signOutAndRedirect((href) => window.location.assign(href));
     if (ended) {
-      window.location.assign("/login");
+      // `signOutAndRedirect` already navigated; only a refusal leaves the shell standing.
       return;
     }
     setSigningOut(false);
@@ -114,55 +122,16 @@ export function AppShell({
   ];
 
   return (
-    <div className={`app-shell${rail ? " app-shell--rail" : ""}${navOpen ? " app-shell--nav-open" : ""}`}>
-      <nav id={navId} ref={nav} className="app-shell__nav" aria-label="Workspaces">
-        <div className="app-shell__nav-head">
-          <span className="app-shell__brand">Group Butler</span>
-          <button
-            type="button"
-            className="app-shell__rail-toggle"
-            aria-expanded={!rail}
-            aria-controls={navId}
-            onClick={() => setRail((value) => !value)}
-          >
-            {rail ? "Expand navigation" : "Collapse navigation"}
-          </button>
-          <button type="button" className="app-shell__nav-close" onClick={closeNav}>
-            Close navigation
-          </button>
-        </div>
-
-        <ul className="app-shell__nav-list">
-          {destinations.map((destination) => {
-            const current = destination.id === currentId;
-            return (
-              <li key={destination.id}>
-                <a
-                  className="app-shell__nav-link"
-                  href={destination.href}
-                  aria-current={current ? "page" : undefined}
-                >
-                  {destination.icon ? (
-                    <span className="app-shell__nav-icon" aria-hidden="true">
-                      {destination.icon}
-                    </span>
-                  ) : null}
-                  <span className="app-shell__nav-label">{destination.title}</span>
-                  {current ? (
-                    <span className="app-shell__nav-current" aria-hidden="true">
-                      <CurrentGlyph />
-                    </span>
-                  ) : null}
-                </a>
-              </li>
-            );
-          })}
-        </ul>
+    <div className={`app-shell${rail ? " app-shell--rail" : ""}`}>
+      <nav id={navId} className="app-shell__nav app-shell__nav--sidebar" aria-label="Workspaces">
+        <Navigation
+          destinations={destinations}
+          currentId={currentId}
+          rail={rail}
+          navId={navId}
+          onToggleRail={() => setRail((value) => !value)}
+        />
       </nav>
-
-      {navOpen ? (
-        <button type="button" className="app-shell__scrim" aria-label="Close navigation" onClick={closeNav} />
-      ) : null}
 
       <div className="app-shell__column">
         <header className="app-shell__header">
@@ -170,9 +139,10 @@ export function AppShell({
             ref={navTrigger}
             type="button"
             className="app-shell__nav-trigger"
+            aria-haspopup="dialog"
             aria-expanded={navOpen}
-            aria-controls={navId}
-            onClick={() => (navOpen ? closeNav() : setNavOpen(true))}
+            aria-controls={sheetId}
+            onClick={openSheet}
           >
             <span className="app-shell__nav-trigger-glyph" aria-hidden="true">
               <MenuGlyph />
@@ -181,7 +151,7 @@ export function AppShell({
           </button>
 
           <div className="app-shell__identity">
-            <h1 className="app-shell__title" tabIndex={-1}>
+            <h1 ref={heading} className="app-shell__title" tabIndex={-1}>
               {title}
             </h1>
             <span className="app-shell__scope">{scopeLabel}</span>
@@ -220,8 +190,90 @@ export function AppShell({
         </footer>
       </div>
 
+      <dialog
+        id={sheetId}
+        ref={sheet}
+        className="app-shell__nav-sheet"
+        aria-label="Navigation"
+        onClose={onSheetClose}
+        onKeyDown={(event) => trapTabKey(sheet.current, event)}
+        onClick={(event: MouseEvent<HTMLDialogElement>) => {
+          // A backdrop click targets the dialog itself; clicks inside land on the nav.
+          if (event.target === sheet.current) closeSheet();
+        }}
+      >
+        <nav className="app-shell__nav app-shell__nav--sheet" aria-label="Workspaces">
+          <Navigation destinations={destinations} currentId={currentId} rail={false} onClose={closeSheet} />
+        </nav>
+      </dialog>
+
       <Toaster />
     </div>
+  );
+}
+
+interface NavigationProps {
+  destinations: readonly NavDestination[];
+  currentId?: string;
+  rail: boolean;
+  /** The desktop sidebar owns the rail toggle and the id the toggle controls. */
+  navId?: string;
+  onToggleRail?: () => void;
+  /** The small-viewport sheet owns the close control. */
+  onClose?: () => void;
+}
+
+/** The registry navigation itself, shared by the sidebar and the sheet (they differ only in controls). */
+function Navigation({ destinations, currentId, rail, navId, onToggleRail, onClose }: NavigationProps) {
+  return (
+    <>
+      <div className="app-shell__nav-head">
+        <span className="app-shell__brand">Group Butler</span>
+        {onToggleRail ? (
+          <button
+            type="button"
+            className="app-shell__rail-toggle"
+            aria-expanded={!rail}
+            aria-controls={navId}
+            onClick={onToggleRail}
+          >
+            {rail ? "Expand navigation" : "Collapse navigation"}
+          </button>
+        ) : null}
+        {onClose ? (
+          <button type="button" className="app-shell__nav-close" onClick={onClose}>
+            Close navigation
+          </button>
+        ) : null}
+      </div>
+
+      <ul className="app-shell__nav-list">
+        {destinations.map((destination) => {
+          const current = destination.id === currentId;
+          return (
+            <li key={destination.id}>
+              <a
+                className="app-shell__nav-link"
+                href={destination.href}
+                aria-current={current ? "page" : undefined}
+              >
+                {destination.icon ? (
+                  <span className="app-shell__nav-icon" aria-hidden="true">
+                    {destination.icon}
+                  </span>
+                ) : null}
+                <span className="app-shell__nav-label">{destination.title}</span>
+                {current ? (
+                  <span className="app-shell__nav-current" aria-hidden="true">
+                    <CurrentGlyph />
+                  </span>
+                ) : null}
+              </a>
+            </li>
+          );
+        })}
+      </ul>
+    </>
   );
 }
 
@@ -250,7 +302,16 @@ function OverviewGlyph() {
 
 function CurrentGlyph() {
   return (
-    <svg viewBox="0 0 16 16" width="1em" height="1em" fill="none" stroke="currentColor" strokeWidth={1.75} strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      viewBox="0 0 16 16"
+      width="1em"
+      height="1em"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.75}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <path d="M3.5 8.5 6.5 11.5 12.5 4.5" />
     </svg>
   );
@@ -258,7 +319,15 @@ function CurrentGlyph() {
 
 function MenuGlyph() {
   return (
-    <svg viewBox="0 0 16 16" width="1em" height="1em" fill="none" stroke="currentColor" strokeWidth={1.75} strokeLinecap="round">
+    <svg
+      viewBox="0 0 16 16"
+      width="1em"
+      height="1em"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.75}
+      strokeLinecap="round"
+    >
       <path d="M2.5 4.5h11" />
       <path d="M2.5 8h11" />
       <path d="M2.5 11.5h11" />

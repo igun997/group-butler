@@ -183,7 +183,52 @@ body > main [role="alert"]:empty {
   gap: var(--space-1);
   padding: var(--space-1) var(--space-2) var(--space-2);
   background: var(--card);
+}
+
+/* The desktop sidebar; below `md` it leaves the grid for the modal sheet. */
+.app-shell__nav--sidebar {
   border-right: var(--border-width) solid var(--border);
+}
+
+/*
+ * The small-viewport navigation sheet (R-M2). It is a native `dialog`, so the
+ * browser supplies the modal semantics, the focus containment, the `Esc` close,
+ * the focus return to the trigger, and a `::backdrop` scrim that has no element
+ * to focus. The sidebar is `display: none` below `md` and a closed dialog is
+ * `display: none`, so exactly one `nav` landmark is exposed at a time.
+ */
+.app-shell__nav-sheet {
+  position: fixed;
+  inset: 0 auto 0 0;
+  margin: 0;
+  width: min(var(--shell-sidebar), 82vw);
+  max-width: 100vw;
+  height: 100dvh;
+  max-height: 100dvh;
+  padding: 0;
+  border: 0;
+  border-right: var(--border-width) solid var(--border);
+  background: var(--card);
+  color: var(--foreground);
+  box-shadow: var(--elevation-28);
+  overflow-y: auto;
+}
+
+.app-shell__nav-sheet::backdrop {
+  background: color-mix(in srgb, var(--foreground) 40%, transparent);
+}
+
+.app-shell__nav-sheet .app-shell__nav {
+  min-height: 100%;
+}
+
+/*
+ * One `nav` landmark at a time: while the sheet is open the sidebar yields to it,
+ * so the modal can never be exposed beside a second navigation (for instance
+ * when the viewport grows past `md` while the sheet is open).
+ */
+.app-shell:has(.app-shell__nav-sheet[open]) .app-shell__nav--sidebar {
+  display: none;
 }
 
 .app-shell__nav-head {
@@ -239,7 +284,7 @@ body > main [role="alert"]:empty {
 }
 
 /* The icon rail (R-M2): labels stay in the accessibility tree, on screen only the glyph. */
-.app-shell--rail .app-shell__brand {
+.app-shell--rail .app-shell__nav--sidebar .app-shell__brand {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -251,7 +296,7 @@ body > main [role="alert"]:empty {
   border: 0;
 }
 
-.app-shell--rail .app-shell__nav-label {
+.app-shell--rail .app-shell__nav--sidebar .app-shell__nav-label {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -263,12 +308,12 @@ body > main [role="alert"]:empty {
   border: 0;
 }
 
-.app-shell--rail .app-shell__nav-link,
-.app-shell--rail .app-shell__nav-head {
+.app-shell--rail .app-shell__nav--sidebar .app-shell__nav-link,
+.app-shell--rail .app-shell__nav--sidebar .app-shell__nav-head {
   justify-content: center;
 }
 
-.app-shell--rail .app-shell__nav-current {
+.app-shell--rail .app-shell__nav--sidebar .app-shell__nav-current {
   margin-left: 0;
 }
 
@@ -363,9 +408,8 @@ body > main [role="alert"]:empty {
   opacity: 0.7;
 }
 
-/* Hidden until the small-viewport rules reach them; specificity beats the shell button base. */
-.app-shell .app-shell__nav-trigger,
-.app-shell .app-shell__nav-close {
+/* Hidden until the small-viewport rules reach it; specificity beats the shell button base. */
+.app-shell .app-shell__nav-trigger {
   display: none;
 }
 
@@ -479,49 +523,20 @@ body > main [role="alert"]:empty {
 
 /*
  * Small viewports (R-M2): the registry navigation leaves the grid and becomes a
- * sheet opened from the header; the workspace identity and the scope stay in the
- * header without opening anything. The palette remains a header control and the
- * scrim is the sheet's close-by-pointer surface.
+ * modal sheet opened from the header; the workspace identity and the scope stay
+ * in the header without opening anything. The palette remains a header control.
  */
 @media (max-width: 767px) {
   .app-shell {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .app-shell__nav {
-    position: fixed;
-    inset: 0 auto 0 0;
-    width: min(var(--shell-sidebar), 82vw);
-    visibility: hidden;
-    transform: translateX(-100%);
-    transition: transform var(--motion-duration-sheet) var(--motion-curve-decelerate);
-    box-shadow: var(--elevation-28);
-    z-index: 3;
-  }
-
-  .app-shell--nav-open .app-shell__nav {
-    visibility: visible;
-    transform: none;
-  }
-
-  .app-shell .app-shell__nav-trigger,
-  .app-shell .app-shell__nav-close {
-    display: inline-flex;
-  }
-
-  .app-shell .app-shell__rail-toggle {
+  .app-shell .app-shell__nav--sidebar {
     display: none;
   }
 
-  .app-shell .app-shell__scrim {
-    position: fixed;
-    inset: 0;
-    display: block;
-    padding: 0;
-    border: 0;
-    border-radius: 0;
-    background: color-mix(in srgb, var(--foreground) 40%, transparent);
-    z-index: 2;
+  .app-shell .app-shell__nav-trigger {
+    display: inline-flex;
   }
 
   /*
@@ -567,12 +582,6 @@ body > main [role="alert"]:empty {
   .app-shell__footer,
   .app-shell__main {
     padding-inline: var(--space-3);
-  }
-}
-
-@media (min-width: 768px) {
-  .app-shell .app-shell__scrim {
-    display: none;
   }
 }
 

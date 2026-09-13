@@ -1,6 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { trapTabKey } from "./focus-trap";
+import { paletteShortcut } from "./keyboard";
 
 /**
  * One entry in the command palette (docs/ui-decision.md §4.6 R-A6). P2's view
@@ -57,8 +59,7 @@ export function CommandPalette({ commands, shortcutHint }: CommandPaletteProps) 
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
-      if (event.altKey || !(event.metaKey || event.ctrlKey)) return;
-      if (event.key.toLowerCase() !== "k") return;
+      if (!paletteShortcut(event)) return;
       event.preventDefault();
       if (dialog.current?.open) close();
       else open();
@@ -89,7 +90,21 @@ export function CommandPalette({ commands, shortcutHint }: CommandPaletteProps) 
         </kbd>
       </button>
 
-      <dialog ref={dialog} className="app-palette acrylic" aria-labelledby={titleId}>
+      <dialog
+        ref={dialog}
+        className="app-palette acrylic"
+        aria-labelledby={titleId}
+        onKeyDown={(event) => {
+          // A `type="search"` field consumes Escape to clear itself in Chromium;
+          // R-A6 gives Escape to the topmost layer, so it closes the palette here.
+          if (event.key === "Escape") {
+            event.preventDefault();
+            close();
+            return;
+          }
+          trapTabKey(dialog.current, event);
+        }}
+      >
         <h2 id={titleId} className="app-palette__title">
           Command palette
         </h2>

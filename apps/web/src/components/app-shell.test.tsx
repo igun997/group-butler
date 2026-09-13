@@ -7,6 +7,8 @@ import { AppShell, type AppShellProps } from "./app-shell";
  * server components: what matters here is the structure a browser and a screen
  * reader receive — the landmarks, the single `h1`, the eager live regions, and
  * the controls — not a client interaction the node environment cannot run.
+ * Focus containment and restoration belong to the native `dialog` and are
+ * exercised against a real browser.
  */
 function shell(overrides: Partial<AppShellProps> = {}): string {
   return renderToStaticMarkup(
@@ -25,8 +27,7 @@ describe("AppShell (spec §2.2 invariant 1, R-A5, R-A7)", () => {
   test("renders the four landmarks around exactly one h1", () => {
     const html = shell();
 
-    expect(html).toContain('aria-label="Workspaces"');
-    expect(html).toContain("<nav");
+    expect(html.match(/aria-label="Workspaces"/g)).toHaveLength(2);
     expect(html).toContain("<header");
     expect(html).toContain("<main");
     expect(html).toContain("<footer");
@@ -40,6 +41,19 @@ describe("AppShell (spec §2.2 invariant 1, R-A5, R-A7)", () => {
     expect(element(html, "live-polite")).toContain('aria-live="polite"');
     expect(element(html, "live-assertive")).toContain('aria-live="assertive"');
     expect(html.match(/data-testid="live-/g)).toHaveLength(2);
+  });
+
+  test("carries the small-viewport navigation in a modal-capable dialog", () => {
+    const html = shell();
+
+    const sheet = html.match(/<dialog[^>]*class="app-shell__nav-sheet"[^>]*>/)?.[0] ?? "";
+    expect(sheet).toContain('aria-label="Navigation"');
+    expect(sheet).not.toContain("open");
+
+    const sheetNav = html.match(
+      /<dialog[^>]*class="app-shell__nav-sheet"[^>]*>\s*<nav[^>]*aria-label="Workspaces"/,
+    );
+    expect(sheetNav).not.toBeNull();
   });
 
   test("exposes the palette trigger with its keyboard shortcut hint", () => {

@@ -12,6 +12,9 @@
  */
 export type SignOutFetch = (input: string, init: RequestInit) => Promise<Response>;
 
+/** Where the browser is sent once the session has really ended. */
+export type Navigate = (href: string) => void;
+
 /** `true` when the server ended the session; `false` when it did not, or was unreachable. */
 export async function signOut(fetchImpl: SignOutFetch = fetch): Promise<boolean> {
   try {
@@ -20,4 +23,18 @@ export async function signOut(fetchImpl: SignOutFetch = fetch): Promise<boolean>
   } catch {
     return false;
   }
+}
+
+/**
+ * The whole sign-out outcome: end the session, and navigate to `/login` only
+ * when it did. Split from the DOM so the navigation decision — the part a
+ * forgotten redirect or a redirect-on-failure would break — is testable.
+ */
+export async function signOutAndRedirect(
+  navigate: Navigate,
+  fetchImpl: SignOutFetch = fetch,
+): Promise<boolean> {
+  const ended = await signOut(fetchImpl);
+  if (ended) navigate("/login");
+  return ended;
 }
