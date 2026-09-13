@@ -1,0 +1,10 @@
+# Build context for the worker image is this directory (see the Dockerfile).
+# Docker reads .dockerignore and never .gitignore, so everything that is merely
+# git-ignored — above all the host-built binary and the local sqlite auth store —
+# has to be listed here or it lands in the build context.
+worker
+.localdata
+*.db
+*.out
+.env
+.env.*

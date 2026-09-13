@@ -1,0 +1,33 @@
+# Build context for the WEB image is the repository root:
+#
+#   docker build -f apps/web/Dockerfile -t butler-web:dev .
+#
+# It cannot be `apps/web`, because the Next build needs the bun workspace
+# manifests (root package.json + bun.lock) and packages/shared. Docker reads
+# .dockerignore and never .gitignore, so this file is the only thing keeping the
+# git objects, the host node_modules and the real .env out of the image layers.
+
+.git
+.github
+node_modules
+**/node_modules
+.next
+**/.next
+coverage
+**/coverage
+**/*.tsbuildinfo
+
+# Real credentials live in .env / .env.local; they must never enter a layer.
+# Next also auto-loads .env files at build time, which would inline those values.
+# Docker anchors a slashless pattern to the context root (unlike .gitignore), so
+# each nested form needs its own `**/` rule.
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Not inputs to the web build.
+docs
+infra
+apps/worker
+**/*.md
