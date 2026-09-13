@@ -174,22 +174,31 @@ func loadConfig() (Config, error) {
 func (c Config) validate() error {
 	for _, v := range []struct {
 		key   string
+		value time.Duration
+	}{
+		{"INGEST_FLUSH_MS", c.IngestFlush},
+		{"MEDIA_DOWNLOAD_TIMEOUT", c.MediaDownloadTimeout},
+		{"MEDIA_JANITOR_INTERVAL", c.MediaJanitorEvery},
+		{"GROUP_SYNC_INTERVAL", c.GroupSyncInterval},
+		{"GROUP_STALE_AFTER", c.GroupStaleAfter},
+		{"DISPATCH_INTERVAL", c.DispatchInterval},
+	} {
+		if v.value <= 0 {
+			return fmt.Errorf("%s must be positive, got %s", v.key, v.value)
+		}
+	}
+	for _, v := range []struct {
+		key   string
 		value int64
 	}{
 		{"INGEST_QUEUE_SIZE", int64(c.IngestQueueSize)},
-		{"INGEST_FLUSH_MS", int64(c.IngestFlush / time.Millisecond)},
 		{"INGEST_FLUSH_MAX", int64(c.IngestFlushMax)},
 		{"RAW_JSON_MAX_BYTES", int64(c.RawJSONMaxBytes)},
 		{"RAW_SEARCH_MAX_BYTES", int64(c.RawSearchMax)},
 		{"MEDIA_MAX_BYTES", c.MediaMaxBytes},
 		{"MEDIA_CONCURRENCY", int64(c.MediaConcurrency)},
-		{"MEDIA_DOWNLOAD_TIMEOUT", int64(c.MediaDownloadTimeout)},
 		{"MEDIA_MAX_ATTEMPTS", int64(c.MediaMaxAttempts)},
-		{"MEDIA_JANITOR_INTERVAL", int64(c.MediaJanitorEvery)},
 		{"HISTORY_SYNC_MAX_DAYS", int64(c.HistorySyncMaxDays)},
-		{"GROUP_SYNC_INTERVAL", int64(c.GroupSyncInterval)},
-		{"GROUP_STALE_AFTER", int64(c.GroupStaleAfter)},
-		{"DISPATCH_INTERVAL", int64(c.DispatchInterval)},
 		{"SEND_MAX_ATTEMPTS", int64(c.SendMaxAttempts)},
 	} {
 		if v.value <= 0 {

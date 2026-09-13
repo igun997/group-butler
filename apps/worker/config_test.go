@@ -38,7 +38,7 @@ func TestLoadConfig_DevWhatsmeowDBMatchesEnvExample(t *testing.T) {
 	// `.env.example`, i.e. a relative path inside the git-ignored
 	// apps/worker/.localdata/ — never the container's mounted /data path, which
 	// a host process may not even be able to create.
-	t.Setenv("ENVIRONMENT", "development")
+	setDevEnv(t)
 	t.Setenv("WHATSMEOW_DB_URI", "")
 
 	cfg, err := loadConfig()
@@ -128,31 +128,49 @@ func TestLoadConfig_RejectsNonPositiveLimits(t *testing.T) {
 	// queue, a zero cap or concurrency, no attempt budget, or a zero interval
 	// either stores nothing or never makes progress (time.NewTicker panics on a
 	// non-positive interval). Booleans and PORT are deliberately absent.
-	for _, key := range []string{
-		"INGEST_QUEUE_SIZE",
-		"INGEST_FLUSH_MS",
-		"INGEST_FLUSH_MAX",
-		"RAW_JSON_MAX_BYTES",
-		"RAW_SEARCH_MAX_BYTES",
-		"MEDIA_MAX_BYTES",
-		"MEDIA_CONCURRENCY",
-		"MEDIA_DOWNLOAD_TIMEOUT",
-		"MEDIA_MAX_ATTEMPTS",
-		"MEDIA_JANITOR_INTERVAL",
-		"HISTORY_SYNC_MAX_DAYS",
-		"GROUP_SYNC_INTERVAL",
-		"GROUP_STALE_AFTER",
-		"DISPATCH_INTERVAL",
-		"SEND_MAX_ATTEMPTS",
+	for _, tc := range []struct{ key, value string }{
+		{"INGEST_QUEUE_SIZE", "0"},
+		{"INGEST_FLUSH_MS", "0"},
+		{"INGEST_FLUSH_MAX", "0"},
+		{"RAW_JSON_MAX_BYTES", "0"},
+		{"RAW_SEARCH_MAX_BYTES", "0"},
+		{"MEDIA_MAX_BYTES", "0"},
+		{"MEDIA_CONCURRENCY", "0"},
+		{"MEDIA_DOWNLOAD_TIMEOUT", "0"},
+		{"MEDIA_MAX_ATTEMPTS", "0"},
+		{"MEDIA_JANITOR_INTERVAL", "0"},
+		{"HISTORY_SYNC_MAX_DAYS", "0"},
+		{"GROUP_SYNC_INTERVAL", "0"},
+		{"GROUP_STALE_AFTER", "0"},
+		{"DISPATCH_INTERVAL", "0"},
+		{"SEND_MAX_ATTEMPTS", "0"},
+		// One representative below the boundary, so the gate is proven to be
+		// `<= 0` and not merely "rejects the zero the table above supplies".
+		{"INGEST_QUEUE_SIZE", "-1"},
 	} {
-		t.Run(key, func(t *testing.T) {
+		t.Run(tc.key+"="+tc.value, func(t *testing.T) {
 			setDevEnv(t)
-			t.Setenv(key, "0")
+			t.Setenv(tc.key, tc.value)
 
 			if _, err := loadConfig(); err == nil {
-				t.Fatalf("loadConfig accepted %s=0", key)
+				t.Fatalf("loadConfig accepted %s=%s", tc.key, tc.value)
 			}
 		})
+	}
+}
+
+func TestLoadConfig_NonPositiveDurationErrorIsOperatorReadable(t *testing.T) {
+	// A rejected interval must name the variable and print the duration the way
+	// it was configured, not as raw nanoseconds.
+	setDevEnv(t)
+	t.Setenv("MEDIA_JANITOR_INTERVAL", "-1s")
+
+	_, err := loadConfig()
+	if err == nil {
+		t.Fatal("loadConfig accepted MEDIA_JANITOR_INTERVAL=-1s")
+	}
+	if !strings.Contains(err.Error(), "MEDIA_JANITOR_INTERVAL") || !strings.Contains(err.Error(), "-1s") {
+		t.Errorf("error = %q, want the variable name and the duration", err)
 	}
 }
 
