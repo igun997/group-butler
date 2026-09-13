@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import { MongoMemoryReplSet } from "mongodb-memory-server";
+import { UnauthorizedError } from "../../../server/auth/owner";
 import { issueSession } from "../../../server/auth/session";
 import { closeDb } from "../../../server/mongo";
 import { insertGroup, insertInstance } from "../../../server/repos/test-helpers";
@@ -86,13 +87,32 @@ describe("GET /api/groups", () => {
     expect(body.groups.map((g: { groupJid: string }) => g.groupJid)).not.toContain("120363043777777777@g.us");
   });
 
-  test("rejects an unauthenticated request", async () => {
+  test("answers 401 for a request with no session", async () => {
     session.token = "";
-    await expect(GET()).rejects.toThrow(/unauthorized/);
+    const res = await GET();
+    expect(res.status).toBe(401);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(await res.json()).toEqual({ error: "unauthorized" });
   });
 
-  test("rejects a forged session cookie instead of trusting its presence", async () => {
+  test("answers 401 for a forged session cookie instead of trusting its presence", async () => {
     session.token = "eyJzdWIiOiJvd25lciIsImVtYWlsIjoiYXR0YWNrZXJAaG9zdCJ9.forged";
-    await expect(GET()).rejects.toThrow(/unauthorized/);
+    const res = await GET();
+    expect(res.status).toBe(401);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(await res.json()).toEqual({ error: "unauthorized" });
+  });
+
+  test("lets an unexpected failure surface instead of masking it as 401", async () => {
+    vi.stubEnv("MONGODB_URI", "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=250");
+    await closeDb();
+    try {
+      const error = await GET().catch((thrown: unknown) => thrown);
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toBeInstanceOf(UnauthorizedError);
+    } finally {
+      await closeDb();
+      vi.stubEnv("MONGODB_URI", replSet.getUri());
+    }
   });
 });

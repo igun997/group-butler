@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import { MongoMemoryReplSet } from "mongodb-memory-server";
 import { COLLECTIONS } from "../../../../../server/collections";
+import { UnauthorizedError } from "../../../../../server/auth/owner";
 import { issueSession } from "../../../../../server/auth/session";
 import { closeDb, getDb } from "../../../../../server/mongo";
 import { insertGroup } from "../../../../../server/repos/test-helpers";
@@ -147,13 +148,32 @@ describe("GET /api/instances/[id]/groups", () => {
     ]);
   });
 
-  test("rejects an unauthenticated request", async () => {
+  test("answers 401 for a request with no session", async () => {
     session.token = "";
-    await expect(getGroups("inst_1")).rejects.toThrow(/unauthorized/);
+    const res = await getGroups("inst_1");
+    expect(res.status).toBe(401);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(await res.json()).toEqual({ error: "unauthorized" });
   });
 
-  test("rejects a forged session cookie instead of trusting its presence", async () => {
+  test("answers 401 for a forged session cookie instead of trusting its presence", async () => {
     session.token = "eyJzdWIiOiJvd25lciIsImVtYWlsIjoiYXR0YWNrZXJAaG9zdCJ9.forged";
-    await expect(getGroups("inst_1")).rejects.toThrow(/unauthorized/);
+    const res = await getGroups("inst_1");
+    expect(res.status).toBe(401);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(await res.json()).toEqual({ error: "unauthorized" });
+  });
+
+  test("lets an unexpected failure surface instead of masking it as 401", async () => {
+    vi.stubEnv("MONGODB_URI", "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=250");
+    await closeDb();
+    try {
+      const error = await getGroups("inst_1").catch((thrown: unknown) => thrown);
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toBeInstanceOf(UnauthorizedError);
+    } finally {
+      await closeDb();
+      vi.stubEnv("MONGODB_URI", replSet.getUri());
+    }
   });
 });
