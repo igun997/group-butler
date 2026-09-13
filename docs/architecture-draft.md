@@ -1215,9 +1215,10 @@ services:
     image: mongo:7
     depends_on: { mongo: { condition: service_healthy } }
     restart: "no"
-    # Member host is 127.0.0.1 (not mongo:27017): the clients are host processes
-    # and a replica set advertises member hosts back to them.
-    entrypoint: ["bash","-lc","mongosh --host 127.0.0.1 --quiet --eval 'try{rs.status()}catch(e){rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"127.0.0.1:27017\"}]})}'"]
+    # Connects by SERVICE NAME (`mongo`); the replica set ADVERTISES 127.0.0.1:27017
+    # so the host-run apps can reach the member. The guard reads
+    # local.system.replset, so a re-run is a no-op instead of an error.
+    entrypoint: ["bash","-lc","mongosh --host mongo --quiet --eval 'if (db.getSiblingDB(\"local\").system.replset.countDocuments() > 0) { print(\"replica set already initiated\") } else { rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"127.0.0.1:27017\"}]}); print(\"replica set initiated\") }'"]
 volumes: { mongo-data: {} }
 ```
 Why a single-node replica set: change streams (live UI, §7.4) require one, and the local

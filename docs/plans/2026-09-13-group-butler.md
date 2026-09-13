@@ -499,6 +499,15 @@ services:
       start_period: 10s
 
   # One-shot, idempotent replica-set init; safe to run on every `up`.
+  #
+  # Two different hosts are involved and they must not be confused:
+  #   * this client connects by SERVICE NAME (`mongo`) because the server runs in
+  #     another container;
+  #   * the replica set ADVERTISES 127.0.0.1:27017, because the clients that
+  #     speak replica-set protocol are the host-run web and worker processes,
+  #     which reach the published port on loopback.
+  # The guard reads local.system.replset rather than calling rs.status(), so it
+  # behaves the same before and after initiation and never fails on re-run.
   mongo-init:
     image: mongo:7
     depends_on:
@@ -510,9 +519,14 @@ services:
       - -lc
       - |
         set -eu
-        mongosh --host 127.0.0.1 --quiet --eval '
-          try { rs.status(); print("replica set already initiated"); }
-          catch (e) { rs.initiate({_id:"rs0", members:[{_id:0, host:"127.0.0.1:27017"}]}); print("replica set initiated"); }
+        mongosh --host mongo --quiet --eval '
+          const configured = db.getSiblingDB("local").system.replset.countDocuments() > 0;
+          if (configured) {
+            print("replica set already initiated");
+          } else {
+            rs.initiate({_id: "rs0", members: [{_id: 0, host: "127.0.0.1:27017"}]});
+            print("replica set initiated");
+          }
         '
 
 volumes:
