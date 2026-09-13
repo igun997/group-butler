@@ -54,12 +54,12 @@
     "dev:check": "bash scripts/dev.sh --check",
     "dev:infra": "docker compose -f infra/dev/docker-compose.yml up -d",
     "dev:down": "docker compose -f infra/dev/docker-compose.yml down",
-    "bootstrap": "bun --cwd apps/web run bootstrap",
-    "auth:hash": "bun --cwd apps/web run auth:hash",
-    "test": "bun test scripts/dev.test.ts && bun --cwd packages/shared run test && bun --cwd apps/web run test",
+    "bootstrap": "bun run --cwd apps/web bootstrap",
+    "auth:hash": "bun run --cwd apps/web auth:hash",
+    "test": "bun test scripts/dev.test.ts && bun run --cwd packages/shared test && bun run --cwd apps/web test",
     "test:worker": "cd apps/worker && go test ./... -short",
-    "lint": "bun --cwd packages/shared run lint && bun --cwd apps/web run lint",
-    "check": "bun --cwd apps/web run check"
+    "lint": "bun run --cwd packages/shared lint && bun run --cwd apps/web lint",
+    "check": "bun run --cwd apps/web check"
   },
   "devDependencies": { "typescript": "^5.6.3" }
 }
@@ -147,13 +147,24 @@ apps/worker/whatsapp-worker
 
 **Step 5: Verify**
 
-Run: `bun install && bun --cwd packages/shared run lint`
+Run: `bun install && bun run --cwd packages/shared lint`
 Expected: install completes; `tsc` exits 0.
+
+Two tooling facts verified on bun 1.3.14 while executing this task, both now encoded in the plan:
+
+- **Workspace scripts MUST be invoked as `bun run --cwd <dir> <script>`.** The form
+  `bun --cwd <dir> run <script>` prints the `bun run` usage text, lists the target package's
+  scripts, and **exits 0 without running anything** — a silent no-op that would have skipped every
+  workspace script in CI while reporting success. Every `bun run --cwd …` occurrence in this plan
+  (root `package.json`, `scripts/dev.sh`, CI) uses the working form.
+- **`packages/shared/src/index.ts` exists from this task** as an empty module (`export {}`) so
+  `tsc --noEmit -p tsconfig.json` has an input; without it the package's `lint` fails with
+  `error TS18003: No inputs were found in config file`. Task 5 adds the real exports to that file.
 
 **Step 6: Commit**
 
 ```bash
-git add package.json .gitignore tsconfig.base.json apps/web/package.json packages/shared
+git add package.json .gitignore tsconfig.base.json apps/web/package.json packages/shared bun.lock
 git commit -m "chore: scaffold monorepo workspaces and root scripts"
 ```
 
@@ -871,7 +882,7 @@ start_child() {
   log "started [$name] pid=$!"
 }
 
-start_child web bun --cwd "$ROOT/apps/web" run dev
+start_child web bun run --cwd "$ROOT/apps/web" dev
 start_child worker bash -lc "cd '$ROOT/apps/worker' && exec go run ./..."
 
 log "web=http://127.0.0.1:3000  worker=http://127.0.0.1:${PORT:-4000}  (Ctrl-C stops both)"
@@ -1090,7 +1101,7 @@ export type GroupUpdatedEvent = z.infer<typeof GroupUpdatedEventSchema>;
 
 **Step 5: Verify and commit**
 
-Run: `bun test packages/shared/test/worker-contract.test.ts && bun --cwd packages/shared run lint`
+Run: `bun test packages/shared/test/worker-contract.test.ts && bun run --cwd packages/shared lint`
 Expected: PASS (4 tests); `tsc` exits 0.
 
 Append to `packages/shared/src/index.ts`: `export * from "./worker-contract";`
@@ -1478,7 +1489,7 @@ describe("bootstrap", () => {
 
 **Step 7: Run it — expect failure**
 
-Run: `bun --cwd apps/web run test bootstrap`
+Run: `bun run --cwd apps/web test bootstrap`
 Expected: FAIL — `Cannot find module './mongo'`.
 
 **Step 8: Implement the BFF Mongo helpers and bootstrap**
@@ -1553,7 +1564,7 @@ from the env, `$setOnInsert` only.
 
 **Step 9: Verify and commit**
 
-Run: `bun --cwd apps/web run test bootstrap && bun run bootstrap && docker compose -f infra/dev/docker-compose.yml exec -T mongo mongosh group_butler --quiet --eval 'db.groups.getIndexes().map(i=>i.name)'`
+Run: `bun run --cwd apps/web test bootstrap && bun run bootstrap && docker compose -f infra/dev/docker-compose.yml exec -T mongo mongosh group_butler --quiet --eval 'db.groups.getIndexes().map(i=>i.name)'`
 Expected: PASS (2 tests); the index list includes `uniq_group`, `group_activity`, `group_name_search`.
 
 ```bash
@@ -3194,7 +3205,7 @@ describe("POST /api/auth/login", () => {
 
 **Step 2: Run them — expect failure**
 
-Run: `bun --cwd apps/web run test auth`
+Run: `bun run --cwd apps/web test auth`
 Expected: FAIL — `Cannot find module './password'` / `./route`.
 
 **Step 3: Implement `password.ts` (scrypt: no native deps, works on alpine)**
@@ -3312,7 +3323,7 @@ only — every handler still calls `requireOwner()`.
 
 **Step 6: Verify and commit**
 
-Run: `bun --cwd apps/web run test auth`
+Run: `bun run --cwd apps/web test auth`
 Expected: PASS (10 tests).
 
 ```bash
@@ -3447,7 +3458,7 @@ returning `{ cookies: async () => ({ get: () => ({ value: issueSession({ email: 
 
 **Step 2: Run it — expect failure**
 
-Run: `bun --cwd apps/web run test "instances/\[id\]/groups"`
+Run: `bun run --cwd apps/web test "instances/\[id\]/groups"`
 Expected: FAIL — `Cannot find module './route'`.
 
 **Step 3: Implement the repo and route**
@@ -3471,7 +3482,7 @@ also carries `instanceId` and `instanceLabel` so one screen covers every instanc
 
 **Step 4: Verify and commit**
 
-Run: `bun --cwd apps/web run test "instances/\[id\]/groups"`
+Run: `bun run --cwd apps/web test "instances/\[id\]/groups"`
 Expected: PASS (3 tests).
 
 ```bash
@@ -3558,7 +3569,7 @@ describe("searchMessages", () => {
 
 **Step 2: Run it — expect failure**
 
-Run: `bun --cwd apps/web run test repos/messages`
+Run: `bun run --cwd apps/web test repos/messages`
 Expected: FAIL — `Cannot find module './messages'`.
 
 **Step 3: Implement `repos/messages.ts`**
@@ -3575,7 +3586,7 @@ media{status, declaredType, r2Key, mime, fileName}) and
 
 **Step 4: Run the test to verify it passes**
 
-Run: `bun --cwd apps/web run test repos/messages`
+Run: `bun run --cwd apps/web test repos/messages`
 Expected: PASS (3 tests).
 
 **Step 5: Implement presigning and the routes**
@@ -3718,7 +3729,7 @@ describe("token layer (spec §3.2)", () => {
 
 **Step 2: Run it — expect failure**
 
-Run: `bun --cwd apps/web run test ui/tokens`
+Run: `bun run --cwd apps/web test ui/tokens`
 Expected: FAIL — `Cannot find module './index'`.
 
 **Step 3: Implement the tokens**
@@ -3734,7 +3745,7 @@ shadcn theme tokens are the only colour source (spec §3.1).
 
 **Step 4: Verify — no raw values in components**
 
-Run: `bun --cwd apps/web run test ui/tokens && bun --cwd apps/web run check`
+Run: `bun run --cwd apps/web test ui/tokens && bun run --cwd apps/web check`
 Expected: PASS (4 tests); typecheck clean.
 
 Run: `grep -rnE "#[0-9a-fA-F]{3,6}|[0-9]+px" apps/web/src/components apps/web/src/views | grep -v "\.test\."`
@@ -3798,7 +3809,7 @@ describe("AppShell (spec §2.2 invariant 1, R-A7)", () => {
 
 **Step 2: Run it — expect failure**
 
-Run: `bun --cwd apps/web run test app-shell`
+Run: `bun run --cwd apps/web test app-shell`
 Expected: FAIL — `Cannot find module './app-shell'`.
 
 **Step 3: Implement**
@@ -3812,7 +3823,7 @@ handling once, here. `app/(dash)/layout.tsx` is the only page shell for every au
 
 **Step 4: Verify**
 
-Run: `bun --cwd apps/web run test app-shell`
+Run: `bun run --cwd apps/web test app-shell`
 Expected: PASS (3 tests) — this is P1's proof: every authenticated route renders inside the one shell,
 logout returns to `/login`, and the shell holds exactly one polite and one assertive live region.
 
@@ -3875,7 +3886,7 @@ describe("scope resolution and canonicalisation", () => {
 
 **Step 2: Run it — expect failure**
 
-Run: `bun --cwd apps/web run test ui/registry`
+Run: `bun run --cwd apps/web test ui/registry`
 Expected: FAIL — `Cannot find module './index'`.
 
 **Step 3: Implement the registry**
@@ -3922,7 +3933,7 @@ describe("ScopeSpine", () => {
 
 **Step 5: Run it — expect failure; then implement**
 
-Run: `bun --cwd apps/web run test scope-spine` → FAIL (`Cannot find module './scope-spine'`).
+Run: `bun run --cwd apps/web test scope-spine` → FAIL (`Cannot find module './scope-spine'`).
 
 `scope-spine.tsx` renders instance rows (label, `InstanceStateBadge`, `groupsObserved`/`groupsLeft`,
 `lastSyncAt`) and, under the active instance, group rows using `GroupNameCell` + `JidCell` so the raw
@@ -3933,7 +3944,7 @@ live patches (`R-V4`). Below `md` it collapses to a scope chip opening a `Sheet`
 
 **Step 6: Verify and commit**
 
-Run: `bun --cwd apps/web run test ui/registry scope-spine`
+Run: `bun run --cwd apps/web test ui/registry scope-spine`
 Expected: PASS. P2's proof: table-driven canonicalisation, invalid params, aliases, group scope
 without instance, unknown view and stale bookmark each render a working default.
 
@@ -4012,7 +4023,7 @@ describe("useResource loading tiers (R-L1..R-L3)", () => {
 
 **Step 2: Run it — expect failure**
 
-Run: `bun --cwd apps/web run test ui/resource`
+Run: `bun run --cwd apps/web test ui/resource`
 Expected: FAIL — `Cannot find module './use-resource'`.
 
 **Step 3: Implement the resource layer**
@@ -4030,7 +4041,7 @@ same policy. `app/api/stream/route.ts` serves the SSE endpoint (change streams o
 
 **Step 4: Verify and commit**
 
-Run: `bun --cwd apps/web run test ui/resource`
+Run: `bun run --cwd apps/web test ui/resource`
 Expected: PASS — P3's proof: tier transitions per R-L1–R-L3, a scope switch that never interleaves two
 scopes' data (R-V5), and a simulated SSE→poll fallback with identical DOM.
 
@@ -4098,7 +4109,7 @@ describe("toast policy (R-T1..R-T5)", () => {
 
 **Step 2: Run it — expect failure**
 
-Run: `bun --cwd apps/web run test ui/feedback`
+Run: `bun run --cwd apps/web test ui/feedback`
 Expected: FAIL — `Cannot find module './toast-policy'`.
 
 **Step 3: Implement the feedback layer**
@@ -4118,7 +4129,7 @@ recovery control of `R-X4` and never renders raw stacks or worker JSON.
 
 **Step 4: Verify and commit**
 
-Run: `bun --cwd apps/web run test ui/feedback components/feedback`
+Run: `bun run --cwd apps/web test ui/feedback components/feedback`
 Expected: PASS — P4's proof: R-T1–R-T5 exercised as a table, every forbidden toast produces no toast,
 every unknown code falls back and shows a copyable code.
 
@@ -4177,7 +4188,7 @@ describe("groups slice (R11, R-V4)", () => {
 
 **Step 2: Run it — expect failure; then implement**
 
-Run: `bun --cwd apps/web run test views/groups` → FAIL (`Cannot find module './groups'`).
+Run: `bun run --cwd apps/web test views/groups` → FAIL (`Cannot find module './groups'`).
 
 `views/groups.tsx` declares the `groups` view descriptor for `global | instance` scope (canonical
 `/groups` plus the `/instances/[instanceId]/groups` alias), a fixed panel catalog, and a
@@ -4192,7 +4203,7 @@ scope label, live indicator, and actions.
 
 **Step 3: Verify and commit**
 
-Run: `bun --cwd apps/web run test views/groups`
+Run: `bun run --cwd apps/web test views/groups`
 Expected: PASS — P5's proof: the full `<id>@g.us` is visible and copyable and the current name is
 non-empty for every row; a rename patches in place with no toast and no focus move; fallback names
 render and then resolve after sync.
@@ -4240,7 +4251,7 @@ describe("instance view (R-L5, R-X3)", () => {
 
 **Step 2: Run it — expect failure; then implement**
 
-Run: `bun --cwd apps/web run test views/instance` → FAIL (`Cannot find module './instance'`).
+Run: `bun run --cwd apps/web test views/instance` → FAIL (`Cannot find module './instance'`).
 
 `views/instance.tsx` implements the instance view with config editor, `PairingPanel` (stateful
 pairing with elapsed time, TTL, cancel — never a skeleton), `WhitelistEditor` writing
@@ -4251,7 +4262,7 @@ BFF mutation path, status badges, the per-instance group table, `Sync now`, and 
 
 **Step 3: Verify and commit**
 
-Run: `bun --cwd apps/web run test views/instance views/instances`
+Run: `bun run --cwd apps/web test views/instance views/instances`
 Expected: PASS — P6's proof: `disconnected → pairing → connected` traverses without a skeleton; an
 empty whitelist produces `unconfigured` everywhere it is consumed; `logged_out` raises the re-pair
 banner while data stays readable.
@@ -4313,7 +4324,7 @@ describe("messages + group views", () => {
 
 **Step 2: Run it — expect failure; then implement**
 
-Run: `bun --cwd apps/web run test views/messages` → FAIL (`Cannot find module './messages'`).
+Run: `bun run --cwd apps/web test views/messages` → FAIL (`Cannot find module './messages'`).
 
 `views/messages.tsx` declares the `messages` view for `global | instance` scope with `q`, instance,
 group, kind, media-status and date filters in URL params, cursor paging that keeps rows mounted, and
@@ -4325,7 +4336,7 @@ renders `raw.message` as collapsible **text**.
 
 **Step 3: Verify and commit**
 
-Run: `bun --cwd apps/web run test views/messages`
+Run: `bun run --cwd apps/web test views/messages`
 Expected: PASS — P7's proof: search + filters + Back restore the same page; media is requested only on
 demand and re-requested on expiry; no message content reaches the DOM as HTML.
 
@@ -4377,7 +4388,7 @@ describe("assistant view (R5)", () => {
 
 **Step 2: Run it — expect failure; then implement**
 
-Run: `bun --cwd apps/web run test views/assistant` → FAIL (`Cannot find module './assistant'`).
+Run: `bun run --cwd apps/web test views/assistant` → FAIL (`Cannot find module './assistant'`).
 
 `views/assistant.tsx` requires an instance scope (the route constraint mirroring the server rule that
 nothing about scope comes from the client, draft §7.2 step 1), renders the permanent `ScopeBanner`
@@ -4388,7 +4399,7 @@ tokens/cost, and handles `ai_no_whitelist`, budget exhaustion and the refused-re
 
 **Step 3: Verify and commit**
 
-Run: `bun --cwd apps/web run test views/assistant`
+Run: `bun run --cwd apps/web test views/assistant`
 Expected: PASS — P8's proof: an empty whitelist disables input before submit; the banner cannot widen
 scope; a refusal inside a call surfaces the count and links to the call row.
 
@@ -4442,7 +4453,7 @@ describe("sends view (R7)", () => {
 
 **Step 2: Run it — expect failure; then implement**
 
-Run: `bun --cwd apps/web run test views/sends` → FAIL (`Cannot find module './sends'`).
+Run: `bun run --cwd apps/web test views/sends` → FAIL (`Cannot find module './sends'`).
 
 `views/sends.tsx` renders the queue (status/instance/group filters), `SendCard`s with
 `SendStatusTrack`, `dispatch.attempts`, error copy and dispatch history; the composer accepts text,
@@ -4452,7 +4463,7 @@ through `AlertDialog` confirmations (`R-A8`) and `useAction`; no status is ever 
 
 **Step 3: Verify and commit**
 
-Run: `bun --cwd apps/web run test views/sends`
+Run: `bun run --cwd apps/web test views/sends`
 Expected: PASS — P9's proof: ambiguous failure renders re-approve only; approval is never optimistic;
 every transition writes the audit-backed state the server returns.
 
@@ -4502,7 +4513,7 @@ describe("stats + overview", () => {
 
 **Step 2: Run it — expect failure; then implement**
 
-Run: `bun --cwd apps/web run test views/stats` → FAIL (`Cannot find module './stats'`).
+Run: `bun run --cwd apps/web test views/stats` → FAIL (`Cannot find module './stats'`).
 
 `views/stats.tsx` renders the three tabs with tables (and charts that expose their rows plus a text
 summary for assistive technology), rollup recompute with streamed progress, and whitelist rejections
@@ -4512,7 +4523,7 @@ decision now.
 
 **Step 3: Verify and commit**
 
-Run: `bun --cwd apps/web run test views/stats`
+Run: `bun run --cwd apps/web test views/stats`
 Expected: PASS — P10's proof: counters and rollups are distinguishable in the UI; every overview panel
 resolves to a real state (`no-data`/`unavailable`/`filtered`) with no invented numbers.
 
@@ -4552,7 +4563,7 @@ describe("settings view", () => {
 
 **Step 2: Run it — expect failure; then implement**
 
-Run: `bun --cwd apps/web run test views/settings` → FAIL (`Cannot find module './settings'`).
+Run: `bun run --cwd apps/web test views/settings` → FAIL (`Cannot find module './settings'`).
 
 `views/settings.tsx`: AI budget (global + per-instance override), retention, storage/R2 info,
 `/api/health` detail, the `auditLog` table with cursor paging, and appearance (density default,
@@ -4560,7 +4571,7 @@ reset-all-layouts).
 
 **Step 3: Verify and commit**
 
-Run: `bun --cwd apps/web run test views/settings`
+Run: `bun run --cwd apps/web test views/settings`
 Expected: PASS — P11's proof: audit rows match the actions performed; health shows Mongo and worker
 reachability separately.
 
@@ -4608,7 +4619,7 @@ describe("layout store (spec §2.4)", () => {
 
 **Step 2: Run it — expect failure; then implement**
 
-Run: `bun --cwd apps/web run test ui/store` → FAIL (`Cannot find module './layout-store'`).
+Run: `bun run --cwd apps/web test ui/store` → FAIL (`Cannot find module './layout-store'`).
 
 `layout-store.ts` persists `{order, span, collapsed}` per `(viewId, breakpoint)` over the view's fixed
 panel catalog, with per-view reset and global reset; spans snap to the 12-column scale; nothing is
@@ -4616,7 +4627,7 @@ serialized into the URL.
 
 **Step 3: Verify and commit**
 
-Run: `bun --cwd apps/web run test ui/store`
+Run: `bun run --cwd apps/web test ui/store`
 Expected: PASS — P12's proof: a rearranged view survives reload; a shared link opens the descriptor's
 default order; reset restores defaults exactly.
 
@@ -4672,7 +4683,7 @@ test("status is never conveyed by colour alone", async ({ page }) => {
 
 **Step 2: Run them — expect failure**
 
-Run: `bun --cwd apps/web x playwright test e2e/a11y.spec.ts e2e/mobile.spec.ts`
+Run: `bun run --cwd apps/web x playwright test e2e/a11y.spec.ts e2e/mobile.spec.ts`
 Expected: FAIL on the first missing behaviour (palette escape handling, mobile sheet chrome, target
 sizes) — each failure is a real gap, not a harness error.
 
@@ -4688,7 +4699,7 @@ auto-scroll).
 
 **Step 4: Verify and commit**
 
-Run: `bun --cwd apps/web x playwright test e2e/`
+Run: `bun run --cwd apps/web x playwright test e2e/`
 Expected: PASS — P13's proof: a keyboard-only walkthrough of login → create → pair → sync → assign →
 whitelist → search → ask → approve, plus a 320 px / 400 % zoom pass on every view with no horizontal
 scrolling.
@@ -4748,7 +4759,7 @@ describe("drift guards (spec P14, draft §6.5/§6.7)", () => {
 
 **Step 2: Run them — expect failure; then implement**
 
-Run: `bun --cwd apps/web run test transport-drift error-map` → FAIL until the map covers every code and
+Run: `bun run --cwd apps/web test transport-drift error-map` → FAIL until the map covers every code and
 the indicator is transport-only.
 
 Implement: resume-token reconnect with backoff, the SSE↔poll parity test above, contract parity via
@@ -4758,7 +4769,7 @@ default, never an error page).
 
 **Step 3: Verify and commit**
 
-Run: `bun --cwd apps/web run test ui && bun --cwd apps/web run check && bun test scripts/dev.test.ts`
+Run: `bun run --cwd apps/web test ui && bun run --cwd apps/web check && bun test scripts/dev.test.ts`
 Expected: PASS — P14's proof: a forced SSE failure produces no visible change beyond the indicator; an
 unknown worker code renders the fallback with a copyable code; a drift fixture fails loudly.
 
@@ -4777,7 +4788,7 @@ Each line is a verifiable claim about this implementation; do not tick one you h
 
 **Step 2: Run the spec's own gate commands**
 
-Run: `bun --cwd apps/web run test && bun --cwd apps/web x playwright test e2e/ && bun --cwd apps/web run check`
+Run: `bun run --cwd apps/web test && bun run --cwd apps/web x playwright test e2e/ && bun run --cwd apps/web check`
 Expected: all green. Then run the manual gate items that no test can cover, against the live stack
 started by `bun run dev:local`:
 
@@ -4843,7 +4854,7 @@ describe("send request state machine", () => {
 
 **Step 2: Run it — expect failure**
 
-Run: `bun --cwd apps/web run test repos/sends`
+Run: `bun run --cwd apps/web test repos/sends`
 Expected: FAIL — `Cannot find module './sends'`.
 
 **Step 3: Implement `repos/sends.ts`**
@@ -4870,7 +4881,7 @@ approval). `api/sends/[id]/[action]/route.ts`: `action ∈ {approve, reject, can
 session: a draft cannot be approved straight to `sending`; approving an unassigned group returns 400;
 a successful approve writes `status:"scheduled"` and an audit row.
 
-Run: `bun --cwd apps/web run test "sends"` → PASS.
+Run: `bun run --cwd apps/web test "sends"` → PASS.
 
 **Step 5: Failing worker dispatch tests**
 
@@ -5065,7 +5076,7 @@ describe("assistant tool scope", () => {
 
 **Step 2: Run it — expect failure**
 
-Run: `bun --cwd apps/web run test ai/tools`
+Run: `bun run --cwd apps/web test ai/tools`
 Expected: FAIL — `Cannot find module './tools'`.
 
 **Step 3: Implement `provider.ts` and `tools.ts`**
@@ -5096,7 +5107,7 @@ an absent `groupJid` passes `groupJids: allowedGroupJids` so the Mongo filter is
 
 **Step 4: Run the tool tests to verify they pass**
 
-Run: `bun --cwd apps/web run test ai/tools`
+Run: `bun run --cwd apps/web test ai/tools`
 Expected: PASS (4 tests).
 
 **Step 5: Implement `assistant.ts` and the routes**
@@ -5116,7 +5127,7 @@ Add an `assistant.test.ts` asserting the two pre-flight guards:
 an empty whitelist rejects with `ai_no_whitelist`, and a token budget already exhausted rejects with
 `ai_token_budget_exceeded` **before** any provider call (both against the memory replica set).
 
-Run: `bun --cwd apps/web run test ai` → PASS.
+Run: `bun run --cwd apps/web test ai` → PASS.
 
 **Step 6: Commit**
 
@@ -5145,7 +5156,7 @@ and that running it twice leaves exactly the same number of rows (the `$merge` i
 
 **Step 2: Run it — expect failure**
 
-Run: `bun --cwd apps/web run test stats/daily`
+Run: `bun run --cwd apps/web test stats/daily`
 Expected: FAIL — `Cannot find module './daily'`.
 
 **Step 3: Implement `daily.ts` and the stats routes**
@@ -5164,7 +5175,7 @@ for the organisation only and never leaks another `organizationId`.
 
 **Step 4: Verify and commit**
 
-Run: `bun --cwd apps/web run test stats`
+Run: `bun run --cwd apps/web test stats`
 Expected: PASS.
 
 ```bash
@@ -5233,7 +5244,7 @@ FROM oven/bun:1 AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-RUN bun --cwd apps/web run build
+RUN bun run --cwd apps/web build
 
 FROM node:22-alpine AS production
 WORKDIR /app
@@ -5250,9 +5261,9 @@ CMD ["node", "apps/web/server.js"]
 **Step 3: CI workflow**
 
 `.github/workflows/ci.yml`: on `pull_request` and `push` to `master` — checkout; setup bun;
-`bun install --frozen-lockfile`; `bun run lint`; `bun --cwd apps/web run check`; `bun test`
+`bun install --frozen-lockfile`; `bun run lint`; `bun run --cwd apps/web check`; `bun test`
 (includes the dev-launcher and env-example contract suites, so a broken `.env.example` or a
-Dockerfile-adding launcher change fails CI); `bun --cwd apps/web run build`; then setup-go 1.25,
+Dockerfile-adding launcher change fails CI); `bun run --cwd apps/web build`; then setup-go 1.25,
 `gofmt -l .` (fail on output), `go vet ./...`, `go test ./... -short` in `apps/worker`.
 
 **Step 4: Deploy workflow (GHCR)**
@@ -5293,7 +5304,7 @@ git commit -m "build: add standalone web/worker images and GHCR deployment workf
 
 **Step 1: Full suite, once, on the frozen tree**
 
-Run: `bun test && bun --cwd packages/shared run test && bun --cwd apps/web run test && cd apps/worker && gofmt -l . && go vet ./... && go test ./...`
+Run: `bun test && bun run --cwd packages/shared test && bun run --cwd apps/web test && cd apps/worker && gofmt -l . && go vet ./... && go test ./...`
 Expected: every suite green, `gofmt` silent, vet clean. Record the exact commands and output in the PR body.
 
 **Step 2: The one-command developer path, from a clean clone state**
@@ -5377,7 +5388,7 @@ flowchart TD
 ## Definition of done
 
 - Tasks 1–25 complete, each with its tests committed **before** the implementation (`git log` shows the red/green pairing per task).
-- `bun test`, `bun --cwd apps/web run test`, `bun --cwd apps/worker`-equivalent `go test ./... -short`, `gofmt -l` and `go vet ./...` all clean on the frozen tree.
+- `bun test`, `bun run --cwd apps/web test`, the worker's `go test ./... -short`, `gofmt -l` and `go vet ./...` all clean on the frozen tree.
 - The mandatory local-dev UX works from a cold clone: `cp .env.example .env` (with real R2 values), `bun install`, `bun run dev:check`, `bun run dev:local` — infra-only Docker (MongoDB alone), prefixed logs, an actionable preflight failure when R2 is unconfigured, and no orphan processes after Ctrl-C.
 - Media storage is a real Cloudflare R2 bucket in development and production: no MinIO, no local S3 emulator, no endpoint override and no path-style configuration anywhere in the tree.
 - `docs/ui-decision.md` (the authoritative UI specification) gates the dashboard: all ten views render inside the single `AppShell`, no view calls `fetch` directly, skeleton tiers and toast policy follow `R-L*`/`R-T*`, and the view/resource/scope structure plus skeleton, toast and live-update states are implemented per spec §5 P0–P15.

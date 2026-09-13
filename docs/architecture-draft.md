@@ -1238,7 +1238,7 @@ What the script MUST do:
 1. **Infra only in Docker.** `docker compose -f infra/dev/docker-compose.yml up -d` — the MongoDB
    replica set and the one-shot `mongo-init` job. It MUST NOT build or run the `web` or `worker`
    images, and MUST NOT pass `--build` (no app/worker compose services exist at all in the dev file).
-2. **Apps on the host, foreground, prefixed.** `bun --cwd apps/web run dev` and
+2. **Apps on the host, foreground, prefixed.** `bun run --cwd apps/web dev` and
    `cd apps/worker && go run ./...` run as two foreground children; each stdout/stderr line is
    prefixed (`[web]`, `[worker]`, plus `[dev]` for the script itself) so two interleaved logs stay
    readable. Prefixing is done by the script (a FIFO per child), so `go run` build errors are
