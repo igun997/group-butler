@@ -28,20 +28,31 @@ type api struct {
 	staleAfter time.Duration
 
 	// Health dependencies. `ping` is the database reachability check and
-	// `queue`/`persist` are the two bounded queues whose state the probe reports
-	// (§6.5).
-	ping    func(ctx context.Context) error
-	queue   *ingestQueue
-	persist *persistQueue
+	// `queue`/`persist`/`lifecycle` are the bounded queues whose state the probe
+	// reports (§6.5).
+	ping      func(ctx context.Context) error
+	queue     *ingestQueue
+	persist   *persistQueue
+	lifecycle *lifecycleQueue
 }
 
 // healthResponse is the §6.5 liveness payload: `ok` is the aggregate a load
 // balancer acts on, and the parts say which dependency degraded.
 type healthResponse struct {
-	OK      bool          `json:"ok"`
-	Mongo   string        `json:"mongo"`
-	Queue   queueHealth   `json:"queue"`
-	Persist persistHealth `json:"persist"`
+	OK        bool            `json:"ok"`
+	Mongo     string          `json:"mongo"`
+	Queue     queueHealth     `json:"queue"`
+	Persist   persistHealth   `json:"persist"`
+	Lifecycle lifecycleHealth `json:"lifecycle"`
+}
+
+type lifecycleHealth struct {
+	Depth     int    `json:"depth"`
+	Applied   int64  `json:"applied"`
+	Failed    int64  `json:"failed"`
+	Abandoned int64  `json:"abandoned"`
+	Stopped   bool   `json:"stopped"`
+	Error     string `json:"error,omitempty"`
 }
 
 type queueHealth struct {
@@ -132,6 +143,32 @@ func (a *api) handleHealth(w http.ResponseWriter, r *http.Request) {
 			Depth:   a.persist.Depth(),
 			Dropped: a.persist.Dropped(),
 			Failed:  a.persist.Failed(),
+		}
+	}
+	if a.lifecycle != nil {
+		body.Lifecycle = lifecycleHealth{
+			Depth:     a.lifecycle.Depth(),
+			Applied:   a.lifecycle.Applied(),
+			Failed:    a.lifecycle.Failed(),
+			Abandoned: a.lifecycle.Abandoned(),
+			Stopped:   a.lifecycle.Stopped(),
+		}
+		switch {
+		case body.Lifecycle.Stopped:
+			// No consumer: transitions would pile up unapplied, so this worker
+			// must not be routed more work.
+			body.OK = false
+			body.Lifecycle.Error = "lifecycle consumer stopped"
+		case body.Lifecycle.Abandoned > 0:
+			// A previous drain could not apply transitions; the startup
+			// reconcile repairs them, but the state is degraded until then.
+			body.OK = false
+			body.Lifecycle.Error = "lifecycle transitions were abandoned"
+		case body.Lifecycle.Depth >= lifecycleWarnDepth:
+			// Lifecycle transitions are rare, so a backlog this deep means the
+			// consumer is stalled, not merely busy.
+			body.OK = false
+			body.Lifecycle.Error = "lifecycle consumer stalled"
 		}
 	}
 	if a.ping != nil {

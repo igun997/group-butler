@@ -166,3 +166,40 @@ func TestConnectedThenLoggedOutEndsLoggedOut(t *testing.T) {
 		return repo.statuses["inst_1"] == stateLoggedOut && repo.connected["inst_1"]
 	})
 }
+
+// TestReconcileInstancesRepairsStaleRuntime is the deterministic recovery the P1
+// asks for: a transition that never reached Mongo (or a credential that
+// disappeared) is repaired from the auth store at startup, so a stale
+// `runtime.status` cannot survive a restart.
+func TestReconcileInstancesRepairsStaleRuntime(t *testing.T) {
+	liveDevice := types.NewJID("628990000002:5", types.DefaultUserServer)
+	repo := newFakeInstanceRepo(
+		// Linked, but the credential is gone: must become logged_out.
+		InstanceRow{ID: "stale_connected", OrganizationID: "org_default", Label: "Stale", Mode: modeQR, Status: stateConnected, PhoneNumber: "628990000001"},
+		// Linked and intact: untouched.
+		InstanceRow{ID: "healthy", OrganizationID: "org_default", Label: "Healthy", Mode: modeQR, Status: stateConnected, PhoneNumber: "628990000002"},
+		// Interrupted pairing: no device and no live session after a restart.
+		InstanceRow{ID: "interrupted", OrganizationID: "org_default", Label: "Pairing", Mode: modeQR, Status: statePairing, PhoneNumber: ""},
+		// Already logged out: untouched.
+		InstanceRow{ID: "gone", OrganizationID: "org_default", Label: "Gone", Mode: modeQR, Status: stateLoggedOut, PhoneNumber: "628990000003"},
+	)
+	devices := &fakeDeviceStore{device: &store.Device{ID: &liveDevice}}
+	mgr := testManagerForLifecycle(repo, devices, newFakeClient())
+
+	reconcileInstances(context.Background(), mgr)
+
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
+	if repo.statuses["stale_connected"] != stateLoggedOut {
+		t.Errorf("stale_connected status = %q, want logged_out (its credential is gone)", repo.statuses["stale_connected"])
+	}
+	if _, changed := repo.statuses["healthy"]; changed {
+		t.Error("a healthy connected instance must not be touched by reconciliation")
+	}
+	if repo.statuses["interrupted"] != stateError {
+		t.Errorf("interrupted status = %q, want error (the pairing did not survive the restart)", repo.statuses["interrupted"])
+	}
+	if _, changed := repo.statuses["gone"]; changed {
+		t.Error("an already logged-out instance must not be touched")
+	}
+}

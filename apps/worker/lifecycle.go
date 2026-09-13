@@ -285,6 +285,69 @@ func qrDataURL(code string) (string, error) {
 	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(png), nil
 }
 
+// reconcileInstances repairs persisted `runtime.status` from the auth store
+// before anything reconnects. It is the deterministic recovery for a transition
+// that never landed (a crash mid-drain, a queue the shutdown deadline cut off):
+// without it, a row could claim `connected` for a credential that no longer
+// exists, or `pairing` for a QR session that died with the previous process.
+//
+// A read failure is transient and leaves the row alone (the next start retries);
+// only facts the auth store proves are written.
+func reconcileInstances(ctx context.Context, m *manager) {
+	rows, err := m.instances.List(ctx, m.orgID)
+	if err != nil {
+		logf("reconcile: list instances: %v", err)
+		return
+	}
+	byPhone, err := m.devicesByPhone(ctx)
+	if err != nil {
+		logf("reconcile: read auth devices: %v", err)
+		return
+	}
+	repaired := 0
+	for _, row := range rows {
+		switch row.Status {
+		case stateConnected:
+			if phone := normalizePhone(row.PhoneNumber); phone != "" {
+				if _, ok := byPhone[phone]; !ok {
+					// The credential is gone: the link does not exist, whatever
+					// the row says.
+					m.reconcileStatus(ctx, row, stateLoggedOut, "")
+					repaired++
+				}
+			}
+		case statePairing:
+			// A pairing that was in flight when the process stopped cannot be
+			// resumed: the QR/login websocket died with it.
+			if _, ok := byPhone[normalizePhone(row.PhoneNumber)]; !ok {
+				m.reconcileStatus(ctx, row, stateError, "pairing interrupted; restart to retry")
+				repaired++
+			}
+		}
+	}
+	if repaired > 0 {
+		logf("reconcile: repaired %d stale instance status(es)", repaired)
+	}
+}
+
+// reconcileStatus writes one repaired status and audits it, so a state change no
+// event produced is still traceable.
+func (m *manager) reconcileStatus(ctx context.Context, row InstanceRow, status sessionState, reason string) {
+	if err := m.instances.SetStatus(ctx, m.orgID, row.ID, status, reason); err != nil {
+		logf("reconcile: instance %s -> %s: %v", row.ID, status, err)
+		return
+	}
+	if m.audit != nil {
+		if err := m.audit.append(ctx, m.orgID, "instance.reconciled", "instance", row.ID, bson.M{
+			"from":   string(row.Status),
+			"to":     string(status),
+			"reason": reason,
+		}); err != nil {
+			logf("reconcile: audit instance %s: %v", row.ID, err)
+		}
+	}
+}
+
 // restoreInstances reconnects every persisted instance whose own auth device is
 // still present. It never substitutes another device, and it refuses a device
 // already owned by a live session, which is what keeps one linked account from

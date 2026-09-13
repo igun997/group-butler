@@ -385,6 +385,218 @@ func (q *persistQueue) abandon() {
 	})
 }
 
+// lifecycleDrainTimeout bounds the shutdown drain of the lifecycle queue. It is
+// deliberately shorter than the metadata queue's: these transitions are rare, so
+// a drain that still has work after this long is a stuck dependency, and the
+// startup reconcile is what repairs the rows it could not apply.
+const lifecycleDrainTimeout = 5 * time.Second
+
+// lifecycleWarnDepth is where a stalled lifecycle consumer becomes loud. The
+// queue never drops a transition, so backlog is its only symptom.
+const lifecycleWarnDepth = 1000
+
+// lifecycleQueue is the ordered, lossless queue for instance state transitions
+// (connected, logged out, duplicate-device refusal). It is deliberately *not*
+// bounded the way the metadata queue is: a `Connected` or `LoggedOut` event is a
+// rare control-plane transition, and silently discarding one would leave
+// `instances.runtime` describing a link that does not exist — state no metadata
+// touch can repair. Admission therefore always succeeds; the queue is an
+// in-memory FIFO whose depth /health reports, shutdown drains every accepted
+// transition under a bounded deadline, and whatever the deadline cuts off is
+// counted as abandoned and repaired by the startup reconcile.
+type lifecycleQueue struct {
+	mu           sync.Mutex
+	jobs         []persistJob
+	stopped      bool
+	drainTimeout time.Duration
+
+	notify  chan struct{}
+	failed  atomic.Int64
+	applied atomic.Int64
+
+	abandonOnce sync.Once
+	abandoned   atomic.Int64
+}
+
+func newLifecycleQueue() *lifecycleQueue {
+	return &lifecycleQueue{
+		notify:       make(chan struct{}, 1),
+		drainTimeout: lifecycleDrainTimeout,
+	}
+}
+
+// enqueue never blocks and never drops. A transition is retained in memory until
+// a consumer applies it.
+func (q *lifecycleQueue) enqueue(job persistJob) {
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	q.jobs = append(q.jobs, job)
+	depth := len(q.jobs)
+	q.mu.Unlock()
+	if depth == lifecycleWarnDepth {
+		logf("lifecycle queue backlog at %d transitions; the consumer may be stalled", depth)
+	}
+	select {
+	case q.notify <- struct{}{}:
+	default:
+	}
+}
+
+// stop closes admission. It does not discard anything: what is already queued is
+// still drained.
+func (q *lifecycleQueue) stop() {
+	q.mu.Lock()
+	q.stopped = true
+	q.mu.Unlock()
+}
+
+// run owns the single consumer. Instance transitions are applied in arrival
+// order; when ctx is cancelled admission stops and the remaining accepted
+// transitions are drained under the bounded deadline rather than applied with a
+// dead context.
+func (q *lifecycleQueue) run(ctx context.Context, m *manager) {
+	if q == nil {
+		return
+	}
+	for {
+		if ctx.Err() != nil {
+			break
+		}
+		job, ok := q.next(ctx)
+		if !ok {
+			break
+		}
+		if ctx.Err() != nil {
+			// Shutdown landed between the pop and here: hand the transition to
+			// the bounded drain instead of applying it with a dead context.
+			q.requeueFront(job)
+			break
+		}
+		q.apply(ctx, m, job)
+	}
+	q.drain(m)
+}
+
+func (q *lifecycleQueue) requeueFront(job persistJob) {
+	q.mu.Lock()
+	q.jobs = append([]persistJob{job}, q.jobs...)
+	q.mu.Unlock()
+}
+
+// next blocks until a job is available or ctx is cancelled. Admission never
+// closes the queue, so a job can always still arrive while ctx is alive.
+func (q *lifecycleQueue) next(ctx context.Context) (persistJob, bool) {
+	for {
+		if job, ok := q.pop(); ok {
+			return job, true
+		}
+		select {
+		case <-ctx.Done():
+			return nil, false
+		case <-q.notify:
+		}
+	}
+}
+
+func (q *lifecycleQueue) pop() (persistJob, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.jobs) == 0 {
+		return nil, false
+	}
+	job := q.jobs[0]
+	q.jobs = q.jobs[1:]
+	return job, true
+}
+
+func (q *lifecycleQueue) apply(ctx context.Context, m *manager, job persistJob) {
+	if err := job.persist(ctx, m); err != nil {
+		q.failed.Add(1)
+		logf("lifecycle transition %T: %v", job, err)
+		return
+	}
+	q.applied.Add(1)
+}
+
+// drain applies the transitions accepted before shutdown, under its own bounded
+// context (the run context is already cancelled). Whatever the deadline cuts off
+// is counted as abandoned and logged: the consumer reports it rather than
+// pretending it was applied.
+func (q *lifecycleQueue) drain(m *manager) {
+	q.stop()
+	q.mu.Lock()
+	remaining := len(q.jobs)
+	q.mu.Unlock()
+	if remaining == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), q.drainTimeout)
+	defer cancel()
+	for {
+		job, ok := q.pop()
+		if !ok {
+			break
+		}
+		if ctx.Err() != nil {
+			q.requeueFront(job)
+			break
+		}
+		q.apply(ctx, m, job)
+	}
+	q.abandonOnce.Do(func() {
+		q.mu.Lock()
+		left := len(q.jobs)
+		q.mu.Unlock()
+		if left > 0 {
+			q.abandoned.Store(int64(left))
+			logf("lifecycle: %d transition(s) not applied before the drain deadline; the next start reconciles them", left)
+		}
+	})
+}
+
+func (q *lifecycleQueue) Depth() int {
+	if q == nil {
+		return 0
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.jobs)
+}
+
+func (q *lifecycleQueue) Stopped() bool {
+	if q == nil {
+		return false
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.stopped
+}
+
+func (q *lifecycleQueue) Applied() int64 {
+	if q == nil {
+		return 0
+	}
+	return q.applied.Load()
+}
+
+func (q *lifecycleQueue) Failed() int64 {
+	if q == nil {
+		return 0
+	}
+	return q.failed.Load()
+}
+
+// Abandoned is the number of accepted transitions the shutdown drain could not
+// apply. It is the one number that must never be silently non-zero.
+func (q *lifecycleQueue) Abandoned() int64 {
+	if q == nil {
+		return 0
+	}
+	return q.abandoned.Load()
+}
+
 func (q *persistQueue) Depth() int {
 	if q == nil {
 		return 0

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func healthBody(t *testing.T, a *api) (int, healthResponse) {
@@ -99,5 +100,108 @@ func TestHealthCountsPersistenceFailures(t *testing.T) {
 	}
 	if body.Persist.Depth != 1 {
 		t.Errorf("persist = %+v, want the queued job reflected", body.Persist)
+	}
+}
+
+// TestHealthReportsLifecycleQueueState is the P1 visibility requirement: a
+// backlogged lifecycle consumer must be visible to the probe.
+func TestHealthReportsLifecycleQueueState(t *testing.T) {
+	lifecycle := newLifecycleQueue()
+	lifecycle.enqueue(okJob{})
+	a := &api{
+		secret:    "dev-secret",
+		ping:      func(context.Context) error { return nil },
+		queue:     newIngestQueue(4, 0, 0),
+		lifecycle: lifecycle,
+	}
+
+	code, body := healthBody(t, a)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if body.Lifecycle.Depth != 1 {
+		t.Errorf("lifecycle = %+v, want the queued transition visible", body.Lifecycle)
+	}
+	if body.Lifecycle.Stopped {
+		t.Error("lifecycle reported stopped while its consumer runs")
+	}
+}
+
+// TestHealthIsUnavailableWhenTheLifecycleConsumerStopped is the degraded-lifecycle
+// signal: with no consumer, transitions would pile up unapplied, so the worker
+// must not advertise itself as healthy.
+func TestHealthIsUnavailableWhenTheLifecycleConsumerStopped(t *testing.T) {
+	lifecycle := newLifecycleQueue()
+	lifecycle.stop()
+	a := &api{
+		secret:    "dev-secret",
+		ping:      func(context.Context) error { return nil },
+		queue:     newIngestQueue(4, 0, 0),
+		lifecycle: lifecycle,
+	}
+
+	code, body := healthBody(t, a)
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 when the lifecycle consumer has stopped", code)
+	}
+	if body.OK || !body.Lifecycle.Stopped {
+		t.Errorf("body = %+v, want not-ok with a stopped lifecycle", body)
+	}
+}
+
+// TestHealthIsUnavailableWhenTransitionsWereAbandoned covers the drain-deadline
+// case: transitions that could not be applied must degrade health rather than
+// disappear.
+func TestHealthIsUnavailableWhenTransitionsWereAbandoned(t *testing.T) {
+	lifecycle := newLifecycleQueue()
+	lifecycle.drainTimeout = 20 * time.Millisecond
+	entered := make(chan struct{})
+	lifecycle.enqueue(blockingTransition{entered})
+	lifecycle.enqueue(okJob{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the drain itself runs the blocking transition
+	go lifecycle.run(ctx, testManagerWithDeps(newFakeGroupStore(), nil, nil))
+	waitFor(t, "the lifecycle drain to give up", func() bool { return lifecycle.Abandoned() == 1 })
+
+	a := &api{
+		secret:    "dev-secret",
+		ping:      func(context.Context) error { return nil },
+		queue:     newIngestQueue(4, 0, 0),
+		lifecycle: lifecycle,
+	}
+	code, body := healthBody(t, a)
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 after transitions were abandoned", code)
+	}
+	if body.Lifecycle.Abandoned != 1 {
+		t.Errorf("lifecycle = %+v, want abandoned 1", body.Lifecycle)
+	}
+}
+
+// TestHealthIsUnavailableWhenTheLifecycleConsumerStalls completes the P1
+// visibility loop: a deep backlog (no consumer) must be an explicit degraded
+// lifecycle signal, not just a number.
+func TestHealthIsUnavailableWhenTheLifecycleConsumerStalls(t *testing.T) {
+	lifecycle := newLifecycleQueue()
+	for range lifecycleWarnDepth {
+		lifecycle.enqueue(okJob{})
+	}
+	a := &api{
+		secret:    "dev-secret",
+		ping:      func(context.Context) error { return nil },
+		queue:     newIngestQueue(4, 0, 0),
+		lifecycle: lifecycle,
+	}
+
+	code, body := healthBody(t, a)
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 for a stalled lifecycle consumer", code)
+	}
+	if body.OK || body.Lifecycle.Depth < lifecycleWarnDepth {
+		t.Errorf("body = %+v, want not-ok with the backlog reported", body)
+	}
+	if body.Lifecycle.Error == "" {
+		t.Error("a degraded lifecycle must say why")
 	}
 }

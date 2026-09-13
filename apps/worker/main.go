@@ -108,6 +108,9 @@ func run() error {
 	start(func() { mgr.runGroupSyncScheduler(ctx) })
 	start(func() { mgr.runMediaJanitor(ctx) })
 
+	// Reconcile persisted status against the auth store before reconnecting:
+	// a transition lost with the previous process is repaired here.
+	reconcileInstances(ctx, mgr)
 	restoreInstances(ctx, mgr)
 
 	server := &http.Server{

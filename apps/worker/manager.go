@@ -281,7 +281,7 @@ type manager struct {
 	// lifecycle carries instance state transitions (connected, logged out) the
 	// same way, but on a single consumer: those transitions are ordered, so a
 	// logout can never be overtaken by the connect that preceded it.
-	lifecycle *persistQueue
+	lifecycle *lifecycleQueue
 
 	// ping is the `/health` database reachability check (§6.5).
 	ping func(ctx context.Context) error
@@ -319,7 +319,7 @@ func newManager(cfg Config, groups groupStoreAPI, instances instanceRepo, pairin
 		ingest:    ingest,
 		devices:   devices,
 		persist:   newPersistQueue(cfg.EventQueueSize, cfg.EventWorkers),
-		lifecycle: newPersistQueue(cfg.EventQueueSize, 1),
+		lifecycle: newLifecycleQueue(),
 		newClient: func(device *store.Device, log waLog.Logger) whatsmeowClient {
 			return whatsmeowNewClient(device, log)
 		},
@@ -428,6 +428,7 @@ func (m *manager) api() *api {
 		ping:       m.ping,
 		queue:      m.ingest,
 		persist:    m.persist,
+		lifecycle:  m.lifecycle,
 	}
 }
 
