@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -20,7 +22,36 @@ const (
 	// cannot identify (§6.3.3, §6.3.4).
 	unparsedMime = "application/octet-stream"
 	unparsedExt  = "bin"
+
+	// Every stored object gets a descriptor sidecar beside it (§6.3.3).
+	sidecarExt  = "meta.json"
+	sidecarMime = "application/json"
 )
+
+// kindForMime derives `media.kind` from the container we actually stored, so a
+// record can never claim media it does not hold (§6.3.4). A video note, a
+// sticker or a view-once image keeps its WhatsApp wording in `declaredType`.
+func kindForMime(mime string) Kind {
+	switch {
+	case strings.HasPrefix(mime, "image/"):
+		return KindImage
+	case strings.HasPrefix(mime, "video/"):
+		return KindVideo
+	case strings.HasPrefix(mime, "audio/"):
+		return KindAudio
+	case strings.HasPrefix(mime, "text/"):
+		return KindDocument
+	}
+	switch mime {
+	case "application/pdf", "application/zip",
+		"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+		return KindDocument
+	}
+	// Only reachable if a sniffer starts reporting a container with no kind;
+	// calling those bytes raw is the honest answer.
+	return KindRaw
+}
 
 // errMediaTooLarge is returned when a download would exceed MEDIA_MAX_BYTES.
 // It is a sentinel so the pipeline can map it to `too_large` instead of
@@ -70,12 +101,47 @@ type mediaUploader interface {
 	Upload(ctx context.Context, data []byte, key, mime string) (uploadResult, error)
 }
 
+// mediaLimits are the operational bounds of §6.3.2 — MEDIA_MAX_BYTES,
+// MEDIA_DOWNLOAD_TIMEOUT and MEDIA_CONCURRENCY — derived from the worker
+// configuration once per process. The semaphore is deliberately shared: the
+// spec asks for a *global* concurrency bound, so a pipeline built per media job
+// must not carry its own.
+type mediaLimits struct {
+	maxBytes  int64
+	timeout   time.Duration
+	semaphore chan struct{}
+}
+
+// newMediaLimits derives the download policy from the worker configuration.
+// Config.validate has already rejected non-positive caps, timeouts and
+// concurrency, so the three values are used as they are rather than validated a
+// second time.
+func newMediaLimits(cfg Config) *mediaLimits {
+	return &mediaLimits{
+		maxBytes:  cfg.MediaMaxBytes,
+		timeout:   cfg.MediaDownloadTimeout,
+		semaphore: make(chan struct{}, cfg.MediaConcurrency),
+	}
+}
+
+// acquire takes one MEDIA_CONCURRENCY slot and returns its release, or the
+// context's error when the caller gave up waiting for one.
+func (l *mediaLimits) acquire(ctx context.Context) (func(), error) {
+	select {
+	case l.semaphore <- struct{}{}:
+		return func() { <-l.semaphore }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 // mediaPipeline runs one attachment through download → classify → upload →
 // metadata and returns the `media` subdocument the message row keeps (§6.3).
 // It deliberately holds no clock of its own: `now` is passed in, so the
 // year/month partition of the key is the date of the attempt rather than of
 // process start, and tests are deterministic.
 type mediaPipeline struct {
+	limits     *mediaLimits
 	downloader mediaDownloader
 	uploader   mediaUploader
 	orgID      string
@@ -83,14 +149,47 @@ type mediaPipeline struct {
 	now        time.Time
 }
 
-func newMediaPipeline(downloader mediaDownloader, uploader mediaUploader, orgID, instanceID string, now time.Time) *mediaPipeline {
+// newMediaPipeline builds one pipeline for one media job. limits comes from
+// newMediaLimits(cfg) and is shared by every pipeline in the process, which is
+// what makes MEDIA_CONCURRENCY a bound on the worker rather than on one job.
+func newMediaPipeline(limits *mediaLimits, downloader mediaDownloader, uploader mediaUploader, orgID, instanceID string, now time.Time) *mediaPipeline {
 	return &mediaPipeline{
+		limits:     limits,
 		downloader: downloader,
 		uploader:   uploader,
 		orgID:      orgID,
 		instanceID: instanceID,
 		now:        now,
 	}
+}
+
+// download fetches one attachment under the whole §6.3.2 policy: a
+// MEDIA_CONCURRENCY slot, a MEDIA_DOWNLOAD_TIMEOUT deadline, and MEDIA_MAX_BYTES
+// on what comes back. Every download the worker performs goes through here, so
+// no path can fetch an attachment outside the configured bounds.
+func (p *mediaPipeline) download(ctx context.Context, desc MediaDescriptor) ([]byte, error) {
+	release, err := p.limits.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	ctx, cancel := context.WithTimeout(ctx, p.limits.timeout)
+	defer cancel()
+
+	// The downloader's MIME hint is deliberately ignored: the stored mime, the
+	// key's extension and media.kind all come from the bytes we hold, never from
+	// what a sender claimed (§11.4).
+	data, _, err := p.downloader.Download(ctx, desc)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > p.limits.maxBytes {
+		// A downloader that streams to a temp file aborts under the same cap
+		// (copyCapped); this is the bound on whatever one hands back instead.
+		return nil, fmt.Errorf("%w: %d bytes", errMediaTooLarge, len(data))
+	}
+	return data, nil
 }
 
 // Store performs one attempt at one attachment and reports the resulting media
@@ -121,58 +220,128 @@ func (p *mediaPipeline) Store(ctx context.Context, desc MediaDescriptor) Media {
 		return media
 	}
 
-	data, _, err := p.downloader.Download(ctx, desc)
+	data, err := p.download(ctx, desc)
 	if err != nil {
 		media.Status, media.Reason = classifyDownloadFailure(err)
 		media.Error = err.Error()
 		return media
 	}
 
-	// The downloader's MIME hint is deliberately not used: the stored mime and
-	// the key's extension come from the bytes we now hold, never from what a
-	// sender claimed (§11.4).
 	mime, readable := sniffMedia(data)
 	if !readable {
-		return p.storeOpaque(ctx, media, data, desc)
+		return p.persist(ctx, unparsedMedia(media, data), desc, data, unparsedExt)
 	}
 
 	media.Status = MediaStored
+	// media.kind describes the bytes we stored, never the descriptor that asked
+	// for them: an image node carrying an MP4 is a video here, and what
+	// WhatsApp declared stays in `declaredType` (§6.3.4).
+	media.Kind = kindForMime(mime)
 	media.Mime = mime
 	media.Size = int64(len(data))
 	media.SHA256 = sha256Hex(data)
 	media.Width, media.Height = imageDimensions(data)
 	media.DurationSec = mediaDurationSeconds(data)
 
-	upload, err := p.uploader.Upload(ctx, data, p.key(desc, extensionForMime(mime, desc.FileName)), mime)
-	if err != nil {
-		media.Status = MediaFailed
-		media.Error = err.Error()
-		return media
-	}
-	media.R2Key, media.PublicURL = upload.Key, upload.PublicURL
-	return media
+	return p.persist(ctx, media, desc, data, extensionForMime(mime, desc.FileName))
 }
 
-// storeOpaque is the R3 path: the bytes arrived but no sniffer knows their
-// container, so they are stored as an opaque object and the record keeps what
-// WhatsApp claimed about them (§6.3.4). `unparsed` is terminal by design — a
-// retry would fetch the same unreadable bytes — so it is only reported once the
-// object is really in the bucket.
-func (p *mediaPipeline) storeOpaque(ctx context.Context, media Media, data []byte, desc MediaDescriptor) Media {
-	upload, err := p.uploader.Upload(ctx, data, p.key(desc, unparsedExt), unparsedMime)
-	if err != nil {
-		media.Status = MediaFailed
-		media.Error = err.Error()
-		return media
-	}
+// unparsedMedia is the R3 record: the bytes are held, the container is not
+// understood, so what WhatsApp claimed about them is all we can say (§6.3.4).
+// `unparsed` is terminal — a retry would fetch the same unreadable bytes.
+func unparsedMedia(media Media, data []byte) Media {
 	media.Status = MediaUnparsed
 	media.Kind = KindRaw
 	media.Mime = unparsedMime
 	media.Reason = reasonUnsupportedType
 	media.Size = int64(len(data))
 	media.SHA256 = sha256Hex(data)
-	media.R2Key, media.PublicURL = upload.Key, upload.PublicURL
 	return media
+}
+
+// persist writes the bytes and, beside them, the immutable descriptor sidecar
+// of §6.3.3. Both keys derive from the same descriptor, so a retry rewrites the
+// same two objects rather than a different record.
+func (p *mediaPipeline) persist(ctx context.Context, media Media, desc MediaDescriptor, data []byte, ext string) Media {
+	upload, err := p.uploader.Upload(ctx, data, p.key(desc, ext), media.Mime)
+	if err != nil {
+		return failedMedia(media, err)
+	}
+	media.R2Key, media.PublicURL = upload.Key, upload.PublicURL
+
+	sidecar, err := sidecarJSON(p.orgID, p.instanceID, desc, media)
+	if err != nil {
+		return failedMedia(media, err)
+	}
+	if _, err := p.uploader.Upload(ctx, sidecar, p.key(desc, sidecarExt), sidecarMime); err != nil {
+		// The bytes are in the bucket but their descriptor is not. The record
+		// must not claim a stored attachment it cannot describe, so the attempt
+		// fails and the janitor rewrites both objects at the same keys (§6.3.5).
+		return failedMedia(media, err)
+	}
+	return media
+}
+
+// failedMedia ends one attempt: nothing the record could point at is complete,
+// so the error is kept and no locator is claimed (§6.3.1).
+func failedMedia(media Media, err error) Media {
+	media.Status = MediaFailed
+	media.Reason = ""
+	media.Error = err.Error()
+	media.R2Key, media.PublicURL = "", ""
+	return media
+}
+
+// mediaSidecar is the JSON object written at <waMessageId>.meta.json (§6.3.3):
+// the descriptor and the outcome, readable even if Mongo is lost. Every field
+// is a plain value derived from the descriptor and the stored bytes — no
+// timestamp, no attempt counter — which is what makes the sidecar immutable in
+// effect: the same media always produces the same bytes at the same key.
+type mediaSidecar struct {
+	OrganizationID string      `json:"organizationId"`
+	InstanceID     string      `json:"instanceId"`
+	GroupJID       string      `json:"groupJid"`
+	WaMessageID    string      `json:"waMessageId"`
+	Status         MediaStatus `json:"status"`
+	Kind           Kind        `json:"kind"`
+	DeclaredType   Kind        `json:"declaredType"`
+	Mime           string      `json:"mime"`
+	FileName       string      `json:"fileName,omitempty"`
+	Size           int64       `json:"size"`
+	SHA256         string      `json:"sha256"`
+	Width          int         `json:"width,omitempty"`
+	Height         int         `json:"height,omitempty"`
+	DurationSec    float64     `json:"durationSec,omitempty"`
+	Reason         string      `json:"reason,omitempty"`
+	R2Key          string      `json:"r2Key"`
+}
+
+// sidecarJSON serializes one descriptor sidecar. Indented because "useful even
+// if Mongo is lost" means a human may open it, and never derived from a map or
+// the clock, so the encoding is stable.
+func sidecarJSON(orgID, instanceID string, desc MediaDescriptor, media Media) ([]byte, error) {
+	payload, err := json.MarshalIndent(mediaSidecar{
+		OrganizationID: orgID,
+		InstanceID:     instanceID,
+		GroupJID:       desc.GroupJID,
+		WaMessageID:    desc.MessageID,
+		Status:         media.Status,
+		Kind:           media.Kind,
+		DeclaredType:   media.DeclaredType,
+		Mime:           media.Mime,
+		FileName:       media.FileName,
+		Size:           media.Size,
+		SHA256:         media.SHA256,
+		Width:          media.Width,
+		Height:         media.Height,
+		DurationSec:    media.DurationSec,
+		Reason:         media.Reason,
+		R2Key:          media.R2Key,
+	}, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("media sidecar: %w", err)
+	}
+	return append(payload, '\n'), nil
 }
 
 // key is the object key for this attempt's descriptor (§6.3.3).
@@ -240,8 +409,9 @@ func isTransientMediaError(err error) bool {
 }
 
 var (
-	pngSignature = []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}
-	zipSignature = []byte{'P', 'K', 0x03, 0x04}
+	pngSignature  = []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}
+	webpSignature = []byte("RIFF")
+	zipSignature  = []byte{'P', 'K', 0x03, 0x04}
 )
 
 // sniffMedia identifies the containers the worker can read from their magic
@@ -255,8 +425,12 @@ func sniffMedia(data []byte) (string, bool) {
 		return "image/png", true
 	case len(data) >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF:
 		return "image/jpeg", true
-	case len(data) >= 12 && bytes.HasPrefix(data, []byte("RIFF")) && string(data[8:12]) == "WEBP":
+	case isWebP(data):
 		return "image/webp", true
+	case bytes.HasPrefix(data, []byte("RIFF")) && len(data) >= 12 && string(data[8:12]) == "WAVE":
+		return "audio/wav", true
+	case isEBML(data):
+		return ebmlMime(data), true
 	case bytes.HasPrefix(data, []byte("GIF87a")), bytes.HasPrefix(data, []byte("GIF89a")):
 		return "image/gif", true
 	case len(data) >= 12 && string(data[4:8]) == "ftyp":
@@ -271,6 +445,29 @@ func sniffMedia(data []byte) (string, bool) {
 		return "application/zip", true
 	}
 	return "", false
+}
+
+// isWebP reports a WebP RIFF container.
+func isWebP(data []byte) bool {
+	return len(data) >= 16 && bytes.HasPrefix(data, webpSignature) && string(data[8:12]) == "WEBP"
+}
+
+// isEBML reports a Matroska/WebM file, which starts with the EBML header magic.
+func isEBML(data []byte) bool { return bytes.HasPrefix(data, []byte{0x1A, 0x45, 0xDF, 0xA3}) }
+
+// ebmlMime reads the DocType of an EBML header: "webm" for WebM, anything else
+// (in practice "matroska") for the broader Matroska container. The DocType sits
+// in the first handful of bytes, so a bounded scan is enough and no EBML parser
+// is needed to name the container.
+func ebmlMime(data []byte) string {
+	head := data
+	if len(head) > 128 {
+		head = head[:128]
+	}
+	if bytes.Contains(head, []byte("webm")) {
+		return "video/webm"
+	}
+	return "video/x-matroska"
 }
 
 // isMP3Frame matches an MPEG audio frame header (no ID3 tag in front of it).
@@ -300,20 +497,52 @@ func sha256Hex(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// imageDimensions reads the size out of a PNG, GIF or JPEG header (§6.3.4). A
-// truncated or unexpected header yields 0×0 rather than an error: the object is
-// stored either way.
+// imageDimensions reads the size out of a PNG, GIF, JPEG or WebP header
+// (§6.3.4). A truncated or unexpected header yields 0×0 rather than an error:
+// the object is stored either way.
 func imageDimensions(data []byte) (int, int) {
 	switch {
 	case len(data) >= 24 && bytes.HasPrefix(data, pngSignature):
 		return int(binary.BigEndian.Uint32(data[16:20])), int(binary.BigEndian.Uint32(data[20:24]))
 	case len(data) >= 10 && bytes.HasPrefix(data, []byte("GIF")):
 		return int(binary.LittleEndian.Uint16(data[6:8])), int(binary.LittleEndian.Uint16(data[8:10]))
+	case isWebP(data):
+		return webpDimensions(data)
 	case len(data) >= 3 && data[0] == 0xFF && data[1] == 0xD8:
 		return jpegDimensions(data)
 	}
 	return 0, 0
 }
+
+// webpDimensions reads the canvas size out of a WebP container, whose layout
+// depends on the frame it carries: VP8X states the canvas explicitly, VP8 holds
+// the lossy frame's size after its start code, and VP8L packs both 14-bit
+// sizes into one little-endian word. A container without a known frame chunk
+// reports 0×0 rather than a guessed size.
+func webpDimensions(data []byte) (int, int) {
+	switch string(data[12:16]) {
+	case "VP8X":
+		if len(data) < 30 {
+			return 0, 0
+		}
+		return uint24LE(data[24:27]) + 1, uint24LE(data[27:30]) + 1
+	case "VP8L":
+		if len(data) < 25 {
+			return 0, 0
+		}
+		bits := binary.LittleEndian.Uint32(data[21:25])
+		return int(bits&0x3FFF) + 1, int((bits>>14)&0x3FFF) + 1
+	case "VP8 ":
+		if len(data) < 30 {
+			return 0, 0
+		}
+		return int(binary.LittleEndian.Uint16(data[26:28]) & 0x3FFF), int(binary.LittleEndian.Uint16(data[28:30]) & 0x3FFF)
+	}
+	return 0, 0
+}
+
+// uint24LE reads the 24-bit little-endian canvas size a VP8X chunk carries.
+func uint24LE(b []byte) int { return int(b[0]) | int(b[1])<<8 | int(b[2])<<16 }
 
 // jpegDimensions walks the JPEG segments to the frame header, which is the only
 // place the size lives; every other segment (APPn, comments, quantization
@@ -455,6 +684,10 @@ func copyCapped(dst io.Writer, src io.Reader, max int64) (int64, error) {
 // declared for it (§6.3.1). It reports false when the node holds nothing
 // downloadable — text, a location, a poll — which keeps `media.status:"none"`.
 // The message id and group JID belong to the event, so the caller adds them.
+//
+// Kind here is what the parser can know before the bytes exist; the pipeline
+// replaces it with the kind the stored bytes prove, keeping this value in
+// `declaredType` (§6.3.4).
 func describeMedia(msg *waE2E.Message) (MediaDescriptor, bool) {
 	inner, viewOnce := unwrapMessage(msg)
 	if inner == nil {

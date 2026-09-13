@@ -170,14 +170,17 @@ var mimeExtensions = map[string]string{
 	"image/webp": "webp",
 	"image/gif":  "gif",
 
-	"video/mp4":       "mp4",
-	"video/3gpp":      "3gp",
-	"video/quicktime": "mov",
+	"video/mp4":        "mp4",
+	"video/3gpp":       "3gp",
+	"video/quicktime":  "mov",
+	"video/webm":       "webm",
+	"video/x-matroska": "mkv",
 
 	"audio/ogg":   "ogg",
 	"audio/mpeg":  "mp3",
 	"audio/mp4":   "m4a",
 	"audio/x-m4a": "m4a",
+	"audio/wav":   "wav",
 
 	"application/pdf": "pdf",
 	"application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
@@ -197,7 +200,8 @@ var genericContainerMimes = map[string]bool{"application/zip": true}
 // does not already store — it only chooses between containers we handle.
 var knownExtensions = map[string]bool{
 	"jpg": true, "jpeg": true, "png": true, "webp": true, "gif": true,
-	"mp4": true, "mov": true, "3gp": true, "ogg": true, "mp3": true, "m4a": true,
+	"mp4": true, "mov": true, "3gp": true, "webm": true, "mkv": true,
+	"ogg": true, "mp3": true, "m4a": true, "wav": true,
 	"pdf": true, "docx": true, "xlsx": true, "txt": true, "csv": true, "zip": true,
 }
 

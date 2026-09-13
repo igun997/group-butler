@@ -52,24 +52,40 @@ func TestR2EndpointDerivation(t *testing.T) {
 // the private-object rules below are asserted without a network. A test double
 // is not an emulator: nothing here stands in for R2 in a running worker — the
 // opt-in test at the bottom of this file is the only place real bytes move.
+type putCall struct {
+	input *s3.PutObjectInput
+	body  []byte
+}
+
 type fakeS3 struct {
-	put   *s3.PutObjectInput
-	putAt []byte
-	get   *s3.GetObjectInput
-	data  []byte
-	mime  string
-	err   error
+	puts []putCall
+	get  *s3.GetObjectInput
+	data []byte
+	mime string
+	err  error
 }
 
 func (f *fakeS3) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
-	f.put = in
+	call := putCall{input: in}
 	if in.Body != nil {
-		f.putAt, _ = io.ReadAll(in.Body)
+		call.body, _ = io.ReadAll(in.Body)
 	}
+	f.puts = append(f.puts, call)
 	if f.err != nil {
 		return nil, f.err
 	}
 	return &s3.PutObjectOutput{}, nil
+}
+
+// stored returns the call that wrote key, or nil: a PutObject the SDK built is
+// the only thing this double knows about.
+func (f *fakeS3) stored(key string) *putCall {
+	for i := range f.puts {
+		if aws.ToString(f.puts[i].input.Key) == key {
+			return &f.puts[i]
+		}
+	}
+	return nil
 }
 
 func (f *fakeS3) GetObject(_ context.Context, in *s3.GetObjectInput, _ ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
@@ -77,11 +93,13 @@ func (f *fakeS3) GetObject(_ context.Context, in *s3.GetObjectInput, _ ...func(*
 	if f.err != nil {
 		return nil, f.err
 	}
-	// An unset data field serves whatever the last PutObject carried, so a test
+	// An unset data field serves what PutObject carried for this key, so a test
 	// can round-trip through both halves of the client.
 	body := f.data
 	if body == nil {
-		body = f.putAt
+		if put := f.stored(aws.ToString(in.Key)); put != nil {
+			body = put.body
+		}
 	}
 	out := &s3.GetObjectOutput{Body: io.NopCloser(bytes.NewReader(body))}
 	if f.mime != "" {
@@ -97,7 +115,7 @@ func (f *fakeS3) GetObject(_ context.Context, in *s3.GetObjectInput, _ ...func(*
 func TestPipelineStoresThroughTheR2Client(t *testing.T) {
 	api := &fakeS3{}
 	r2 := newR2Client(api, "butler-media", "https://cdn.example", 1<<20)
-	pipe := newMediaPipeline(fakeDownloader{data: pngHeader(4, 3)}, r2, "org_default", "inst_1", mediaNow)
+	pipe := newMediaPipeline(testMediaLimits(), fakeDownloader{data: pngHeader(4, 3)}, r2, "org_default", "inst_1", mediaNow)
 
 	got := pipe.Store(context.Background(), MediaDescriptor{
 		Kind: KindImage, DeclaredType: KindImage, Mime: "image/png",
@@ -110,11 +128,22 @@ func TestPipelineStoresThroughTheR2Client(t *testing.T) {
 	if got.R2Key != wantKey {
 		t.Errorf("R2Key = %q, want %q", got.R2Key, wantKey)
 	}
-	if api.put == nil {
-		t.Fatal("the pipeline stored nothing")
+	if len(api.puts) != 2 {
+		t.Fatalf("puts = %d, want the object and its descriptor sidecar", len(api.puts))
 	}
-	if aws.ToString(api.put.Bucket) != "butler-media" || api.put.ACL != "" {
-		t.Errorf("put = bucket %q acl %q, want the configured private bucket", aws.ToString(api.put.Bucket), api.put.ACL)
+	for _, put := range api.puts {
+		if aws.ToString(put.input.Bucket) != "butler-media" {
+			t.Errorf("put bucket = %q, want the configured bucket", aws.ToString(put.input.Bucket))
+		}
+		if put.input.ACL != "" {
+			t.Errorf("put %q carries ACL %q: every object we write stays private (§11.4)", aws.ToString(put.input.Key), put.input.ACL)
+		}
+	}
+	if ct := aws.ToString(api.puts[0].input.ContentType); ct != "image/png" {
+		t.Errorf("object content type = %q, want the sniffed mime", ct)
+	}
+	if ct := aws.ToString(api.puts[1].input.ContentType); ct != "application/json" {
+		t.Errorf("sidecar content type = %q, want application/json", ct)
 	}
 	if want := "https://cdn.example/" + wantKey; got.PublicURL != want {
 		t.Errorf("PublicURL = %q, want %q", got.PublicURL, want)
@@ -182,22 +211,20 @@ func TestUploadStoresAPrivateObject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Upload: %v", err)
 	}
-	if api.put == nil {
-		t.Fatal("Upload issued no PutObject")
+	put := api.stored(key)
+	if put == nil {
+		t.Fatal("Upload issued no PutObject for the key it was given")
 	}
-	if bucket := aws.ToString(api.put.Bucket); bucket != "butler-media" {
+	if bucket := aws.ToString(put.input.Bucket); bucket != "butler-media" {
 		t.Errorf("put bucket = %q, want the configured bucket", bucket)
 	}
-	if api.put.Key == nil || *api.put.Key != key {
-		t.Errorf("put key = %v, want %q", api.put.Key, key)
-	}
-	if ct := aws.ToString(api.put.ContentType); ct != "image/png" {
+	if ct := aws.ToString(put.input.ContentType); ct != "image/png" {
 		t.Errorf("put content type = %q, want the sniffed mime", ct)
 	}
-	if api.put.ACL != "" {
-		t.Errorf("put ACL = %q: the bucket is private and R2 rejects a public-read ACL (§11.4)", api.put.ACL)
+	if put.input.ACL != "" {
+		t.Errorf("put ACL = %q: the bucket is private and R2 rejects a public-read ACL (§11.4)", put.input.ACL)
 	}
-	if !bytes.Equal(api.putAt, data) {
+	if !bytes.Equal(put.body, data) {
 		t.Error("the object body is not the bytes handed to Upload")
 	}
 	if got.Key != key || got.Size != int64(len(data)) {

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,21 +28,50 @@ func (f fakeDownloader) Download(ctx context.Context, msg MediaDescriptor) ([]by
 	return f.data, f.typ, nil
 }
 
+// uploadCall is one recorded upload, so a test can tell the media object from
+// the descriptor sidecar that rides beside it (§6.3.3).
+type uploadCall struct {
+	data []byte
+	key  string
+	mime string
+}
+
 type fakeUploader struct {
 	key   string
 	calls int
 	mime  string
 	err   error
+
+	// uploads records every call in order; failKeySuffix narrows err to the
+	// object whose key ends with it (used to fail only the sidecar).
+	uploads       []uploadCall
+	failKeySuffix string
 }
 
 func (f *fakeUploader) Upload(ctx context.Context, data []byte, key, mime string) (uploadResult, error) {
 	f.calls++
 	f.key = key
 	f.mime = mime
-	if f.err != nil {
+	f.uploads = append(f.uploads, uploadCall{data: data, key: key, mime: mime})
+	if f.err != nil && (f.failKeySuffix == "" || strings.HasSuffix(key, f.failKeySuffix)) {
 		return uploadResult{}, f.err
 	}
 	return uploadResult{Key: key, Size: int64(len(data)), PublicURL: "http://cdn.local/" + key}, nil
+}
+
+// noopUploader stores nothing and records nothing. The concurrency test drives
+// several Store calls at once, and a recording double would then need a lock of
+// its own — this one has no state to race on.
+type noopUploader struct{}
+
+func (noopUploader) Upload(_ context.Context, data []byte, key, _ string) (uploadResult, error) {
+	return uploadResult{Key: key, Size: int64(len(data))}, nil
+}
+
+// testMediaLimits mirrors the documented media defaults (§6.9) so the pipeline
+// tests run with the same shape the worker configures from the environment.
+func testMediaLimits() *mediaLimits {
+	return newMediaLimits(Config{MediaMaxBytes: 25 << 20, MediaDownloadTimeout: 45 * time.Second, MediaConcurrency: 4})
 }
 
 var mediaNow = time.Date(2026, 9, 13, 0, 0, 0, 0, time.UTC)
@@ -48,7 +79,7 @@ var mediaNow = time.Date(2026, 9, 13, 0, 0, 0, 0, time.UTC)
 func TestStoreMedia_StoredWhenReadable(t *testing.T) {
 	png := []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 'I', 'H', 'D', 'R', 0, 0, 0, 4, 0, 0, 0, 3}
 	up := &fakeUploader{}
-	pipe := newMediaPipeline(fakeDownloader{data: png, typ: "image/png"}, up, "org_default", "inst_1", mediaNow)
+	pipe := newMediaPipeline(testMediaLimits(), fakeDownloader{data: png, typ: "image/png"}, up, "org_default", "inst_1", mediaNow)
 	got := pipe.Store(context.Background(), MediaDescriptor{
 		DeclaredType: "image", Kind: "image", Mime: "image/png", MessageID: "3EB0A1", GroupJID: "120363043123456789@g.us",
 	})
@@ -58,14 +89,17 @@ func TestStoreMedia_StoredWhenReadable(t *testing.T) {
 	if got.Width != 4 || got.Height != 3 {
 		t.Errorf("dimensions = %dx%d, want 4x3", got.Width, got.Height)
 	}
-	if got.R2Key == "" || up.calls != 1 {
-		t.Errorf("expected one upload, got key=%q calls=%d", got.R2Key, up.calls)
+	if got.R2Key == "" || len(up.uploads) != 2 {
+		t.Fatalf("expected the object then its sidecar, got key=%q uploads=%d", got.R2Key, len(up.uploads))
+	}
+	if up.uploads[0].key != got.R2Key || up.uploads[1].key != got.R2Key[:len(got.R2Key)-len(".png")]+".meta.json" {
+		t.Errorf("upload keys = %q, %q, want the object and its descriptor sidecar", up.uploads[0].key, up.uploads[1].key)
 	}
 }
 
 func TestStoreMedia_UnparsedKeepsDeclaredTypeAndLink(t *testing.T) {
 	up := &fakeUploader{}
-	pipe := newMediaPipeline(fakeDownloader{data: []byte{0x00, 0x01, 0x02, 0x03}}, up, "org_default", "inst_1", mediaNow)
+	pipe := newMediaPipeline(testMediaLimits(), fakeDownloader{data: []byte{0x00, 0x01, 0x02, 0x03}}, up, "org_default", "inst_1", mediaNow)
 	got := pipe.Store(context.Background(), MediaDescriptor{
 		DeclaredType: "ptv", Kind: "video", MessageID: "3EB0A2", GroupJID: "120363043123456789@g.us",
 	})
@@ -85,7 +119,7 @@ func TestStoreMedia_UnparsedKeepsDeclaredTypeAndLink(t *testing.T) {
 
 func TestStoreMedia_DownloadFailureIsUnavailableNotFatal(t *testing.T) {
 	up := &fakeUploader{}
-	pipe := newMediaPipeline(fakeDownloader{err: errors.New("media key missing")}, up, "org_default", "inst_1", mediaNow)
+	pipe := newMediaPipeline(testMediaLimits(), fakeDownloader{err: errors.New("media key missing")}, up, "org_default", "inst_1", mediaNow)
 	got := pipe.Store(context.Background(), MediaDescriptor{
 		DeclaredType: "image", Kind: "image", Mime: "image/jpeg", MessageID: "3EB0A3", GroupJID: "120363043123456789@g.us",
 	})
@@ -119,7 +153,7 @@ func (c countingDownloader) Download(context.Context, MediaDescriptor) ([]byte, 
 func TestStoreMedia_ViewOnceIsUnavailableWithoutFetching(t *testing.T) {
 	downloads := 0
 	up := &fakeUploader{}
-	pipe := newMediaPipeline(countingDownloader{calls: &downloads}, up, "org_default", "inst_1", mediaNow)
+	pipe := newMediaPipeline(testMediaLimits(), countingDownloader{calls: &downloads}, up, "org_default", "inst_1", mediaNow)
 
 	got := pipe.Store(context.Background(), MediaDescriptor{
 		Kind: KindImage, DeclaredType: declaredViewOnce, Mime: "image/jpeg", ViewOnce: true,
@@ -139,7 +173,7 @@ func TestStoreMedia_ViewOnceIsUnavailableWithoutFetching(t *testing.T) {
 func TestStoreMedia_UnparsedKeepsTheBytesAsAnOpaqueObject(t *testing.T) {
 	data := []byte("this container is not something any sniffer knows")
 	up := &fakeUploader{}
-	pipe := newMediaPipeline(fakeDownloader{data: data}, up, "org_default", "inst_1", mediaNow)
+	pipe := newMediaPipeline(testMediaLimits(), fakeDownloader{data: data}, up, "org_default", "inst_1", mediaNow)
 
 	got := pipe.Store(context.Background(), MediaDescriptor{
 		Kind: KindDocument, DeclaredType: KindDocument, Mime: "application/pdf",
@@ -160,11 +194,17 @@ func TestStoreMedia_UnparsedKeepsTheBytesAsAnOpaqueObject(t *testing.T) {
 	if got.Attempts != 1 {
 		t.Errorf("Attempts = %d, want 1: Store performs exactly one attempt (§6.3.5)", got.Attempts)
 	}
+	if len(up.uploads) != 2 {
+		t.Fatalf("uploads = %d, want the opaque object and its descriptor sidecar", len(up.uploads))
+	}
+	if up.uploads[0].key != got.R2Key || up.uploads[1].key != got.R2Key[:len(got.R2Key)-len(".bin")]+".meta.json" {
+		t.Errorf("upload keys = %q, %q, want <id>.bin and <id>.meta.json (§6.3.3)", up.uploads[0].key, up.uploads[1].key)
+	}
 }
 
 func TestStoreMedia_TransientDownloadFailureStaysRetryable(t *testing.T) {
 	up := &fakeUploader{}
-	pipe := newMediaPipeline(fakeDownloader{err: context.DeadlineExceeded}, up, "org_default", "inst_1", mediaNow)
+	pipe := newMediaPipeline(testMediaLimits(), fakeDownloader{err: context.DeadlineExceeded}, up, "org_default", "inst_1", mediaNow)
 
 	got := pipe.Store(context.Background(), MediaDescriptor{
 		Kind: KindImage, DeclaredType: KindImage, MessageID: "3EB0B6", GroupJID: "120363043123456789@g.us",
@@ -181,7 +221,7 @@ func TestStoreMedia_TransientDownloadFailureStaysRetryable(t *testing.T) {
 }
 
 func TestStoreMedia_OversizedDownloadIsUnavailable(t *testing.T) {
-	pipe := newMediaPipeline(fakeDownloader{err: errMediaTooLarge}, &fakeUploader{}, "org_default", "inst_1", mediaNow)
+	pipe := newMediaPipeline(testMediaLimits(), fakeDownloader{err: errMediaTooLarge}, &fakeUploader{}, "org_default", "inst_1", mediaNow)
 
 	got := pipe.Store(context.Background(), MediaDescriptor{
 		Kind: KindVideo, DeclaredType: KindVideo, MessageID: "3EB0B7", GroupJID: "120363043123456789@g.us",
@@ -193,7 +233,7 @@ func TestStoreMedia_OversizedDownloadIsUnavailable(t *testing.T) {
 
 func TestStoreMedia_UploadFailureIsFailed(t *testing.T) {
 	up := &fakeUploader{err: errors.New("r2 put: ServiceUnavailable")}
-	pipe := newMediaPipeline(fakeDownloader{data: pngHeader(4, 3)}, up, "org_default", "inst_1", mediaNow)
+	pipe := newMediaPipeline(testMediaLimits(), fakeDownloader{data: pngHeader(4, 3)}, up, "org_default", "inst_1", mediaNow)
 
 	got := pipe.Store(context.Background(), MediaDescriptor{
 		Kind: KindImage, DeclaredType: KindImage, MessageID: "3EB0B8", GroupJID: "120363043123456789@g.us",
@@ -203,6 +243,269 @@ func TestStoreMedia_UploadFailureIsFailed(t *testing.T) {
 	}
 	if up.calls != 1 {
 		t.Errorf("upload calls = %d, want exactly one attempt", up.calls)
+	}
+}
+
+func TestStoreMedia_KindFollowsTheBytesNotTheDescriptor(t *testing.T) {
+	cases := []struct {
+		name         string
+		descKind     Kind
+		declared     Kind
+		data         []byte
+		wantKind     Kind
+		wantDeclared Kind
+	}{
+		{"image descriptor, image bytes", KindImage, KindImage, pngHeader(4, 3), KindImage, KindImage},
+		{"image descriptor, video bytes", KindImage, KindImage, mp4Header("isom"), KindVideo, KindImage},
+		{"video note, video bytes", KindPtv, KindPtv, mp4Header("isom"), KindVideo, KindPtv},
+		{"sticker, webp bytes", KindSticker, KindSticker, []byte("RIFF\x10\x00\x00\x00WEBPVP8 "), KindImage, KindSticker},
+		{"document descriptor, pdf bytes", KindDocument, KindDocument, []byte("%PDF-1.7\n"), KindDocument, KindDocument},
+		{"audio descriptor, ogg bytes", KindAudio, KindAudio, []byte("OggS\x00\x02\x00\x00\x00\x00\x00\x00"), KindAudio, KindAudio},
+		{"image descriptor, zip bytes", KindImage, KindImage, []byte("PK\x03\x04\x14\x00\x00\x00"), KindDocument, KindImage},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			up := &fakeUploader{}
+			pipe := newMediaPipeline(testMediaLimits(), fakeDownloader{data: tc.data}, up, "org_default", "inst_1", mediaNow)
+			got := pipe.Store(context.Background(), MediaDescriptor{
+				Kind: tc.descKind, DeclaredType: tc.declared, MessageID: "3EB0D1", GroupJID: "120363043123456789@g.us",
+			})
+			if got.Status != MediaStored {
+				t.Fatalf("media = %+v, want stored", got)
+			}
+			if got.Kind != tc.wantKind {
+				t.Errorf("Kind = %q, want %q: media.kind describes the bytes we stored, not what the descriptor claimed (§6.3.4)", got.Kind, tc.wantKind)
+			}
+			if got.DeclaredType != tc.wantDeclared {
+				t.Errorf("DeclaredType = %q, want %q: WhatsApp's claim is what keeps a sticker or video note visible (R3)", got.DeclaredType, tc.wantDeclared)
+			}
+		})
+	}
+}
+
+// blockingDownloader models an attachment that never arrives: only the deadline
+// the pipeline imposed can end the call.
+type blockingDownloader struct{}
+
+func (blockingDownloader) Download(ctx context.Context, _ MediaDescriptor) ([]byte, string, error) {
+	<-ctx.Done()
+	return nil, "", ctx.Err()
+}
+
+func TestStoreMedia_CapsAnOversizedDownloaderResponse(t *testing.T) {
+	up := &fakeUploader{}
+	limits := newMediaLimits(Config{MediaMaxBytes: 8, MediaDownloadTimeout: time.Second, MediaConcurrency: 1})
+	pipe := newMediaPipeline(limits, fakeDownloader{data: bytes.Repeat([]byte("a"), 9)}, up, "org_default", "inst_1", mediaNow)
+
+	got := pipe.Store(context.Background(), MediaDescriptor{
+		Kind: KindDocument, DeclaredType: KindDocument, MessageID: "3EB0D2", GroupJID: "120363043123456789@g.us",
+	})
+	if got.Status != MediaUnavailable || got.Reason != "too_large" {
+		t.Errorf("media = %+v, want unavailable/too_large: MEDIA_MAX_BYTES bounds what a downloader may hand back (§6.3.2)", got)
+	}
+	if !strings.Contains(got.Error, "MEDIA_MAX_BYTES") {
+		t.Errorf("Error = %q, want it to name the cap that was hit", got.Error)
+	}
+	if up.calls != 0 {
+		t.Error("an attachment past the cap was uploaded anyway")
+	}
+}
+
+func TestStoreMedia_AppliesTheConfiguredDownloadTimeout(t *testing.T) {
+	limits := newMediaLimits(Config{MediaMaxBytes: 1 << 20, MediaDownloadTimeout: 25 * time.Millisecond, MediaConcurrency: 1})
+	pipe := newMediaPipeline(limits, blockingDownloader{}, &fakeUploader{}, "org_default", "inst_1", mediaNow)
+
+	start := time.Now()
+	got := pipe.Store(context.Background(), MediaDescriptor{
+		Kind: KindImage, DeclaredType: KindImage, MessageID: "3EB0D3", GroupJID: "120363043123456789@g.us",
+	})
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("Store took %s, want the configured 25ms MEDIA_DOWNLOAD_TIMEOUT to cut the download short", elapsed)
+	}
+	if got.Status != MediaFailed || !strings.Contains(got.Error, context.DeadlineExceeded.Error()) {
+		t.Errorf("media = %+v, want failed with the deadline error: the per-download timeout is the configured one (§6.3.2)", got)
+	}
+}
+
+func TestStoreMedia_BoundsConcurrentDownloads(t *testing.T) {
+	const (
+		concurrency = 2
+		callers     = 6
+	)
+	limits := newMediaLimits(Config{MediaMaxBytes: 1 << 20, MediaDownloadTimeout: 5 * time.Second, MediaConcurrency: concurrency})
+	probe := newConcurrencyProbe(concurrency)
+	// Two pipelines built from one limits value: the manager builds a pipeline
+	// per media job, so MEDIA_CONCURRENCY has to bound the process, not one job.
+	pipes := []*mediaPipeline{
+		newMediaPipeline(limits, probe, noopUploader{}, "org_default", "inst_1", mediaNow),
+		newMediaPipeline(limits, probe, noopUploader{}, "org_default", "inst_1", mediaNow),
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range callers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			pipes[i%len(pipes)].Store(context.Background(), MediaDescriptor{
+				Kind: KindImage, DeclaredType: KindImage, MessageID: "3EB0D4", GroupJID: "120363043123456789@g.us",
+			})
+		}(i)
+	}
+	close(start)
+
+	if !probe.waitFor(concurrency, 2*time.Second) {
+		t.Fatal("fewer than MEDIA_CONCURRENCY downloads ever ran at once: the semaphore is blocking everything")
+	}
+	// The settle window is what makes an over-subscribed semaphore observable:
+	// the remaining callers are runnable, so without a bound they enter Download.
+	time.Sleep(50 * time.Millisecond)
+	probe.releaseAll()
+	wg.Wait()
+
+	if got := probe.maxInFlight(); got > concurrency {
+		t.Errorf("%d downloads ran at once, want at most MEDIA_CONCURRENCY=%d (§6.3.2)", got, concurrency)
+	}
+	if got := probe.maxInFlight(); got != concurrency {
+		t.Errorf("max in flight = %d, want exactly %d: the bound must be reachable, not a global lock", got, concurrency)
+	}
+}
+
+// concurrencyProbe is a downloader that reports how many downloads the pipeline
+// let run at once by holding each call inside Download until releaseAll.
+type concurrencyProbe struct {
+	limit   int
+	done    chan struct{}
+	reached chan struct{}
+	once    sync.Once
+
+	mu       sync.Mutex
+	inFlight int
+	max      int
+}
+
+func newConcurrencyProbe(limit int) *concurrencyProbe {
+	return &concurrencyProbe{limit: limit, done: make(chan struct{}), reached: make(chan struct{})}
+}
+
+func (c *concurrencyProbe) Download(_ context.Context, _ MediaDescriptor) ([]byte, string, error) {
+	c.mu.Lock()
+	c.inFlight++
+	if c.inFlight > c.max {
+		c.max = c.inFlight
+	}
+	if c.inFlight >= c.limit {
+		c.once.Do(func() { close(c.reached) })
+	}
+	c.mu.Unlock()
+
+	<-c.done
+
+	c.mu.Lock()
+	c.inFlight--
+	c.mu.Unlock()
+	return pngHeader(1, 1), "image/png", nil
+}
+
+func (c *concurrencyProbe) waitFor(n int, timeout time.Duration) bool {
+	select {
+	case <-c.reached:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+func (c *concurrencyProbe) releaseAll() { close(c.done) }
+
+func (c *concurrencyProbe) maxInFlight() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.max
+}
+
+func TestStoreMedia_WritesTheDeterministicDescriptorSidecar(t *testing.T) {
+	desc := MediaDescriptor{
+		Kind: KindImage, DeclaredType: KindImage, Mime: "image/jpeg", FileName: "chart.png",
+		MessageID: "3EB0E1", GroupJID: "120363043123456789@g.us",
+	}
+	png := pngHeader(4, 3)
+	up := &fakeUploader{}
+	pipe := newMediaPipeline(testMediaLimits(), fakeDownloader{data: png}, up, "org_default", "inst_1", mediaNow)
+
+	got := pipe.Store(context.Background(), desc)
+	if got.Status != MediaStored {
+		t.Fatalf("media = %+v, want stored", got)
+	}
+	if len(up.uploads) != 2 {
+		t.Fatalf("uploads = %d, want the object and its descriptor sidecar (§6.3.3)", len(up.uploads))
+	}
+	object, sidecar := up.uploads[0], up.uploads[1]
+	const prefix = "org/org_default/instance/inst_1/group/120363043123456789_g.us/2026/09/"
+	if object.key != prefix+"3EB0E1.png" || object.mime != "image/png" {
+		t.Errorf("media upload = %q (%s), want the sniffed object", object.key, object.mime)
+	}
+	if sidecar.key != prefix+"3EB0E1.meta.json" || sidecar.mime != "application/json" {
+		t.Errorf("sidecar upload = %q (%s), want <waMessageId>.meta.json beside the object", sidecar.key, sidecar.mime)
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(sidecar.data, &doc); err != nil {
+		t.Fatalf("sidecar is not JSON: %v", err)
+	}
+	for key, want := range map[string]any{
+		"organizationId": "org_default",
+		"instanceId":     "inst_1",
+		"groupJid":       "120363043123456789@g.us",
+		"waMessageId":    "3EB0E1",
+		"status":         "stored",
+		"kind":           "image",
+		"declaredType":   "image",
+		"mime":           "image/png",
+		"fileName":       "chart.png",
+		"size":           float64(len(png)),
+		"sha256":         sha256Hex(png),
+		"width":          float64(4),
+		"height":         float64(3),
+		"r2Key":          object.key,
+	} {
+		if got := doc[key]; got != want {
+			t.Errorf("sidecar %s = %v, want %v", key, got, want)
+		}
+	}
+
+	// Immutable in effect: the payload is a pure function of the descriptor and
+	// the key is stable, so a retry rewrites identical bytes rather than a
+	// different record.
+	again := &fakeUploader{}
+	newMediaPipeline(testMediaLimits(), fakeDownloader{data: png}, again, "org_default", "inst_1", mediaNow).Store(context.Background(), desc)
+	if len(again.uploads) != 2 {
+		t.Fatalf("second attempt uploads = %d, want 2", len(again.uploads))
+	}
+	if again.uploads[1].key != sidecar.key || !bytes.Equal(again.uploads[1].data, sidecar.data) {
+		t.Error("the sidecar is not deterministic: a retry would rewrite a different record")
+	}
+}
+
+func TestStoreMedia_SidecarFailureFailsTheAttemptWithoutALocator(t *testing.T) {
+	up := &fakeUploader{err: errors.New("r2 put sidecar: ServiceUnavailable"), failKeySuffix: ".meta.json"}
+	pipe := newMediaPipeline(testMediaLimits(), fakeDownloader{data: pngHeader(4, 3)}, up, "org_default", "inst_1", mediaNow)
+
+	got := pipe.Store(context.Background(), MediaDescriptor{
+		Kind: KindImage, DeclaredType: KindImage, MessageID: "3EB0E2", GroupJID: "120363043123456789@g.us",
+	})
+	if len(up.uploads) != 2 {
+		t.Fatalf("uploads = %d, want the object and the attempted sidecar", len(up.uploads))
+	}
+	if got.Status != MediaFailed {
+		t.Errorf("Status = %q, want failed: a record must not claim a stored attachment without its descriptor", got.Status)
+	}
+	if got.Error == "" {
+		t.Error("Error is empty: the attempt failed for a reason worth recording")
+	}
+	if got.R2Key != "" || got.PublicURL != "" {
+		t.Errorf("media = %+v, want no locator while the descriptor is missing (the janitor retries both writes)", got)
 	}
 }
 
@@ -243,7 +546,10 @@ func TestSniffMedia(t *testing.T) {
 		{"png", pngHeader(4, 3), "image/png", "png"},
 		{"jpeg", jpegHeader(5, 2), "image/jpeg", "jpg"},
 		{"gif", []byte("GIF89a\x04\x00\x03\x00"), "image/gif", "gif"},
-		{"webp", []byte("RIFF\x10\x00\x00\x00WEBPVP8 "), "image/webp", "webp"},
+		{"webp", webpHeader("VP8 ", 4, 3), "image/webp", "webp"},
+		{"webm", webmHeader("webm"), "video/webm", "webm"},
+		{"matroska", webmHeader("matroska"), "video/x-matroska", "mkv"},
+		{"wav", wavHeader(), "audio/wav", "wav"},
 		{"mp4", mp4Header("isom"), "video/mp4", "mp4"},
 		{"m4a", mp4Header("M4A "), "audio/mp4", "m4a"},
 		{"3gp", mp4Header("3gp4"), "video/3gpp", "3gp"},
@@ -282,6 +588,10 @@ func TestImageDimensions(t *testing.T) {
 		{"png", pngHeader(4, 3), 4, 3},
 		{"gif", []byte("GIF87a\x04\x00\x03\x00"), 4, 3},
 		{"jpeg", jpegHeader(5, 2), 5, 2},
+		{"webp vp8", webpHeader("VP8 ", 6, 4), 6, 4},
+		{"webp vp8l", webpHeader("VP8L", 7, 5), 7, 5},
+		{"webp vp8x", webpHeader("VP8X", 8, 6), 8, 6},
+		{"webp without a frame header", []byte("RIFF\x10\x00\x00\x00WEBPJUNK"), 0, 0},
 		{"pdf", []byte("%PDF-1.7\n"), 0, 0},
 		{"truncated png", pngHeader(4, 3)[:12], 0, 0},
 		{"truncated jpeg", jpegHeader(5, 2)[:12], 0, 0},
@@ -424,6 +734,63 @@ func TestObjectKeyEscapesEveryJIDSeparator(t *testing.T) {
 	if got != want {
 		t.Errorf("objectKeyAt = %q, want %q", got, want)
 	}
+}
+
+// webpHeader builds a WebP RIFF container in one of its three frame layouts:
+// VP8X (extended), VP8 (lossy) or VP8L (lossless).
+func webpHeader(fourcc string, w, h int) []byte {
+	switch fourcc {
+	case "VP8X":
+		out := []byte("RIFF")
+		out = binary.LittleEndian.AppendUint32(out, 4+8+10)
+		out = append(out, "WEBP"...)
+		out = append(out, "VP8X"...)
+		out = binary.LittleEndian.AppendUint32(out, 10)
+		out = append(out, 0, 0, 0, 0) // flags + reserved
+		out = append(out, be24(w-1)...)
+		out = append(out, be24(h-1)...)
+		return out
+	case "VP8L":
+		bits := uint32(w-1) | uint32(h-1)<<14
+		out := []byte("RIFF")
+		out = binary.LittleEndian.AppendUint32(out, 4+8+5)
+		out = append(out, "WEBP"...)
+		out = append(out, "VP8L"...)
+		out = binary.LittleEndian.AppendUint32(out, 5)
+		out = append(out, 0x2F)
+		return binary.LittleEndian.AppendUint32(out, bits)
+	default:
+		out := []byte("RIFF")
+		out = binary.LittleEndian.AppendUint32(out, 4+8+10)
+		out = append(out, "WEBP"...)
+		out = append(out, "VP8 "...)
+		out = binary.LittleEndian.AppendUint32(out, 10)
+		out = append(out, 0, 0, 0)          // frame tag
+		out = append(out, 0x9D, 0x01, 0x2A) // start code
+		out = binary.LittleEndian.AppendUint16(out, uint16(w))
+		return binary.LittleEndian.AppendUint16(out, uint16(h))
+	}
+}
+
+// be24 is the 24-bit little-endian canvas size a VP8X chunk carries.
+func be24(v int) []byte { return []byte{byte(v), byte(v >> 8), byte(v >> 16)} }
+
+// webmHeader builds an EBML header carrying the DocType, which is the only
+// part of a WebM/Matroska file the sniffer reads.
+func webmHeader(docType string) []byte {
+	out := []byte{0x1A, 0x45, 0xDF, 0xA3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	out = append(out, 0x42, 0x82, byte(len(docType)))
+	return append(out, docType...)
+}
+
+// wavHeader builds the RIFF/WAVE header of an uncompressed audio file.
+func wavHeader() []byte {
+	out := []byte("RIFF")
+	out = binary.LittleEndian.AppendUint32(out, 36)
+	out = append(out, "WAVE"...)
+	out = append(out, "fmt "...)
+	out = binary.LittleEndian.AppendUint32(out, 16)
+	return append(out, make([]byte, 16)...)
 }
 
 // pngHeader builds a PNG signature and an IHDR of the requested size — enough
