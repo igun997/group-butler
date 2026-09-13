@@ -78,6 +78,8 @@ func run() error {
 	if mgr.media != nil {
 		go mgr.media.run(ctx)
 	}
+	// Mongo work that originates on the whatsmeow event loop lands here.
+	go mgr.persist.run(ctx, mgr)
 
 	restoreInstances(ctx, mgr)
 

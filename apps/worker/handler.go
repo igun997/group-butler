@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.mau.fi/whatsmeow/types"
@@ -123,40 +124,25 @@ func (m *manager) onHistorySync(ctx context.Context, s *session, evt *events.His
 		s.id, ingested, skipped, m.cfg.HistorySyncMaxDays)
 }
 
-// onJoinedGroup persists the embedded snapshot as a first-class observation
+// onJoinedGroup queues the embedded snapshot as a first-class observation
 // (§6.6.1): the group exists from the moment we are added, even before any
 // message or scheduled sync sees it.
-func (m *manager) onJoinedGroup(ctx context.Context, s *session, evt *events.JoinedGroup) {
-	if evt.JID.Server != types.GroupServer || m.groups == nil {
+func (m *manager) onJoinedGroup(_ context.Context, _ *session, evt *events.JoinedGroup) {
+	if evt.JID.Server != types.GroupServer {
 		return
 	}
-	if err := m.groups.UpsertFromSync(ctx, m.orgID, s.id, &evt.GroupInfo, SyncOnEvent); err != nil {
-		logf("instance %s: upsert joined group %s: %v", s.id, evt.JID, err)
-	}
+	m.enqueuePersist(joinedGroupJob{groupJID: evt.JID, info: evt.GroupInfo})
 }
 
-// onGroupInfo folds one metadata delta into the stored observation. An empty
-// change list skips the Mongo write entirely — rename storms and membership
-// churn must not amplify into writes (§6.6.3).
-func (m *manager) onGroupInfo(ctx context.Context, s *session, evt *events.GroupInfo) {
-	if evt.JID.Server != types.GroupServer || m.groups == nil {
+// onGroupInfo queues one metadata delta. The read-modify-write happens on the
+// persistence worker, not on the event loop; an empty change list skips the
+// Mongo write entirely — rename storms and membership churn must not amplify
+// into writes (§6.6.3).
+func (m *manager) onGroupInfo(_ context.Context, s *session, evt *events.GroupInfo) {
+	if evt.JID.Server != types.GroupServer {
 		return
 	}
-	cur := Observed{State: GroupActive, SubjectSource: SubjectFromFallback}
-	if stored := m.groups.FindOne(ctx, m.orgID, s.id, evt.JID.String()); stored != nil {
-		cur = stored.Observed
-	}
-	next, changes, err := applyGroupDelta(cur, *evt, s.deviceJID())
-	if err != nil {
-		logf("instance %s: %v", s.id, err)
-		return
-	}
-	if len(changes) == 0 {
-		return
-	}
-	if err := m.groups.UpsertObserved(ctx, m.orgID, s.id, evt.JID.String(), next, false); err != nil {
-		logf("instance %s: apply group delta for %s: %v", s.id, evt.JID, err)
-	}
+	m.enqueuePersist(groupDeltaJob{session: s, evt: *evt})
 }
 
 // onConnected is the authoritative transition to `connected`: persist the
@@ -186,13 +172,10 @@ func (m *manager) onPairSuccess(s *session, evt *events.PairSuccess) {
 	s.mu.Unlock()
 }
 
-// onReceipt records delivery/read receipts as the §10 live counter. A receipt
-// is not a message, so it bumps its own counter instead of inflating
-// `messagesIn`; the BFF's rollup reconciles the day.
-func (m *manager) onReceipt(ctx context.Context, s *session, evt *events.Receipt) {
-	if m.stats == nil {
-		return
-	}
+// onReceipt queues the §10 live counter. A receipt is not a message, so it
+// bumps its own counter instead of inflating `messagesIn`; the BFF's rollup
+// reconciles the day.
+func (m *manager) onReceipt(_ context.Context, s *session, evt *events.Receipt) {
 	groupJID := ""
 	if evt.Chat.Server == types.GroupServer {
 		groupJID = evt.Chat.String()
@@ -201,22 +184,15 @@ func (m *manager) onReceipt(ctx context.Context, s *session, evt *events.Receipt
 	if at.IsZero() {
 		at = now().UTC()
 	}
-	if err := m.stats.bumpReceipt(ctx, m.orgID, s.id, groupJID, at); err != nil {
-		logf("instance %s: record receipt: %v", s.id, err)
-	}
+	m.enqueuePersist(receiptJob{instanceID: s.id, groupJID: groupJID, at: at})
 }
 
-// ensureGroupKnown records that a group carried traffic before any sync saw it,
-// so a missed sync can never hide a group (R1, §6.2). The ingest-owned counters
-// are incremented, never read-modify-written, so this commutes with the BFF's
-// `config.*` writes (§5.2).
-func (m *manager) ensureGroupKnown(ctx context.Context, instanceID, groupJID string, at time.Time) {
-	if m.groups == nil {
-		return
-	}
-	if err := m.groups.Touch(ctx, m.orgID, instanceID, groupJID, at); err != nil {
-		logf("instance %s: ensure group %s known: %v", instanceID, groupJID, err)
-	}
+// ensureGroupKnown queues a traffic record for a group, so a missed sync can
+// never hide a group (R1, §6.2). The ingest-owned counters are incremented by
+// the persistence worker, never read-modify-written here, so this commutes with
+// the BFF's `config.*` writes (§5.2).
+func (m *manager) ensureGroupKnown(_ context.Context, instanceID, groupJID string, at time.Time) {
+	m.enqueuePersist(groupTouchJob{instanceID: instanceID, groupJID: groupJID, at: at})
 }
 
 // attachMedia queues one attachment for the media runner. The descriptor comes
@@ -235,6 +211,208 @@ func (m *manager) attachMedia(ctx context.Context, s *session, evt *events.Messa
 	desc.MessageID = doc.WaMessageID
 	desc.GroupJID = doc.GroupJID
 	m.media.enqueue(mediaJob{doc: doc, desc: desc, client: s.client})
+}
+
+// ---- off-callback persistence --------------------------------------------
+
+// persistJob is one unit of Mongo work that originated on the whatsmeow event
+// loop. Jobs are values (not closures) so the queue can log and count them by
+// type.
+type persistJob interface {
+	persist(ctx context.Context, m *manager) error
+}
+
+// persistQueue is the §6.2 boundary between the protocol goroutine and the
+// database: the callback only enqueues, and a fixed set of workers performs the
+// writes. It is bounded, and overflow is counted — a slow database must degrade
+// visibly, never stall WhatsApp event delivery.
+type persistQueue struct {
+	mu      sync.Mutex
+	ch      chan persistJob
+	stopped bool
+	dropped atomic.Int64
+	failed  atomic.Int64
+	workers int
+
+	stopOnce sync.Once
+}
+
+func newPersistQueue(size, workers int) *persistQueue {
+	if size < 1 {
+		size = 1
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	return &persistQueue{ch: make(chan persistJob, size), workers: workers}
+}
+
+// enqueue returns immediately. A full (or stopped) queue counts the job as
+// dropped and says so rather than blocking the event loop.
+func (q *persistQueue) enqueue(job persistJob) {
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	stopped := q.stopped
+	sent := false
+	if !stopped {
+		select {
+		case q.ch <- job:
+			sent = true
+		default:
+		}
+	}
+	q.mu.Unlock()
+	if sent {
+		return
+	}
+	q.dropped.Add(1)
+	if stopped {
+		logf("event persistence stopped, dropping %T", job)
+	} else {
+		logf("event persistence queue full, dropping %T", job)
+	}
+}
+
+// run owns the workers until ctx is cancelled, then drains what is left and
+// counts it as dropped.
+func (q *persistQueue) run(ctx context.Context, m *manager) {
+	if q == nil {
+		return
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < q.workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			q.worker(ctx, m)
+		}()
+	}
+	wg.Wait()
+}
+
+func (q *persistQueue) worker(ctx context.Context, m *manager) {
+	for {
+		select {
+		case <-ctx.Done():
+			q.stop()
+			return
+		case job := <-q.ch:
+			if err := job.persist(ctx, m); err != nil {
+				q.failed.Add(1)
+				logf("event persistence %T: %v", job, err)
+			}
+		}
+	}
+}
+
+// stop closes the queue to producers; the first caller drains the buffer so a
+// shutdown counts exactly what it abandoned.
+func (q *persistQueue) stop() {
+	q.stopOnce.Do(func() {
+		q.mu.Lock()
+		q.stopped = true
+		q.mu.Unlock()
+		for {
+			select {
+			case <-q.ch:
+				q.dropped.Add(1)
+			default:
+				return
+			}
+		}
+	})
+}
+
+func (q *persistQueue) Depth() int {
+	if q == nil {
+		return 0
+	}
+	return len(q.ch)
+}
+
+func (q *persistQueue) Dropped() int64 {
+	if q == nil {
+		return 0
+	}
+	return q.dropped.Load()
+}
+
+func (q *persistQueue) Failed() int64 {
+	if q == nil {
+		return 0
+	}
+	return q.failed.Load()
+}
+
+// groupTouchJob records traffic for one group (§6.2).
+type groupTouchJob struct {
+	instanceID string
+	groupJID   string
+	at         time.Time
+}
+
+func (j groupTouchJob) persist(ctx context.Context, m *manager) error {
+	if m.groups == nil {
+		return nil
+	}
+	return m.groups.Touch(ctx, m.orgID, j.instanceID, j.groupJID, j.at)
+}
+
+// groupDeltaJob folds one `events.GroupInfo` into the stored observation. The
+// read and the write are both here so the event loop does neither.
+type groupDeltaJob struct {
+	session *session
+	evt     events.GroupInfo
+}
+
+func (j groupDeltaJob) persist(ctx context.Context, m *manager) error {
+	if m.groups == nil || j.session == nil {
+		return nil
+	}
+	groupJID := j.evt.JID.String()
+	cur := Observed{State: GroupActive, SubjectSource: SubjectFromFallback}
+	if stored := m.groups.FindOne(ctx, m.orgID, j.session.id, groupJID); stored != nil {
+		cur = stored.Observed
+	}
+	next, changes, err := applyGroupDelta(cur, j.evt, j.session.deviceJID())
+	if err != nil {
+		return err
+	}
+	if len(changes) == 0 {
+		// Nothing moved: the write is skipped, not issued empty (§6.6.3).
+		return nil
+	}
+	return m.groups.UpsertObserved(ctx, m.orgID, j.session.id, groupJID, next, false)
+}
+
+// joinedGroupJob persists a newly joined group's embedded snapshot (§6.6.1).
+type joinedGroupJob struct {
+	groupJID types.JID
+	info     types.GroupInfo
+}
+
+func (j joinedGroupJob) persist(ctx context.Context, m *manager) error {
+	if m.groups == nil {
+		return nil
+	}
+	info := j.info
+	return m.groups.UpsertFromSync(ctx, m.orgID, j.info.JID.String(), &info, SyncOnEvent)
+}
+
+// receiptJob records one inbound receipt in the §10 live counter.
+type receiptJob struct {
+	instanceID string
+	groupJID   string
+	at         time.Time
+}
+
+func (j receiptJob) persist(ctx context.Context, m *manager) error {
+	if m.stats == nil {
+		return nil
+	}
+	return m.stats.bumpReceipt(ctx, m.orgID, j.instanceID, j.groupJID, j.at)
 }
 
 // ---- media runner --------------------------------------------------------

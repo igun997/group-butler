@@ -47,6 +47,12 @@ type Config struct {
 	RawJSONMaxBytes int
 	RawSearchMax    int
 
+	// Event persistence bounds the queue that carries Mongo work off the
+	// whatsmeow event loop (§6.2). It is separate from the ingest queue: a
+	// message batch and a group delta have different volume and failure modes.
+	EventQueueSize int
+	EventWorkers   int
+
 	MediaMaxBytes        int64
 	MediaConcurrency     int
 	MediaDownloadTimeout time.Duration
@@ -104,6 +110,9 @@ func loadConfig() (Config, error) {
 		IngestFlushMax:  envInt("INGEST_FLUSH_MAX", 100),
 		RawJSONMaxBytes: envInt("RAW_JSON_MAX_BYTES", 32768),
 		RawSearchMax:    envInt("RAW_SEARCH_MAX_BYTES", 8192),
+
+		EventQueueSize: envInt("EVENT_QUEUE_SIZE", 1024),
+		EventWorkers:   envInt("EVENT_WORKERS", 4),
 
 		MediaMaxBytes:      int64(envInt("MEDIA_MAX_BYTES", 25*1024*1024)),
 		MediaConcurrency:   envInt("MEDIA_CONCURRENCY", 4),
@@ -196,6 +205,8 @@ func (c Config) validate() error {
 	}{
 		{"INGEST_QUEUE_SIZE", int64(c.IngestQueueSize)},
 		{"INGEST_FLUSH_MAX", int64(c.IngestFlushMax)},
+		{"EVENT_QUEUE_SIZE", int64(c.EventQueueSize)},
+		{"EVENT_WORKERS", int64(c.EventWorkers)},
 		{"RAW_JSON_MAX_BYTES", int64(c.RawJSONMaxBytes)},
 		{"RAW_SEARCH_MAX_BYTES", int64(c.RawSearchMax)},
 		{"MEDIA_MAX_BYTES", c.MediaMaxBytes},

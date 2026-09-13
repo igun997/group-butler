@@ -222,6 +222,25 @@ func (s *session) touch(at time.Time) {
 	s.mu.Unlock()
 }
 
+// groupStoreAPI is every `groups` write and read the worker performs. It is an
+// interface so the event-handler routing (what runs off the whatsmeow callback)
+// is provable without Mongo, and *groupStore satisfies it as-is.
+type groupStoreAPI interface {
+	FindOne(ctx context.Context, orgID, instanceID, groupJID string) *groupDoc
+	Touch(ctx context.Context, orgID, instanceID, groupJID string, at time.Time) error
+	UpsertObserved(ctx context.Context, orgID, instanceID, groupJID string, observed Observed, fromSync bool) error
+	UpsertFromSync(ctx context.Context, orgID, instanceID string, info *types.GroupInfo, source SyncSource) error
+	MarkLeft(ctx context.Context, orgID, instanceID, groupJID string, state GroupState) error
+	KnownGroupJIDs(ctx context.Context, orgID, instanceID string) ([]string, error)
+	ListForInstance(ctx context.Context, orgID, instanceID string) ([]groupListRow, *string, error)
+	loadObserved(ctx context.Context, orgID, instanceID string) (map[string]Observed, error)
+}
+
+// receiptWriter is the §10 live-counter write for one receipt.
+type receiptWriter interface {
+	bumpReceipt(ctx context.Context, orgID, instanceID, groupJID string, at time.Time) error
+}
+
 // manager owns every live session, its auth device and its pairing material
 // (§6.1). It is the only component that talks to whatsmeow.
 type manager struct {
@@ -229,14 +248,19 @@ type manager struct {
 	orgID  string
 	secret string
 
-	groups    *groupStore
+	groups    groupStoreAPI
 	instances instanceRepo
 	pairing   pairingStore
-	stats     *statsStore
+	stats     receiptWriter
 	audit     *auditStore
 	ingest    *ingestQueue
 	media     *mediaRunner
 	devices   deviceStore
+
+	// persist carries Mongo work that originates on the whatsmeow event loop
+	// onto its own bounded workers, so the protocol goroutine never waits on the
+	// database (§6.2).
+	persist *persistQueue
 
 	// newClient is the whatsmeow seam: the production value builds a real
 	// client, tests inject a fake so lifecycle and pairing are provable without
@@ -254,7 +278,7 @@ type manager struct {
 // newManager builds the manager and the background context pairing goroutines
 // run under. It starts nothing: restoreInstances and the HTTP server are the
 // caller's next steps, so a failed restore can still be served and diagnosed.
-func newManager(cfg Config, groups *groupStore, instances instanceRepo, pairing pairingStore, ingest *ingestQueue, devices deviceStore) *manager {
+func newManager(cfg Config, groups groupStoreAPI, instances instanceRepo, pairing pairingStore, ingest *ingestQueue, devices deviceStore) *manager {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &manager{
 		cfg:       cfg,
@@ -265,6 +289,7 @@ func newManager(cfg Config, groups *groupStore, instances instanceRepo, pairing 
 		pairing:   pairing,
 		ingest:    ingest,
 		devices:   devices,
+		persist:   newPersistQueue(cfg.EventQueueSize, cfg.EventWorkers),
 		newClient: func(device *store.Device, log waLog.Logger) whatsmeowClient {
 			return whatsmeowNewClient(device, log)
 		},
@@ -272,6 +297,13 @@ func newManager(cfg Config, groups *groupStore, instances instanceRepo, pairing 
 		cancel:   cancel,
 		sessions: make(map[string]*session),
 	}
+}
+
+// enqueuePersist hands Mongo work to the persistence queue. A nil queue (a test
+// manager that never touches Mongo) drops the job rather than writing inline —
+// the callback must never fall back to synchronous I/O.
+func (m *manager) enqueuePersist(job persistJob) {
+	m.persist.enqueue(job)
 }
 
 func (m *manager) get(id string) *session {

@@ -44,7 +44,7 @@ type SyncSummary struct {
 //     `runtime.groupSync.lastError` and backs off; this function only reports.
 //
 // `prune` is GROUP_SYNC_PRUNE: operators can keep rule 3 off entirely.
-func runGroupSync(ctx context.Context, client groupClient, store *groupStore, orgID, instanceID string, source SyncSource, prune bool) (SyncSummary, error) {
+func runGroupSync(ctx context.Context, client groupClient, store groupStoreAPI, orgID, instanceID string, source SyncSource, prune bool) (SyncSummary, error) {
 	started := now()
 	summary := SyncSummary{Source: source}
 	finish := func() SyncSummary {

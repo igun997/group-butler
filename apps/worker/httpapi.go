@@ -19,7 +19,7 @@ import (
 // leaves those routes answering 404, which keeps the group surface testable on
 // its own.
 type api struct {
-	store      *groupStore
+	store      groupStoreAPI
 	clientFor  func(instanceID string) groupClient
 	manager    *manager
 	orgID      string
