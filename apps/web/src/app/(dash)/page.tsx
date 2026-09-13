@@ -1,25 +1,27 @@
+import type { Metadata } from "next";
+
+export const metadata: Metadata = { title: "Overview · Group Butler" };
+
 /**
- * The app root, and deliberately all of it. This image ships the BFF, its
- * production runtime, the owner's session contract, and the health contract; the
- * dashboard of docs/ui-decision.md is a plan, not a build. A page that states
- * what the container serves is worth more to the operator who lands here than a
- * 404, and inventing a workspace would put fake panels in front of the real ones
- * later.
+ * The `overview` address (`/`, docs/ui-decision.md §2.3) until P10 builds it.
+ * It is honest content, not a fake workspace: it states what the container
+ * serves, which is what the operator who lands here actually needs. It adds no
+ * `h1` and no `main` of its own — `(dash)/layout.tsx` and `AppShell` own both
+ * landmarks, and the one `h1` is the shell's workspace heading (R-A5).
  */
-export default function HomePage() {
+export default function OverviewPage() {
   return (
-    <main>
-      <h1>Group Butler</h1>
+    <>
       <p>
         Group Butler keeps one organization&apos;s WhatsApp groups in order: which groups are
         assigned, what they are called now, and what was said in them. The worker that talks
         to WhatsApp runs as its own container; this one serves the dashboard and its API.
       </p>
       <p>
-        The dashboard is not built yet, so this page and the auth routes are the whole surface.
-        All but the health report need the owner&apos;s session cookie: middleware sends a browser
-        without one to <code>/login</code>, the sign-in form, and <code>/api/auth/login</code> is
-        the only thing that issues one.
+        The workspace views are not built yet, so this address and the auth routes are the whole
+        surface. All but the health report need the owner&apos;s session cookie: middleware sends a
+        browser without one to <code>/login</code>, the sign-in form, and{" "}
+        <code>/api/auth/login</code> is the only thing that issues one.
       </p>
 
       <h2>What this container answers</h2>
@@ -27,7 +29,7 @@ export default function HomePage() {
         <dt>
           <code>/</code>
         </dt>
-        <dd>This page, with an owner session.</dd>
+        <dd>This workspace, inside the one shell, with an owner session.</dd>
         <dt>
           <code>/api/auth/login</code>
         </dt>
@@ -42,7 +44,7 @@ export default function HomePage() {
         <dt>
           <code>/api/auth/logout</code>
         </dt>
-        <dd>Clears the cookie.</dd>
+        <dd>Clears the cookie, and is what the shell&apos;s sign-out control calls.</dd>
         <dt>
           <code>/api/health</code>
         </dt>
@@ -51,13 +53,6 @@ export default function HomePage() {
           while both respond, and 503 naming the dependency that did not.
         </dd>
       </dl>
-
-      <footer>
-        <p>
-          Health stays open on purpose: the container healthcheck calls it without a session.{" "}
-          <a href="/api/health">Read the current report</a>
-        </p>
-      </footer>
-    </main>
+    </>
   );
 }

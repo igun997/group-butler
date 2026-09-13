@@ -1,18 +1,22 @@
 /*
- * The token layer and the baseline styles the app root and the sign-in page
- * need. `fluent.css` is docs/ui-decision.md P0: the shadcn semantic tokens of
- * §3.1 in both shipped themes (§3.4), the §3.2 type ramp, 4 px grid, elevation,
- * motion, focus and acrylic vocabulary. It is the only place in the app that
- * defines a colour.
+ * The token layer and the baseline for the two surfaces the app serves: the one
+ * authenticated shell (docs/ui-decision.md P1, below) and the sign-in page that
+ * sits outside it, plus the sign-in form's controls.
  *
- * What is left here is the pre-shell baseline: how the two operator-facing pages
- * that exist before the dashboard (a status page and a door) lay their content
- * out, and the form controls `app/login` uses. This is the floor P1 replaces —
- * nothing here is a second UI system, and no value here is outside the token
- * layer it imports.
+ * `fluent.css` is P0: the shadcn semantic tokens of §3.1 in both shipped themes
+ * (§3.4), the §3.2 type ramp, 4 px grid, elevation, motion, focus and acrylic
+ * vocabulary. It is the only place in the app that defines a colour, and every
+ * rule below consumes it by name.
  *
- * Dial for these pages: ENERGY 1 / RHYTHM 1 / MOTION 1. The UI decision has not
- * fixed an accent hue yet, so the accent slot is the focus ring rather than a
+ * The pre-shell page column and form controls are scoped to `body > main` — the
+ * sign-in page's own `<main>`. The shell's `<main>` lives deeper in its layout,
+ * so the two never meet: the authenticated workspace is laid out by the shell
+ * rules, and the sign-in form keeps the plain document it had. This is the floor
+ * P1 replaces; the shell is now the only chrome, and no value here is outside the
+ * token layer it imports.
+ *
+ * Dial for the sign-in page: ENERGY 1 / RHYTHM 1 / MOTION 1. The UI decision has
+ * not fixed an accent hue yet, so the accent slot is the focus ring rather than a
  * colour invented here; the single link is `--foreground` plus an underline, and
  * the form failure is text, so neither depends on colour alone (§4.6 R-A3).
  */
@@ -31,8 +35,8 @@ body {
   line-height: 24px;
 }
 
-/* Page gutter 24 → 16 at `md`, and one reading column: §3.2 */
-main {
+/* The sign-in page's reading column and its gutter of 24 → 16 at `md` (§3.2). */
+body > main {
   max-width: 68ch;
   margin: 0 auto;
   padding: 48px 24px;
@@ -87,18 +91,18 @@ a {
 }
 
 /*
- * The sign-in form (app/login) is the only interactive surface so far: the
- * controls reuse the tokens above, sit on the 4 px grid, and the failure is text
- * in a live region rather than a colour (§4.6 R-A3).
+ * The sign-in form (app/login) is the only interactive surface outside the
+ * shell: its controls reuse the tokens above, sit on the 4 px grid, and the
+ * failure is text in a live region rather than a colour (§4.6 R-A3).
  */
-label {
+body > main label {
   display: block;
   margin: 16px 0 4px;
   font-size: 14px;
   line-height: 20px;
 }
 
-input {
+body > main input {
   display: block;
   width: 100%;
   padding: 8px 12px;
@@ -109,7 +113,7 @@ input {
   border-radius: 4px;
 }
 
-button {
+body > main button {
   margin-top: 16px;
   padding: 8px 16px;
   font: inherit;
@@ -121,12 +125,12 @@ button {
   cursor: pointer;
 }
 
-button:disabled {
+body > main button:disabled {
   cursor: progress;
   opacity: 0.7;
 }
 
-[role="alert"] {
+body > main [role="alert"] {
   margin: 0;
   padding: 8px 12px;
   border: 1px solid var(--border);
@@ -134,21 +138,446 @@ button:disabled {
 }
 
 /* Mounted empty so the message is announced when it arrives. */
-[role="alert"]:empty {
+body > main [role="alert"]:empty {
   display: none;
 }
 
-footer {
-  margin-top: 48px;
-  padding-top: 16px;
-  border-top: 1px solid var(--border);
+/*
+ * Announcements without geometry: the shell's live regions (R-A7) are in the
+ * accessibility tree from the first paint and take no space on screen.
+ */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * P1 — the one shell (R-A5 landmarks, R-M2 chrome collapse)
+ *
+ * `nav` is the registry navigation; `header` carries the workspace identity, the
+ * scope, the palette trigger and the owner menu; `main` is the workspace;
+ * `footer` reports the build and health. Exactly one of each, and exactly one
+ * `h1`, live here so no view can add another.
+ * ------------------------------------------------------------------------- */
+.app-shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: var(--shell-sidebar) minmax(0, 1fr);
+  transition: grid-template-columns var(--motion-duration-panel) var(--motion-curve-standard);
+}
+
+.app-shell--rail {
+  grid-template-columns: var(--shell-rail) minmax(0, 1fr);
+}
+
+.app-shell__nav {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2) var(--space-2);
+  background: var(--card);
+  border-right: var(--border-width) solid var(--border);
+}
+
+.app-shell__nav-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: var(--shell-header);
+}
+
+.app-shell__brand {
+  flex: 1;
+  font-size: var(--type-body-strong-size);
+  line-height: var(--type-body-strong-line);
+  font-weight: var(--type-body-strong-weight);
+}
+
+.app-shell__nav-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.app-shell__nav-link {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--row-height-compact);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-control);
+  color: var(--foreground);
+  text-decoration: none;
+}
+
+.app-shell__nav-link:hover {
+  background: var(--muted);
+}
+
+/*
+ * Selection (R-A4) is three channels — a surface wash, medium weight, and the
+ * in-flow check glyph — never an edge stripe. Focus stays the ring on
+ * `:focus-visible`, so the two are perceptible at once.
+ */
+.app-shell__nav-link[aria-current="page"] {
+  background: var(--accent);
+  font-weight: 600;
+}
+
+.app-shell__nav-current {
+  margin-left: auto;
+}
+
+/* The icon rail (R-M2): labels stay in the accessibility tree, on screen only the glyph. */
+.app-shell--rail .app-shell__brand {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.app-shell--rail .app-shell__nav-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.app-shell--rail .app-shell__nav-link,
+.app-shell--rail .app-shell__nav-head {
+  justify-content: center;
+}
+
+.app-shell--rail .app-shell__nav-current {
+  margin-left: 0;
+}
+
+.app-shell__column {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.app-shell__header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: var(--shell-header);
+  padding: 0 var(--space-4);
+  background: var(--background);
+  border-bottom: var(--border-width) solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.app-shell__identity {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  flex: 1;
+  min-width: 0;
+}
+
+.app-shell__title {
+  margin: 0;
+  font-size: var(--type-title2-size);
+  line-height: var(--type-title2-line);
+  font-weight: var(--type-title2-weight);
+}
+
+.app-shell__scope {
   color: var(--muted-foreground);
-  font-size: 14px;
-  line-height: 20px;
+  font-size: var(--type-body-size);
+  line-height: var(--type-body-line);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.app-shell__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.app-shell__main {
+  flex: 1;
+  min-width: 0;
+  padding: var(--space-6);
+}
+
+.app-shell__footer {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-top: var(--border-width) solid var(--border);
+  color: var(--muted-foreground);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+}
+
+/* Shell controls: quiet at rest, ≥ 24 × 24 px targets (R-M4), always focusable. */
+.app-shell button,
+.app-shell summary {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: 24px;
+  padding: var(--space-1) var(--space-2);
+  font: inherit;
+  color: var(--foreground);
+  background: transparent;
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+
+.app-shell button:hover {
+  background: var(--muted);
+}
+
+.app-shell button:disabled {
+  cursor: progress;
+  opacity: 0.7;
+}
+
+/* Hidden until the small-viewport rules reach them; specificity beats the shell button base. */
+.app-shell .app-shell__nav-trigger,
+.app-shell .app-shell__nav-close {
+  display: none;
+}
+
+.app-shell__palette-glyph {
+  display: inline-flex;
+}
+
+.app-shell__palette-label {
+  font-size: var(--type-body-size);
+}
+
+.app-shell__palette-hint,
+.app-palette__item-hint {
+  font-family: var(--font-mono);
+  font-size: var(--type-caption-size);
+  font-variant-numeric: tabular-nums;
+  color: var(--muted-foreground);
+}
+
+.app-shell__owner {
+  position: relative;
+}
+
+.app-shell__owner > summary {
+  list-style: none;
+}
+
+.app-shell__owner > summary::-webkit-details-marker {
+  display: none;
+}
+
+.app-shell__owner-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + var(--space-1));
+  min-width: 200px;
+  padding: var(--space-1);
+  background: var(--popover);
+  color: var(--popover-foreground);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-panel);
+  box-shadow: var(--elevation-8);
+  z-index: 2;
+}
+
+.app-shell__sign-out-failure {
+  margin: var(--space-1) 0 0;
+  color: var(--muted-foreground);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+}
+
+/*
+ * The command palette (§3.2: elevation 28 and acrylic are its only home outside
+ * sheets). `dialog` is a transient surface, so it takes the material and its
+ * opaque fallback comes from `.acrylic` in the token layer.
+ */
+.app-palette {
+  width: min(560px, calc(100vw - 32px));
+  margin: 12vh auto auto;
+  padding: var(--space-4);
+  color: var(--foreground);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-dialog);
+  box-shadow: var(--elevation-28);
+}
+
+.app-palette::backdrop {
+  background: color-mix(in srgb, var(--foreground) 40%, transparent);
+}
+
+.app-palette__title {
+  margin: 0 0 var(--space-2);
+  font-size: var(--type-subtitle-size);
+  line-height: var(--type-subtitle-line);
+  font-weight: var(--type-subtitle-weight);
+}
+
+.app-palette__search {
+  display: block;
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  font: inherit;
+  color: var(--foreground);
+  background: var(--background);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-control);
+}
+
+.app-palette__list {
+  list-style: none;
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
+.app-shell .app-palette__list button {
+  width: 100%;
+  justify-content: space-between;
+  text-align: left;
+  border-color: transparent;
+}
+
+.app-palette__empty {
+  margin: var(--space-2) 0 0;
+  color: var(--muted-foreground);
+  font-size: var(--type-body-size);
+  line-height: var(--type-body-line);
+}
+
+/*
+ * Small viewports (R-M2): the registry navigation leaves the grid and becomes a
+ * sheet opened from the header; the workspace identity and the scope stay in the
+ * header without opening anything. The palette remains a header control and the
+ * scrim is the sheet's close-by-pointer surface.
+ */
+@media (max-width: 767px) {
+  .app-shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .app-shell__nav {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: min(var(--shell-sidebar), 82vw);
+    visibility: hidden;
+    transform: translateX(-100%);
+    transition: transform var(--motion-duration-sheet) var(--motion-curve-decelerate);
+    box-shadow: var(--elevation-28);
+    z-index: 3;
+  }
+
+  .app-shell--nav-open .app-shell__nav {
+    visibility: visible;
+    transform: none;
+  }
+
+  .app-shell .app-shell__nav-trigger,
+  .app-shell .app-shell__nav-close {
+    display: inline-flex;
+  }
+
+  .app-shell .app-shell__rail-toggle {
+    display: none;
+  }
+
+  .app-shell .app-shell__scrim {
+    position: fixed;
+    inset: 0;
+    display: block;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: color-mix(in srgb, var(--foreground) 40%, transparent);
+    z-index: 2;
+  }
+
+  /*
+   * R-M2: the identity and the scope stay visible without opening anything. On a
+   * phone they take their own header row, and the controls wrap beneath them, so
+   * neither the scope nor the actions can be squeezed to zero width (R-M1).
+   */
+  .app-shell__header {
+    flex-wrap: wrap;
+    row-gap: var(--space-1);
+    padding-block: var(--space-1);
+  }
+
+  /*
+   * The palette becomes its glyph, and the owner menu keeps one line: the header
+   * fits a phone without horizontal scrolling (R-M1) while both stay labelled and
+   * reachable (R-M2).
+   */
+  .app-shell__palette-label,
+  .app-shell__palette-hint {
+    display: none;
+  }
+
+  .app-shell__identity {
+    order: -1;
+    flex: 1 1 100%;
+  }
+
+  .app-shell__actions {
+    flex: 1 1 auto;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    min-width: 0;
+  }
+
+  .app-shell__owner > summary {
+    max-width: 40vw;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+
+  .app-shell__header,
+  .app-shell__footer,
+  .app-shell__main {
+    padding-inline: var(--space-3);
+  }
+}
+
+@media (min-width: 768px) {
+  .app-shell .app-shell__scrim {
+    display: none;
+  }
 }
 
 @media (max-width: 640px) {
-  main {
+  body > main {
     padding: 32px 16px;
   }
 }

@@ -9,8 +9,10 @@ export const metadata: Metadata = {
 
 /**
  * The §4 layout is the app root: `<html>`/`<body>`, the UI decision's type and
- * colour tokens (globals.css), and nothing else. No shell chrome is mounted yet
- * because there is no authenticated workspace for it to frame.
+ * colour tokens (globals.css), and nothing else. The one authenticated shell is
+ * not here — it is `app/(dash)/layout.tsx`, the single page shell of
+ * docs/ui-decision.md §2.2 invariant 1 — so `/login` and the shell never share
+ * chrome.
  */
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
