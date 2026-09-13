@@ -10,9 +10,22 @@ import { SESSION_COOKIE } from "./server/auth/cookie";
  */
 const OPEN_PATHS = ["/login", "/api/auth/login", "/api/health"];
 
+/**
+ * The two static files of the §3.2 bundled fallback face and the OFL licence that
+ * ships with it (`apps/web/public/fonts`). The sign-in page — an open path —
+ * renders the face before any session exists, so those two exact paths are open
+ * as well. Exact paths, never a `fonts/` prefix: every other path under that
+ * directory, and every route that merely looks like one, keeps the gate.
+ */
+const OPEN_STATIC_FILES: Record<string, true> = {
+  "/fonts/inter-latin-wght-normal.woff2": true,
+  "/fonts/Inter-OFL.txt": true,
+};
+
 export function middleware(request: NextRequest): NextResponse {
   const { pathname } = request.nextUrl;
   if (OPEN_PATHS.some((path) => pathname === path || pathname.startsWith(`${path}/`))) return NextResponse.next();
+  if (OPEN_STATIC_FILES[pathname]) return NextResponse.next();
   if (request.cookies.has(SESSION_COOKIE)) return NextResponse.next();
 
   if (pathname.startsWith("/api/")) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
@@ -24,11 +37,10 @@ export function middleware(request: NextRequest): NextResponse {
 }
 
 /**
- * Static assets never need the gate; everything the app serves does. `fonts/` is
- * the bundled fallback face of docs/ui-decision.md §3.2 and the OFL licence that
- * ships with it (`apps/web/public/fonts`), and the sign-in page — an open path —
- * must be able to load it before a session exists.
+ * Static namespaces never need the gate; everything the app serves does. A single
+ * file inside a namespace cannot be named here without a fragile regex, so the
+ * two open static files are listed by exact path in the middleware itself.
  */
 export const config = {
-  matcher: ["/((?!_next/|fonts/|favicon.ico).*)"],
+  matcher: ["/((?!_next/|favicon.ico).*)"],
 };
