@@ -14,3 +14,5 @@ coverage/
 # whatsmeow auth state (linked-device keys) and local worker build output
 apps/worker/.localdata/
 apps/worker/whatsapp-worker
+# `go build ./...` names the binary after the package directory.
+apps/worker/worker

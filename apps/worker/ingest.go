@@ -203,6 +203,7 @@ func identityFields(doc MessageDoc) bson.D {
 		{Key: "isGroup", Value: doc.IsGroup},
 		{Key: "senderJid", Value: doc.SenderJID},
 		{Key: "fromMe", Value: doc.FromMe},
+		{Key: "flags.historical", Value: doc.Historical},
 		{Key: "timestamp", Value: doc.Timestamp},
 		{Key: "receivedAt", Value: doc.ReceivedAt},
 		{Key: "media.status", Value: doc.Media.Status},

@@ -188,6 +188,36 @@ func (s *groupStore) UpsertObserved(ctx context.Context, orgID, instanceID, grou
 	return nil
 }
 
+// Touch records traffic for a group the ingest path has just seen. A group that
+// carried a message exists even before any sync lists it, so a missing document
+// is inserted as a fallback observation; an existing one only has its
+// ingest-owned counters moved. `observed.*` metadata and the BFF's `config.*`
+// are left exactly as they were (§6.2, §5.2).
+func (s *groupStore) Touch(ctx context.Context, orgID, instanceID, groupJID string, at time.Time) error {
+	if at.IsZero() {
+		at = now().UTC()
+	}
+	_, err := s.coll.UpdateOne(ctx, groupIdentity(orgID, instanceID, groupJID), bson.D{
+		{Key: "$setOnInsert", Value: bson.D{
+			{Key: "organizationId", Value: orgID},
+			{Key: "instanceId", Value: instanceID},
+			{Key: "groupJid", Value: groupJID},
+			{Key: "config", Value: groupConfig{Active: true, Tags: []string{}}},
+			{Key: "observed.state", Value: GroupActive},
+			{Key: "observed.subjectSource", Value: SubjectFromFallback},
+			{Key: "observed.subjectHistory", Value: []SubjectHistoryEntry{}},
+			{Key: "createdAt", Value: at},
+			{Key: "updatedAt", Value: at},
+		}},
+		{Key: "$set", Value: bson.D{{Key: "observed.lastActivityAt", Value: at}}},
+		{Key: "$inc", Value: bson.D{{Key: "observed.messageCount", Value: 1}}},
+	}, options.UpdateOne().SetUpsert(true))
+	if err != nil {
+		return fmt.Errorf("touch group %s: %w", groupJID, err)
+	}
+	return nil
+}
+
 // MarkLeft records that this instance no longer sees a group: absence from a
 // snapshot (§6.6.5 rule 2) or a repair that answered not-found. The retained
 // subject is deliberately left alone — the name a group had is still useful

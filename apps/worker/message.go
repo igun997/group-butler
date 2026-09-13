@@ -150,6 +150,11 @@ type MessageDoc struct {
 	Media Media
 	Raw   RawMessage
 
+	// Historical marks a message replayed from the phone's backfill rather than
+	// observed live (§6.2). It is a property of first arrival and is persisted
+	// as `flags.historical`.
+	Historical bool
+
 	ParseState    ParseState
 	ParseErrors   []string
 	SchemaVersion int

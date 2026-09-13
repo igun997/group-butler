@@ -17,7 +17,7 @@ func newTestAPI(t *testing.T, client groupClient) (*api, *groupStore, context.Co
 	t.Helper()
 	store, ctx := newTestGroupStore(t)
 	return &api{
-		store: store, groups: client, orgID: "org_default",
+		store: store, clientFor: func(string) groupClient { return client }, orgID: "org_default",
 		secret: "dev-secret", prune: true, staleAfter: time.Hour,
 	}, store, ctx
 }
