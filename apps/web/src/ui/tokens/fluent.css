@@ -17,6 +17,29 @@
  * consumers; `tokens.test.ts` fails if the two sources drift apart.
  */
 
+/*
+ * The bundled fallback face (§3.2; `ui-interface-flexible.md` appendix A: "system
+ * stack led by Segoe UI, Inter as bundled fallback"). The stack leads with the
+ * operating system's UI font; this face is what a machine with none of those
+ * fonts renders, so type is never left to an arbitrary default. It is the only
+ * font asset the app ships — the monospace ramp stays system-led, because the
+ * decision asks for none there.
+ *
+ * `apps/web/public/fonts/inter-latin-wght-normal.woff2` is Inter v20's latin
+ * subset, variable across the whole 100–900 weight axis, vendored from the
+ * `@fontsource-variable/inter` 5.3.0 package (upstream Inter project, OFL-1.1).
+ * The licence ships beside it as `apps/web/public/fonts/Inter-OFL.txt`, as the
+ * OFL requires. `font-display: swap` because a fallback must never block first
+ * paint.
+ */
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("/fonts/inter-latin-wght-normal.woff2") format("woff2");
+}
+
 /* Light — the reference theme (§3.4): what an OS set to light receives. */
 :root {
   color-scheme: light;
@@ -46,12 +69,13 @@
   --ring: #18181b;
 
   /*
-   * Type face (§3.2). The stack carries its own fallbacks; a bundled fallback
-   * face is a font asset, not a token, and this decision ships none.
-   * Identifiers — JIDs, `waMessageId`, group IDs, token counts — use the
-   * monospace face with `tabular-nums`.
+   * Type face (§3.2). The system stack leads and the bundled Inter face above is
+   * the fallback, so a machine with none of these fonts still gets a real face
+   * rather than a generic default. Identifiers — JIDs, `waMessageId`, group IDs,
+   * token counts — use the monospace ramp with `tabular-nums`, which is
+   * system-led: the decision bundles no monospace face.
    */
-  --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Inter", sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
   /* Spatial: the 4 px grid, keyed by grid units — `--space-4` is 16 px. */
@@ -132,14 +156,31 @@
   --motion-curve-decelerate: cubic-bezier(0,0,0,1);
   --motion-curve-accelerate: cubic-bezier(1,0,1,1);
 
-  /* Focus: 2 px ring at a 1 px offset, two-tone (R-A4). */
+  /*
+   * Focus: 2 px ring at a 1 px offset, two-tone (R-A4). The pair is chosen so
+   * that at least one channel is always ≥ 3:1 against the control it is drawn on
+   * AND the ring is ≥ 3:1 against the page behind it:
+   *
+   *   --focus-outer  the ring itself: `--ring`, the maximum-contrast neutral of
+   *                  the theme, so it is legible on the page and on every light
+   *                  surface (17.7:1 light, 19.1:1 dark).
+   *   --focus-inner  the neutral line drawn in the 1 px offset gap, in the page
+   *                  tone. It is what makes the indicator perceptible when the
+   *                  control's own fill is the ring's tone — the primary button
+   *                  (`--primary` IS `--foreground`, and in light `--ring` is that
+   *                  same neutral): there the ring would be invisible against the
+   *                  button (1:1) while the inner line reads at 17.7:1 light /
+   *                  19.1:1 dark. On a destructive fill, where the ring is only
+   *                  3.67:1, both channels clear 3:1 and the indicator is
+   *                  genuinely two-tone.
+   */
   --focus-ring-width: 2px;
   --focus-ring-offset: 1px;
-  --focus-inner: var(--foreground);
   --focus-outer: var(--ring);
+  --focus-inner: var(--background);
   /*
-   * The neutral inner line as a shadow layer, so a surface that lifts on focus
-   * composes rather than replaces it:
+   * The inner line as a shadow layer, so a surface that lifts on focus composes
+   * rather than replaces it:
    * `box-shadow: var(--elevation-16), var(--focus-inner-line)`.
    */
   --focus-inner-line: 0 0 0 var(--focus-ring-offset) var(--focus-inner);

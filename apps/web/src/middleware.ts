@@ -23,7 +23,12 @@ export function middleware(request: NextRequest): NextResponse {
   return NextResponse.redirect(login);
 }
 
-/** Static assets never need the gate; everything the app serves does. */
+/**
+ * Static assets never need the gate; everything the app serves does. `fonts/` is
+ * the bundled fallback face of docs/ui-decision.md §3.2 and the OFL licence that
+ * ships with it (`apps/web/public/fonts`), and the sign-in page — an open path —
+ * must be able to load it before a session exists.
+ */
 export const config = {
-  matcher: ["/((?!_next/|favicon.ico).*)"],
+  matcher: ["/((?!_next/|fonts/|favicon.ico).*)"],
 };

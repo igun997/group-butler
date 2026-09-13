@@ -126,6 +126,103 @@ describe("token layer (spec §3.2)", () => {
     expect([...still.keys()]).toEqual(Object.entries(MOTION.duration).map(([name]) => `--motion-duration-${name}`));
     for (const ms of still.values()) expect(ms).toBe("0ms");
   });
+
+  /*
+   * R-A4 held against the failure a control whose fill IS the ring exposes: with
+   * the inner line authored in `--foreground`, the primary submit button — whose
+   * background is `--foreground`, and in the light theme `--ring` is that same
+   * neutral — carried an indicator at 1:1 on the control in both themes. The pair
+   * is now inner light / outer dark, so the control and the page each get a
+   * channel that reads.
+   */
+  test("the focus rectangle clears 3:1 on every surface a control can take, button and input included", () => {
+    const css = readFileSync(new URL("./fluent.css", import.meta.url), "utf8");
+    // The focus tokens are declared once on `:root` in terms of the theme's own
+    // colours, so each theme is that base with its colour block cascaded over it —
+    // exactly how the browser resolves them.
+    const base = declarations(css, ":root");
+    const themes = { light: base, dark: new Map([...base, ...declarations(css, ":root.dark")]) };
+    // Every fill a focusable control can be drawn with, or sit on: the page and
+    // its surfaces, the form controls, and the filled buttons.
+    const surfaces = [
+      "background",
+      "card",
+      "popover",
+      "input",
+      "muted",
+      "secondary",
+      "accent",
+      "primary",
+      "destructive",
+    ];
+
+    for (const [theme, tokens] of Object.entries(themes)) {
+      const inner = resolve(tokens, "--focus-inner");
+      const outer = resolve(tokens, "--focus-outer");
+      const page = resolve(tokens, "--background");
+      const primary = resolve(tokens, "--primary");
+
+      // Two tones, and the ring is the channel the page sees, so it clears the
+      // floor against the page on its own.
+      expect([theme, inner === outer]).toEqual([theme, false]);
+      expect([theme, contrast(outer, page) >= 3]).toEqual([theme, true]);
+
+      for (const surface of surfaces) {
+        const fill = resolve(tokens, `--${surface}`);
+        const visible = contrast(inner, fill) >= 3 || contrast(outer, fill) >= 3;
+        expect([theme, surface, visible]).toEqual([theme, surface, true]);
+      }
+
+      // The primary control: its fill is the ring's own tone, so only the inner
+      // line can carry the indicator. This is the case the review blocked on.
+      expect([theme, contrast(outer, primary) < 3, contrast(inner, primary) >= 3]).toEqual([theme, true, true]);
+    }
+
+    // One global treatment applies the pair to every focusable element: the ring
+    // as an outline, the neutral line as the shadow layer filling the 1 px offset.
+    const focus = declarations(css, ":focus-visible");
+    expect(focus.get("outline")).toBe("var(--focus-ring-width) solid var(--focus-outer)");
+    expect(focus.get("outline-offset")).toBe("var(--focus-ring-offset)");
+    expect(focus.get("box-shadow")).toBe("var(--focus-inner-line)");
+  });
+
+  /*
+   * §3.2 asks for "a system UI stack with a bundled fallback face" and the
+   * appendix names it, Inter. Naming a family in a stack is not a bundled face,
+   * so this holds the asset, its licence, the @font-face and the stack position
+   * together — the claim the first round got wrong.
+   */
+  test("the bundled fallback face is a real Inter asset, licensed, declared and last in the stack", () => {
+    const css = readFileSync(new URL("./fluent.css", import.meta.url), "utf8");
+    const face = declarations(css, "@font-face");
+    const family = (face.get("font-family") ?? "").replace(/["']/g, "");
+    const source = /url\("([^"]+)"\)/.exec(face.get("src") ?? "")?.[1] ?? "";
+
+    expect(family).toBe("Inter");
+    expect(source.startsWith("/fonts/")).toBe(true);
+    expect(face.get("font-display")).toBe("swap");
+
+    // A real woff2 beside its OFL licence, both inside `public/` so Next serves
+    // them and the runtime image copies them.
+    const asset = readFileSync(new URL(`../../../public${source}`, import.meta.url));
+    const licence = readFileSync(new URL("../../../public/fonts/Inter-OFL.txt", import.meta.url), "utf8");
+    expect(asset.subarray(0, 4).toString("latin1")).toBe("wOF2");
+    expect(asset.length).toBeGreaterThan(10_000);
+    expect(licence).toContain("SIL Open Font License");
+    expect(licence).toContain("Inter Project Authors");
+
+    // The one face covers every weight the ramp asks for.
+    const [minimum, maximum] = (face.get("font-weight") ?? "").split(/\s+/).map(Number);
+    for (const step of Object.values(TYPE_RAMP)) {
+      expect([step.weight, minimum! <= step.weight && step.weight <= maximum!]).toEqual([step.weight, true]);
+    }
+
+    // Stack position: system-led, the bundled face as the fallback, generic last.
+    const stack = (declarations(css, ":root").get("--font-ui") ?? "").split(",").map((entry) => entry.trim());
+    expect(stack).toContain(`"${family}"`);
+    expect(stack.indexOf('"Segoe UI"')).toBeLessThan(stack.indexOf(`"${family}"`));
+    expect(stack.indexOf(`"${family}"`)).toBeLessThan(stack.indexOf("sans-serif"));
+  });
 });
 
 /** `sheetTop` is `sheet-top` in a custom property name. */
@@ -133,11 +230,31 @@ function asToken(camelName: string): string {
   return camelName.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
 }
 
+/** A token's value with its `var(--other)` references followed to the theme's own value. */
+function resolve(tokens: Map<string, string>, name: string): string {
+  let value = tokens.get(name) ?? "";
+  for (let depth = 0; depth < 4 && value.startsWith("var("); depth += 1) {
+    value = tokens.get(value.slice(4, value.indexOf(")")).trim()) ?? value;
+  }
+  return value;
+}
+
+/** WCAG relative-luminance contrast ratio between two `#rrggbb` token values. */
+function contrast(one: string, other: string): number {
+  const luminance = (hex: string) =>
+    [1, 3, 5]
+      .map((offset) => parseInt(hex.slice(offset, offset + 2), 16) / 255)
+      .map((channel) => (channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4))
+      .reduce((sum, channel, index) => sum + channel * [0.2126, 0.7152, 0.0722][index]!, 0);
+  const [high, low] = [luminance(one), luminance(other)].sort((left, right) => right - left);
+  return (high! + 0.05) / (low! + 0.05);
+}
+
 /**
- * The custom properties declared by every rule whose selector is exactly
- * `selector`, values whitespace-normalised, optionally requiring the rule to sit
- * directly inside `atRule` (so the same selector in two environments — the OS
- * theme media query, the reduced-motion override — is not conflated).
+ * Every declaration of every rule whose selector is exactly `selector`, names and
+ * values whitespace-normalised, optionally requiring the rule to sit directly
+ * inside `atRule` (so the same selector in two environments — the OS theme media
+ * query, the reduced-motion override — is not conflated).
  */
 function declarations(css: string, selector: string, atRule: string | null = null): Map<string, string> {
   const found = new Map<string, string>();
@@ -146,8 +263,7 @@ function declarations(css: string, selector: string, atRule: string | null = nul
     for (const declaration of rule.body.split(";")) {
       const colon = declaration.indexOf(":");
       if (colon === -1) continue;
-      const name = declaration.slice(0, colon).trim();
-      if (name.startsWith("--")) found.set(name, declaration.slice(colon + 1).replace(/\s+/g, " ").trim());
+      found.set(declaration.slice(0, colon).trim(), declaration.slice(colon + 1).replace(/\s+/g, " ").trim());
     }
   }
   return found;
