@@ -103,10 +103,10 @@ type errorJob struct{}
 
 func (errorJob) persist(context.Context, *manager) error { return errors.New("boom") }
 
-// testManagerWithDeps builds a manager whose persistence dependencies are fakes,
-// so event routing is provable without Mongo or a socket.
-func testManagerWithDeps(groups groupStoreAPI, stats receiptWriter, persist *persistQueue) *manager {
-	cfg := Config{
+// testConfig is the configuration the routing and scheduler tests run under:
+// the real defaults that matter, with nothing that needs a socket.
+func testConfig() Config {
+	return Config{
 		OrganizationID:       "org_default",
 		WorkerSecret:         "dev-secret",
 		GroupSyncPrune:       true,
@@ -120,7 +120,12 @@ func testManagerWithDeps(groups groupStoreAPI, stats receiptWriter, persist *per
 		EventWorkers:         1,
 		GroupSyncInterval:    time.Hour,
 	}
-	mgr := newManager(cfg, groups, newFakeInstanceRepo(), newFakePairingStore(), nil, &fakeDeviceStore{})
+}
+
+// testManagerWithDeps builds a manager whose persistence dependencies are fakes,
+// so event routing is provable without Mongo or a socket.
+func testManagerWithDeps(groups groupStoreAPI, stats receiptWriter, persist *persistQueue) *manager {
+	mgr := newManager(testConfig(), groups, newFakeInstanceRepo(), newFakePairingStore(), nil, &fakeDeviceStore{})
 	if stats != nil {
 		mgr.stats = stats
 	}

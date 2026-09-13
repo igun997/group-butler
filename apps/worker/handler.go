@@ -25,21 +25,21 @@ func handleEvent(s *session, evt any) {
 	}
 	m := s.mgr
 	if m.ctx.Err() != nil {
-		// The process is leaving; the ingest queue performs the final flush.
+		// The process is leaving; the persistence queues drain what they
+		// accepted, and nothing new is worth starting.
 		return
 	}
-	ctx := context.WithoutCancel(m.ctx)
 	switch evt := evt.(type) {
 	case *events.Message:
-		m.onMessage(ctx, s, evt)
+		m.onMessage(s, evt)
 	case *events.HistorySync:
-		m.onHistorySync(ctx, s, evt)
+		m.onHistorySync(s, evt)
 	case *events.JoinedGroup:
-		m.onJoinedGroup(ctx, s, evt)
+		m.onJoinedGroup(s, evt)
 	case *events.GroupInfo:
-		m.onGroupInfo(ctx, s, evt)
+		m.onGroupInfo(s, evt)
 	case *events.Connected:
-		m.onConnected(ctx, s)
+		m.onConnected(s)
 	case *events.PairSuccess:
 		m.onPairSuccess(s, evt)
 	case *events.Disconnected:
@@ -48,9 +48,9 @@ func handleEvent(s *session, evt any) {
 		logf("instance %s: disconnected, waiting for automatic reconnect", s.id)
 	case *events.LoggedOut:
 		logf("instance %s: logged out of whatsapp (%v)", s.id, evt.Reason)
-		m.markLoggedOut(ctx, s)
+		m.onLoggedOut(s)
 	case *events.Receipt:
-		m.onReceipt(ctx, s, evt)
+		m.onReceipt(s, evt)
 	}
 }
 
@@ -58,7 +58,7 @@ func handleEvent(s *session, evt any) {
 // hands it to the ingest queue, then records the group and queues any
 // attachment. The message document is enqueued before the media attempt, so a
 // crash can only leave `media.status:"pending"`, never lose the message (§6.2).
-func (m *manager) onMessage(ctx context.Context, s *session, evt *events.Message) {
+func (m *manager) onMessage(s *session, evt *events.Message) {
 	doc, err := parseInbound(evt, m.orgID, s.id)
 	if err != nil {
 		logf("instance %s: parse inbound: %v", s.id, err)
@@ -69,16 +69,16 @@ func (m *manager) onMessage(ctx context.Context, s *session, evt *events.Message
 		m.ingest.Enqueue(doc)
 	}
 	if doc.IsGroup {
-		m.ensureGroupKnown(ctx, s.id, doc.GroupJID, doc.Timestamp)
+		m.ensureGroupKnown(s.id, doc.GroupJID, doc.Timestamp)
 	}
-	m.attachMedia(ctx, s, evt, doc)
+	m.attachMedia(s, evt, doc)
 }
 
 // onHistorySync replays the phone's backfill through the same parse/ingest path
 // as live traffic, marked `flags.historical` and bounded by
 // HISTORY_SYNC_MAX_DAYS so an old account cannot dump years of history into the
 // worker (§6.2).
-func (m *manager) onHistorySync(ctx context.Context, s *session, evt *events.HistorySync) {
+func (m *manager) onHistorySync(s *session, evt *events.HistorySync) {
 	if evt == nil || evt.Data == nil {
 		return
 	}
@@ -117,9 +117,9 @@ func (m *manager) onHistorySync(ctx context.Context, s *session, evt *events.His
 				m.ingest.Enqueue(doc)
 			}
 			if doc.IsGroup {
-				m.ensureGroupKnown(ctx, s.id, doc.GroupJID, doc.Timestamp)
+				m.ensureGroupKnown(s.id, doc.GroupJID, doc.Timestamp)
 			}
-			m.attachMedia(ctx, s, msgEvt, doc)
+			m.attachMedia(s, msgEvt, doc)
 			ingested++
 		}
 	}
@@ -130,7 +130,7 @@ func (m *manager) onHistorySync(ctx context.Context, s *session, evt *events.His
 // onJoinedGroup queues the embedded snapshot as a first-class observation
 // (§6.6.1): the group exists from the moment we are added, even before any
 // message or scheduled sync sees it.
-func (m *manager) onJoinedGroup(_ context.Context, _ *session, evt *events.JoinedGroup) {
+func (m *manager) onJoinedGroup(_ *session, evt *events.JoinedGroup) {
 	if evt.JID.Server != types.GroupServer {
 		return
 	}
@@ -141,29 +141,36 @@ func (m *manager) onJoinedGroup(_ context.Context, _ *session, evt *events.Joine
 // persistence worker, not on the event loop; an empty change list skips the
 // Mongo write entirely — rename storms and membership churn must not amplify
 // into writes (§6.6.3).
-func (m *manager) onGroupInfo(_ context.Context, s *session, evt *events.GroupInfo) {
+func (m *manager) onGroupInfo(s *session, evt *events.GroupInfo) {
 	if evt.JID.Server != types.GroupServer {
 		return
 	}
 	m.enqueuePersist(groupDeltaJob{session: s, evt: *evt})
 }
 
-// onConnected is the authoritative transition to `connected`: persist the
-// canonical bot identity, drop pairing material, and run the full group sync.
-// A device already owned by another live session is refused before any of that
-// (§6.1 duplicate-ownership guard).
-func (m *manager) onConnected(ctx context.Context, s *session) {
+// onConnected is the authoritative transition to `connected`. The duplicate
+// ownership guard and the in-memory status run here because later events depend
+// on them; the instance row, pairing cleanup and the full group sync are queued
+// so the protocol goroutine never waits on Mongo or WhatsApp I/O (§6.1, §6.2).
+func (m *manager) onConnected(s *session) {
 	if deviceOwnedByOther(m.liveDevices(), s.id, s.deviceJID()) {
+		const reason = "device is already linked to another instance"
 		logf("instance %s: device %s is already linked to another live session; disconnecting", s.id, s.deviceJID())
 		if s.client != nil {
 			s.client.Disconnect()
 		}
-		if err := m.markStatus(ctx, s.id, stateError, "device is already linked to another instance"); err != nil {
-			logf("instance %s: persist duplicate-device error: %v", s.id, err)
-		}
+		s.setStatus(stateError, reason)
+		m.enqueueLifecycle(instanceStatusJob{instanceID: s.id, status: stateError, pairingError: reason})
 		return
 	}
-	m.markConnected(ctx, s)
+	m.markConnectedLocal(s)
+	m.enqueueLifecycle(instanceConnectedJob{session: s})
+}
+
+// onLoggedOut releases the session synchronously (nothing else may use it) and
+// queues the persistence and credential cleanup.
+func (m *manager) onLoggedOut(s *session) {
+	m.releaseLoggedOut(s)
 }
 
 // onPairSuccess captures the canonical JID/LID as soon as the phone confirms the
@@ -178,7 +185,7 @@ func (m *manager) onPairSuccess(s *session, evt *events.PairSuccess) {
 // onReceipt queues the §10 live counter. A receipt is not a message, so it
 // bumps its own counter instead of inflating `messagesIn`; the BFF's rollup
 // reconciles the day.
-func (m *manager) onReceipt(_ context.Context, s *session, evt *events.Receipt) {
+func (m *manager) onReceipt(s *session, evt *events.Receipt) {
 	groupJID := ""
 	if evt.Chat.Server == types.GroupServer {
 		groupJID = evt.Chat.String()
@@ -194,7 +201,7 @@ func (m *manager) onReceipt(_ context.Context, s *session, evt *events.Receipt) 
 // never hide a group (R1, §6.2). The ingest-owned counters are incremented by
 // the persistence worker, never read-modify-written here, so this commutes with
 // the BFF's `config.*` writes (§5.2).
-func (m *manager) ensureGroupKnown(_ context.Context, instanceID, groupJID string, at time.Time) {
+func (m *manager) ensureGroupKnown(instanceID, groupJID string, at time.Time) {
 	m.enqueuePersist(groupTouchJob{instanceID: instanceID, groupJID: groupJID, at: at})
 }
 
@@ -203,7 +210,7 @@ func (m *manager) ensureGroupKnown(_ context.Context, instanceID, groupJID strin
 // download, upload and the `media.*` write. With media unconfigured (no R2
 // credentials) the runner is nil and the record stays `pending`, which is the
 // documented recoverable state rather than a silent drop (R3).
-func (m *manager) attachMedia(ctx context.Context, s *session, evt *events.Message, doc MessageDoc) {
+func (m *manager) attachMedia(s *session, evt *events.Message, doc MessageDoc) {
 	if m.media == nil || doc.Media.Status != MediaPending || evt == nil || evt.Message == nil {
 		return
 	}

@@ -29,6 +29,19 @@ type fakeInstanceRepo struct {
 	statuses  map[string]sessionState
 	connected map[string]bool
 	deleted   map[string]bool
+	ops       []string
+}
+
+// record keeps the order of the writes the worker issued, which is how a test
+// proves lifecycle jobs are applied in event order.
+func (r *fakeInstanceRepo) record(op string) {
+	r.ops = append(r.ops, op)
+}
+
+func (r *fakeInstanceRepo) opLog() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.ops...)
 }
 
 func newFakeInstanceRepo(rows ...InstanceRow) *fakeInstanceRepo {
@@ -53,6 +66,7 @@ func (r *fakeInstanceRepo) Create(_ context.Context, row InstanceRow) error {
 		}
 	}
 	r.rows[row.ID] = row
+	r.record("create")
 	return nil
 }
 
@@ -83,6 +97,7 @@ func (r *fakeInstanceRepo) SetStatus(_ context.Context, _, id string, status ses
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.statuses[id] = status
+	r.record("setStatus:" + string(status))
 	return nil
 }
 
@@ -90,6 +105,7 @@ func (r *fakeInstanceRepo) SetConnected(_ context.Context, _, id, phone, botJID,
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.connected[id] = true
+	r.record("setConnected")
 	row := r.rows[id]
 	row.Status = stateConnected
 	row.PhoneNumber, row.BotJID, row.BotLID = phone, botJID, botLID
@@ -101,6 +117,7 @@ func (r *fakeInstanceRepo) SoftDelete(_ context.Context, _, id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.deleted[id] = true
+	r.record("softDelete")
 	return nil
 }
 

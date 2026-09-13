@@ -229,6 +229,15 @@ func (s *session) touch(at time.Time) {
 	s.mu.Unlock()
 }
 
+// setStatus flips the in-memory status only; the persisted transition belongs to
+// a lifecycle job.
+func (s *session) setStatus(status sessionState, pairingError string) {
+	s.mu.Lock()
+	s.status = status
+	s.pairingError = pairingError
+	s.mu.Unlock()
+}
+
 // groupStoreAPI is every `groups` write and read the worker performs. It is an
 // interface so the event-handler routing (what runs off the whatsmeow callback)
 // is provable without Mongo, and *groupStore satisfies it as-is.
@@ -269,6 +278,11 @@ type manager struct {
 	// database (§6.2).
 	persist *persistQueue
 
+	// lifecycle carries instance state transitions (connected, logged out) the
+	// same way, but on a single consumer: those transitions are ordered, so a
+	// logout can never be overtaken by the connect that preceded it.
+	lifecycle *persistQueue
+
 	// ping is the `/health` database reachability check (§6.5).
 	ping func(ctx context.Context) error
 
@@ -305,6 +319,7 @@ func newManager(cfg Config, groups groupStoreAPI, instances instanceRepo, pairin
 		ingest:    ingest,
 		devices:   devices,
 		persist:   newPersistQueue(cfg.EventQueueSize, cfg.EventWorkers),
+		lifecycle: newPersistQueue(cfg.EventQueueSize, 1),
 		newClient: func(device *store.Device, log waLog.Logger) whatsmeowClient {
 			return whatsmeowNewClient(device, log)
 		},
@@ -323,6 +338,11 @@ func newManager(cfg Config, groups groupStoreAPI, instances instanceRepo, pairin
 // the callback must never fall back to synchronous I/O.
 func (m *manager) enqueuePersist(job persistJob) {
 	m.persist.enqueue(job)
+}
+
+// enqueueLifecycle queues an ordered instance transition.
+func (m *manager) enqueueLifecycle(job persistJob) {
+	m.lifecycle.enqueue(job)
 }
 
 func (m *manager) get(id string) *session {

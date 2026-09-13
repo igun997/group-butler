@@ -101,6 +101,8 @@ func run() error {
 	}
 	// Mongo work that originates on the whatsmeow event loop lands here.
 	start(func() { mgr.persist.run(ctx, mgr) })
+	// Instance transitions run on a single consumer so they stay ordered.
+	start(func() { mgr.lifecycle.run(ctx, mgr) })
 	// The periodic reconcile (GROUP_SYNC_INTERVAL) and the attachment retry
 	// loop (MEDIA_JANITOR_INTERVAL) own their own cadence.
 	start(func() { mgr.runGroupSyncScheduler(ctx) })
@@ -130,8 +132,11 @@ func mediaRunnerFor(cfg Config, messages mediaStore, orgID string) *mediaRunner 
 }
 
 // awaitShutdown runs the HTTP server until it fails or ctx is cancelled, then
-// stops every worker. The worker WaitGroup is always drained before returning,
-// so a failed listen cannot leave half a process running.
+// stops admission on every background queue and drains what was accepted —
+// before it returns. run() closes Mongo and the auth store in its defers, which
+// therefore run *after* the drain: no accepted write is rejected by a closed
+// dependency, and the worker WaitGroup is always drained, so a failed listen
+// cannot leave half a process running.
 func awaitShutdown(ctx context.Context, cancel context.CancelFunc, srv *http.Server, mgr *manager, workers *sync.WaitGroup) error {
 	serveErr := make(chan error, 1)
 	go func() {

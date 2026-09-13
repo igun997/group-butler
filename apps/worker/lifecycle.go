@@ -382,9 +382,12 @@ func (m *manager) markStatus(ctx context.Context, id string, status sessionState
 	return m.instances.SetStatus(ctx, m.orgID, id, status, pairingError)
 }
 
-// markConnected records the canonical bot identity, clears pairing material and
-// kicks off the connect-time group sync (§6.2, §6.6.2).
-func (m *manager) markConnected(ctx context.Context, s *session) {
+// markConnectedLocal applies the in-memory half of the connected transition:
+// status and identity become visible immediately, so group/media lookups can
+// use the client from the next statement on. The Mongo write and the connect
+// sync are queued (instanceConnectedJob) — they must not run on the whatsmeow
+// callback.
+func (m *manager) markConnectedLocal(s *session) {
 	jid := s.deviceJID()
 	phone := phoneDigitsFromJID(jid)
 	lid := ""
@@ -403,14 +406,75 @@ func (m *manager) markConnected(ctx context.Context, s *session) {
 	s.connectedAt = at
 	s.lastSeenAt = at
 	s.mu.Unlock()
+}
 
-	if err := m.instances.SetConnected(ctx, m.orgID, s.id, phone, jid.String(), lid); err != nil {
-		logf("instance %s: persist connected: %v", s.id, err)
+// instanceConnectedJob persists the connected state and starts the connect-time
+// sync. It runs on the ordered lifecycle consumer, and it spawns the sync rather
+// than performing it here so a slow WhatsApp IQ cannot block later transitions.
+type instanceConnectedJob struct{ session *session }
+
+func (j instanceConnectedJob) persist(ctx context.Context, m *manager) error {
+	s := j.session
+	if s == nil {
+		return nil
+	}
+	snap := s.snapshot()
+	if err := m.instances.SetConnected(ctx, m.orgID, s.id, snap.PhoneNumber, snap.BotJID, snap.BotLID); err != nil {
+		return err
 	}
 	if err := m.pairing.Clear(ctx, m.orgID, s.id); err != nil {
-		logf("instance %s: clear pairing material: %v", s.id, err)
+		return err
 	}
 	m.syncGroupsOnConnect(s)
+	return nil
+}
+
+// instanceStatusJob persists one runtime status change.
+type instanceStatusJob struct {
+	instanceID   string
+	status       sessionState
+	pairingError string
+}
+
+func (j instanceStatusJob) persist(ctx context.Context, m *manager) error {
+	return m.instances.SetStatus(ctx, m.orgID, j.instanceID, j.status, j.pairingError)
+}
+
+// instanceLoggedOutJob performs the permanent-unlink cleanup off the callback:
+// persist the status, drop pairing material, delete the now-useless auth device
+// (SQLite) and leave an audit trail. Every step is attempted so one failure
+// cannot leave the others undone; the joined error tells the queue this job
+// failed.
+type instanceLoggedOutJob struct {
+	session *session
+	botJID  types.JID
+}
+
+func (j instanceLoggedOutJob) persist(ctx context.Context, m *manager) error {
+	s := j.session
+	if s == nil {
+		return nil
+	}
+	var errs []error
+	if err := m.instances.SetStatus(ctx, m.orgID, s.id, stateLoggedOut, ""); err != nil {
+		errs = append(errs, err)
+	}
+	if err := m.pairing.Clear(ctx, m.orgID, s.id); err != nil {
+		errs = append(errs, err)
+	}
+	if device, err := m.deviceForPhone(ctx, phoneDigitsFromJID(j.botJID)); err != nil {
+		errs = append(errs, err)
+	} else if device != nil {
+		if err := m.devices.DeleteDevice(ctx, device); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if m.audit != nil {
+		if err := m.audit.append(ctx, m.orgID, "instance.logged_out", "instance", s.id, bson.M{"botJid": j.botJID.String()}); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // syncGroupsOnConnect runs the connect-time full sync off the event loop: a
@@ -473,32 +537,15 @@ func (m *manager) syncAllConnected(ctx context.Context) {
 
 const groupSyncTimeout = time.Minute
 
-// markLoggedOut handles the permanent unlink: disconnect, forget the live
-// session, delete the now-useless auth device, persist the status and audit it.
-// The row is kept (soft state) so the owner can see what happened.
-func (m *manager) markLoggedOut(ctx context.Context, s *session) {
-	ctx = context.WithoutCancel(ctx)
+// releaseLoggedOut applies the in-memory half of the logout: the client is
+// disconnected and the session leaves the map immediately, so no further event
+// or request is served for it. The Mongo status and the SQLite credential
+// cleanup are queued on the ordered lifecycle consumer.
+func (m *manager) releaseLoggedOut(s *session) {
+	botJID := s.deviceJID()
 	if s.client != nil {
 		s.client.Disconnect()
 	}
-	jid := s.deviceJID()
 	m.discard(s)
-	if err := m.instances.SetStatus(ctx, m.orgID, s.id, stateLoggedOut, ""); err != nil {
-		logf("instance %s: persist logged out: %v", s.id, err)
-	}
-	if err := m.pairing.Clear(ctx, m.orgID, s.id); err != nil {
-		logf("instance %s: clear pairing material: %v", s.id, err)
-	}
-	if device, err := m.deviceForPhone(ctx, phoneDigitsFromJID(jid)); err != nil {
-		logf("instance %s: find auth device: %v", s.id, err)
-	} else if device != nil {
-		if err := m.devices.DeleteDevice(ctx, device); err != nil {
-			logf("instance %s: delete auth device: %v", s.id, err)
-		}
-	}
-	if m.audit != nil {
-		if err := m.audit.append(ctx, m.orgID, "instance.logged_out", "instance", s.id, bson.M{"botJid": jid.String()}); err != nil {
-			logf("instance %s: audit logout: %v", s.id, err)
-		}
-	}
+	m.enqueueLifecycle(instanceLoggedOutJob{session: s, botJID: botJID})
 }
