@@ -965,8 +965,8 @@ content; §11.5).
 | Var | Notes |
 |---|---|
 | `OWNER_EMAIL` | the single owner identity |
-| `OWNER_PASSWORD_HASH` | argon2id (preferred) or bcrypt hash; never a plaintext password in prod |
-| `OWNER_PASSWORD` | dev-only convenience; refused when `NODE_ENV=production` |
+| `OWNER_PASSWORD_HASH` | scrypt hash from `bun run auth:hash` (`scrypt$N$r$p$saltHex$hashHex`); never a plaintext password in prod |
+| `OWNER_PASSWORD` | dev-only convenience; refused when `ENVIRONMENT=production` |
 | `AUTH_SECRET` | ≥32 chars, HMAC key for the session cookie; rotation invalidates all sessions |
 | `MONGODB_URI`, `MONGODB_DB` | same database as the worker |
 | `ORGANIZATION_ID` | default `org_default` |
@@ -1084,13 +1084,15 @@ Dimensions:
 ### 11.1 Authentication — one owner, env credentials
 - **Identity source:** `OWNER_EMAIL` + (`OWNER_PASSWORD_HASH` | dev-only `OWNER_PASSWORD`). No user
   collection, no roles, no invitations, no password reset.
-- **Login:** `POST /api/auth/login` → constant-time email compare, argon2id/bcrypt verify, a fixed
+- **Login:** `POST /api/auth/login` → constant-time email compare, scrypt verify, a fixed
   minimum response time (~350 ms) to blunt timing/latency oracles, per-IP rate limit
-  (`LOGIN_RATE_LIMIT`, default 5 attempts / 15 min, in-memory + Mongo-backed counter), generic
-  failure message. Success/failure is written to `auditLog` with the IP.
+  (`LOGIN_RATE_LIMIT`, default 5 attempts / 15 min, in-process counter — a restart or a second
+  replica resets it), generic failure message. Success/failure is written to `auditLog` with
+  the IP.
 - **Session:** stateless, HMAC-SHA256-signed cookie
-  `{ sub:"owner", email, organizationId:"org_default", iat, exp }`; `HttpOnly`, `Secure`,
-  `SameSite=Lax`, `Path=/`, 7-day expiry. `AUTH_SECRET` is the only signing key; rotating it
+  `{ sub:"owner", email, organizationId:"org_default", iat, exp }`; `HttpOnly`, `Secure` in
+  production (development is served over plain http), `SameSite=Lax`, `Path=/`, 7-day expiry.
+  `AUTH_SECRET` is the only signing key; rotating it
   revokes every session. Logout clears the cookie. No server-side session store.
 - **Trust rules (explicit):** never accept identity from `X-Forwarded-User`,
   `X-Auth-Request-*`, `X-Remote-User`, `X-Forwarded-Email`, or any header; never accept a
