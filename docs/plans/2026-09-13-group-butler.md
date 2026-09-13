@@ -899,9 +899,9 @@ exists anywhere).
 
 **Step 6: Acceptance — `--check`**
 
-Run: `cp .env.example .env` and fill the five R2 values from your Cloudflare dashboard
-(`R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`),
-then `bun run dev:check`
+Run: `cp .env.example .env` and fill the four required R2 values from your Cloudflare dashboard
+(`R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`; `R2_PUBLIC_URL` stays
+optional), then `bun run dev:check`
 Expected: `[dev] r2 ok …` (authenticated when the `aws` CLI is present, otherwise a reachability line),
 ending in `check ok: env present and complete (incl. R2), mongo replica set healthy (apps not started)`, exit 0.
 

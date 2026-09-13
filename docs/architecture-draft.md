@@ -88,9 +88,10 @@ implementation may not silently cross.
     emulator, no endpoint override and no path-style configuration anywhere in this project, so the
     media path (upload, `unparsed` capture, presigned reads) is exercised against the real service
     from the first day of development. Local development uses a dedicated **dev bucket** with its own
-    scoped credentials, never the production bucket (§11.6). The dev launcher validates the five R2
-    values and refuses to start with an actionable message when one is missing or left as a
-    placeholder (§13).
+    scoped credentials, never the production bucket (§11.6). The dev launcher validates the four
+    required R2 values (`R2_ACCOUNT_ID`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`;
+    `R2_PUBLIC_URL` stays optional) and refuses to start with an actionable message when one is
+    missing or left as a placeholder (§13).
 13. **Out of scope for this draft:** message-level full-text ranking beyond Mongo text indexes,
     vector embeddings, WhatsApp channel/newsletter ingestion, billing, multi-language UI, mobile
     clients, egress-side message templating approval flows (WhatsApp Business API rules).
