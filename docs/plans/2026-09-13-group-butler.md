@@ -5233,12 +5233,22 @@ Dockerfile-adding launcher change fails CI); `bun run --cwd apps/web build`; the
 
 **Step 4: Deploy workflow (GHCR)**
 
-`.github/workflows/deploy.yml`: on `push` to `master` and tags `v*`; `permissions: {contents: read, packages: write}`;
-`docker/login-action` with `GITHUB_TOKEN`; `docker/setup-buildx-action`; two
-`docker/build-push-action` steps (contexts `apps/web` and `apps/worker`, `target: production`) with
-`docker/metadata-action` tags (`type=ref,event=branch`, `type=semver`, `type=sha`) and
-`cache-from/to: type=gha`. Image names: `ghcr.io/${{ github.repository }}/web` and
-`ghcr.io/${{ github.repository }}/worker`.
+`.github/workflows/deploy.yml`: on `push` to `master` and tags `v*`; `permissions: {contents: read, packages: write}`
+(the workflow default is `contents: read`, with `packages: write` granted only to the image job);
+`docker/setup-buildx-action`, then `docker/login-action` with `GITHUB_TOKEN`; then **one
+`docker/build-push-action` matrix row per image** with `docker/metadata-action` tags
+(`type=ref,event=branch`, `type=semver` (`{{version}}`, `{{major}}.{{minor}}`), `type=sha`, plus
+`latest` on the default branch) and `cache-from/to: type=gha,scope=<image>`. Image names:
+`ghcr.io/<lowercased repository>/web` and `.../worker` — there is no combined image.
+
+Correction to the original step (the Dockerfiles were the source of truth here): the contexts are
+**not** `apps/web` and `apps/worker` — they are **`.` (repository root)** for the web image, because
+the Next build needs the root bun workspace manifests, `packages/shared`, and
+`outputFileTracingRoot = <repo root>`, and **`apps/worker`** for the worker. `file:` stays
+workspace-relative (`apps/web/Dockerfile`, `apps/worker/Dockerfile`). A `workflow_dispatch` trigger
+makes the same matrix a **dry run** (`push: false`, `load: true`) that never authenticates or
+publishes, and every action is pinned to a full commit SHA. There is no deployment step and no
+deployment credential: the workflow stops at GHCR.
 
 **Step 5: Optional pull-only compose**
 

@@ -1176,11 +1176,22 @@ Both images: `HEALTHCHECK` on their own health route, no dependency on compose, 
 filesystem, independent restart/scale.
 
 ### 12.2 Deploy workflow
-`.github/workflows/deploy.yml` (mirrors the reference): triggers `push` to `master` and tags `v*`;
-`permissions: {contents: read, packages: write}`; `docker/login-action` with `GITHUB_TOKEN`;
-`docker/setup-buildx-action`; `docker/build-push-action` for each image with
-`docker/metadata-action` tags (`type=ref,event=branch`, `type=semver`, `type=sha`) and
-`cache-from/to: type=gha`. `ci.yml` runs on PR/push: `bun install --frozen-lockfile`, `bun run lint`,
+`.github/workflows/deploy.yml` (mirrors the reference) is the only thing that publishes, and only
+`push` to `master` or `push` of a `v*` tag does so. `workflow_dispatch` is a dry run: it builds both
+images with `load: true`, never logs in, never pushes. Permissions are least-privilege — the
+workflow default is `contents: read` and only the image job adds `packages: write`.
+`docker/setup-buildx-action` runs first, then `docker/login-action` against `ghcr.io` with the
+repository-scoped `GITHUB_TOKEN` alone (this workflow holds no deployment credential), then one
+`docker/build-push-action` **matrix row per image**: `docker/metadata-action` tags
+(`type=ref,event=branch`, `type=semver` version and major.minor, `type=sha`, plus `latest` on the
+default branch — the tag §12.3's runbook pulls) and `cache-from/to: type=gha,scope=<image>`, so the
+two images never thrash one cache. Every action is pinned to a full commit SHA.
+Build contexts follow §12.1 and differ per image: **web = the repository root** (the bun workspace
+manifests, `packages/shared`, and Next's `outputFileTracingRoot` all live there), **worker =
+`apps/worker`** (the Go module directory); both build `target: production`, so neither published
+image carries a dev stage. Image names are `ghcr.io/<owner>/group-butler/web` and
+`ghcr.io/<owner>/group-butler/worker`; there is no combined image.
+`ci.yml` runs on PR/push: `bun install --frozen-lockfile`, `bun run lint`,
 `bun run check` (typecheck), `bun run test`, plus `gofmt -l`, `go vet ./...`, `go test ./...` in
 `apps/worker`.
 

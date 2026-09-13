@@ -1,0 +1,112 @@
+# Publish the two independently deployable Group Butler images to GHCR.
+#
+#   ghcr.io/<owner>/<repo>/web      context `.`            file apps/web/Dockerfile
+#   ghcr.io/<owner>/<repo>/worker   context `apps/worker`  file apps/worker/Dockerfile
+#
+# There is deliberately no combined image: the BFF and the worker have separate
+# env contracts and independent restart/scale (docs/architecture-draft.md §12.1).
+# There is deliberately no deployment step and no deployment credential — this
+# workflow authenticates to GHCR with the repository-scoped GITHUB_TOKEN and
+# stops at the registry; rolling the images out is an operator action (§12.3).
+#
+# Events:
+#   push to master / push tag v*   -> build and push
+#   workflow_dispatch              -> build only, never pushes (dry matrix run:
+#                                     both images are built and loaded into the
+#                                     runner so a broken context fails loudly
+#                                     without touching the registry)
+
+name: deploy
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+# Least privilege: the workflow default is read-only, and only the image job is
+# granted the package write it needs to publish.
+permissions:
+  contents: read
+
+# A publish must not be cancelled halfway by a newer run of the same ref.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  images:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The web context is the repository root, not apps/web: the Next build
+          # needs the bun workspace manifests and packages/shared, and Next's
+          # outputFileTracingRoot is the repository root.
+          - image: web
+            context: .
+            file: apps/web/Dockerfile
+            cache-scope: web
+          # The worker context is the Go module directory itself.
+          - image: worker
+            context: apps/worker
+            file: apps/worker/Dockerfile
+            cache-scope: worker
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing here pushes to git; do not leave the token in .git/config.
+          persist-credentials: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # GHCR requires lowercase repository names; github.repository preserves the
+      # owner's casing, so normalize before it reaches metadata-action.
+      - name: Resolve lowercase image namespace
+        id: repo
+        run: echo "namespace=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags and labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.repo.outputs.namespace }}/${{ matrix.image }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          target: production
+          push: ${{ github.event_name == 'push' }}
+          load: ${{ github.event_name == 'workflow_dispatch' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Separate scopes keep the two images from thrashing one GHA cache.
+          cache-from: type=gha,scope=${{ matrix.cache-scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache-scope }}
+          # Registry-side supply-chain metadata; only meaningful when pushing
+          # (the docker exporter used by the dispatch dry run cannot carry it).
+          provenance: ${{ github.event_name == 'push' }}
+          sbom: ${{ github.event_name == 'push' }}
