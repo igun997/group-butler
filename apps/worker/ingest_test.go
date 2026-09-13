@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -55,9 +58,9 @@ func TestFlushIngestUpsertsIdempotently(t *testing.T) {
 	}
 }
 
-// TestIngestQueueFlushesWhatItHoldsOnShutdown pins the only moment the queue can
-// lose an accepted message: a batch that never reached the flush size must still
-// be written when the worker shuts down, not discarded with the process.
+// TestIngestQueueFlushesWhatItHoldsOnShutdown pins the shutdown path: a batch that
+// never reached the flush size must still be written when the worker stops, not
+// discarded with the process.
 func TestIngestQueueFlushesWhatItHoldsOnShutdown(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), integrationTimeout)
 	defer cancel()
@@ -99,6 +102,94 @@ func TestIngestQueueFlushesWhatItHoldsOnShutdown(t *testing.T) {
 	}
 	if dropped := q.Dropped(); dropped != 0 {
 		t.Errorf("Dropped() = %d, want 0: a shutdown flush is not a drop", dropped)
+	}
+}
+
+// TestIngestQueueDoesNotStrandMessagesAcrossShutdown races producers against the
+// consumer's termination: every message a producer hands over must end up either
+// persisted or counted as dropped. A queue that keeps accepting into its buffer
+// after its consumer stopped would silently strand those documents.
+func TestIngestQueueDoesNotStrandMessagesAcrossShutdown(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), integrationTimeout)
+	defer cancel()
+	client, db, err := connectMongo(ctx, testMongoURI(t), "group_butler_test")
+	if err != nil {
+		t.Fatalf("connectMongo: %v", err)
+	}
+	defer func() { _ = client.Disconnect(ctx) }()
+	if err := ensureIngestIndexes(ctx, db); err != nil {
+		t.Fatalf("ensureIngestIndexes: %v", err)
+	}
+	const (
+		instanceID  = "inst_race"
+		perProducer = 2000
+		producers   = 4
+	)
+	_, _ = db.Collection(collMessages).DeleteMany(ctx, map[string]any{"instanceId": instanceID})
+	defer func() { _, _ = db.Collection(collMessages).DeleteMany(ctx, map[string]any{"instanceId": instanceID}) }()
+
+	// A flush interval and batch cap the producers never reach, so the only
+	// writes are the ones the shutdown flush performs.
+	q := newIngestQueue(64, time.Hour, 1<<20)
+	runCtx, shutdown := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		q.Run(runCtx, newMessageStore(db))
+	}()
+
+	var attempted atomic.Int64
+	stopProducers := make(chan struct{})
+	var running sync.WaitGroup
+	for range producers {
+		running.Add(1)
+		go func() {
+			defer running.Done()
+			for range perProducer {
+				select {
+				case <-stopProducers:
+					return
+				default:
+				}
+				n := attempted.Add(1)
+				q.Enqueue(MessageDoc{
+					OrganizationID: "org_default", InstanceID: instanceID,
+					WaMessageID: fmt.Sprintf("3EB0RACE%06d", n),
+					Kind:        KindText, Text: "racing the shutdown", Media: Media{Status: MediaNone},
+				})
+				// Space the handovers out so the producers are still working when
+				// the consumer dies, which is the window under test.
+				time.Sleep(50 * time.Microsecond)
+			}
+		}()
+	}
+
+	// Let a slice of the traffic land, then pull the consumer out from under the
+	// producers.
+	time.Sleep(5 * time.Millisecond)
+	shutdown()
+	<-done
+	close(stopProducers)
+	running.Wait()
+
+	// The consumer is gone for good now: one more handover must be counted, never
+	// buffered where nothing will ever read it.
+	q.Enqueue(MessageDoc{
+		OrganizationID: "org_default", InstanceID: instanceID,
+		WaMessageID: "3EB0RACE999999", Kind: KindText, Text: "after termination", Media: Media{Status: MediaNone},
+	})
+	attempted.Add(1)
+
+	count, err := db.Collection(collMessages).CountDocuments(ctx, map[string]any{"instanceId": instanceID})
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if persisted, dropped, want := int64(count), q.Dropped(), attempted.Load(); persisted+dropped != want {
+		t.Errorf("persisted(%d) + dropped(%d) = %d, want %d: %d messages were stranded",
+			persisted, dropped, persisted+dropped, want, want-persisted-dropped)
+	}
+	if count == 0 || q.Dropped() == 0 {
+		t.Errorf("persisted=%d dropped=%d, want both non-zero: the race was not exercised", count, q.Dropped())
 	}
 }
 

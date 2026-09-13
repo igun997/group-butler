@@ -77,14 +77,22 @@ const messageSchemaVersion = 1
 // a malformed tree from looping.
 const messageWrapperDepth = 8
 
-// Raw-tree caps mirror the documented worker defaults (§6.4). They are package
-// state rather than parseInbound arguments so the parser keeps a two-argument
-// signature; the process applies Config.RawJSONMaxBytes/RawSearchMax once at
-// startup.
+// Raw-tree caps are the parser's effective limits (§6.4). parseInbound keeps a
+// two-argument signature — it runs in the event handler, not in configuration —
+// so the limits live here and the process binds its configuration to them once
+// with applyRawLimits.
 var (
 	rawJSONMaxBytes   = 32768
 	rawSearchMaxBytes = 8192
 )
+
+// applyRawLimits binds the process configuration to the parser's raw-tree caps.
+// Config.validate has already rejected non-positive caps, so this is a plain
+// assignment rather than a second validation of the same values.
+func applyRawLimits(cfg Config) {
+	rawJSONMaxBytes = cfg.RawJSONMaxBytes
+	rawSearchMaxBytes = cfg.RawSearchMax
+}
 
 // Media is the worker-owned attachment subdocument (§5.1, §6.3). Ingest fills
 // status, kind and declaredType; the media pipeline fills the rest.
@@ -285,9 +293,10 @@ func classifyKind(msg *waE2E.Message) (kind, mediaKind, declared Kind) {
 	case msg.GetConversation() != "" || msg.GetExtendedTextMessage() != nil:
 		return KindText, "", ""
 	case msg.GetListResponseMessage() != nil || msg.GetButtonsResponseMessage() != nil ||
-		msg.GetTemplateButtonReplyMessage() != nil:
-		// A tapped control is user input: it is recorded as text so a button
-		// press is a readable message instead of an empty row (§6.2).
+		msg.GetTemplateButtonReplyMessage() != nil || msg.GetInteractiveResponseMessage() != nil:
+		// A tapped control — list row, quick reply, or native flow — is user
+		// input: it is recorded as text so a button press is a readable message
+		// instead of an empty row (§6.2).
 		return KindText, "", ""
 	case msg.GetPtvMessage() != nil:
 		// A video note is a video document whose media kind is its own (§5.1).
@@ -367,7 +376,81 @@ func extractText(msg *waE2E.Message) string {
 	case msg.GetTemplateButtonReplyMessage().GetSelectedDisplayText() != "":
 		return msg.GetTemplateButtonReplyMessage().GetSelectedDisplayText()
 	}
+	return interactiveResponseText(msg)
+}
+
+// nativeFlowLabelKeys are the keys a native flow response carries the tapped
+// label under, and nativeFlowIDKeys the ones a client that omits the label
+// falls back to. The plural keys hold a multi-select's labels.
+var (
+	nativeFlowLabelKeys = []string{
+		"selectedDisplayText", "selected_display_text",
+		"display_text", "displayText",
+		"selectedDisplayTexts", "selected_display_texts",
+		"title", "text",
+	}
+	nativeFlowIDKeys = []string{"selectedId", "selected_id", "id"}
+)
+
+// interactiveResponseText returns the readable label of a tapped native flow
+// control (list row, quick reply, or a flow form submission). The label travels
+// in body.text and the machine payload in paramsJson holds it again; clients in
+// the wild use camelCase, snake_case, a plain id, or nothing readable at all.
+// Without this a native flow tap was recorded as an empty unknown message even
+// though §6.2 requires every variant to be stored readably.
+func interactiveResponseText(msg *waE2E.Message) string {
+	response := msg.GetInteractiveResponseMessage()
+	if response == nil {
+		return ""
+	}
+	if body := response.GetBody().GetText(); body != "" {
+		return body
+	}
+	params := response.GetNativeFlowResponseMessage().GetParamsJSON()
+	if label := nativeFlowLabel(params); label != "" {
+		return label
+	}
+	// A flow payload with no label we recognize is still the only record of what
+	// the user submitted, so the payload itself is kept rather than nothing.
+	return params
+}
+
+// nativeFlowLabel reads the label out of a paramsJson payload. It returns "" when
+// the payload is not JSON or holds no readable value at all.
+func nativeFlowLabel(params string) string {
+	if params == "" {
+		return ""
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(params), &parsed); err != nil {
+		return ""
+	}
+	for _, keys := range [][]string{nativeFlowLabelKeys, nativeFlowIDKeys} {
+		for _, key := range keys {
+			switch value := parsed[key].(type) {
+			case string:
+				if strings.TrimSpace(value) != "" {
+					return value
+				}
+			case []any:
+				if labels := stringItems(value); len(labels) > 0 {
+					return strings.Join(labels, ", ")
+				}
+			}
+		}
+	}
 	return ""
+}
+
+// stringItems returns the non-empty strings of a decoded JSON array.
+func stringItems(items []any) []string {
+	labels := make([]string, 0, len(items))
+	for _, item := range items {
+		if label, ok := item.(string); ok && strings.TrimSpace(label) != "" {
+			labels = append(labels, label)
+		}
+	}
+	return labels
 }
 
 // foldText builds `textSearch`: case-folded, punctuation turned into word
@@ -388,9 +471,9 @@ func foldText(s string) string {
 	return strings.Join(strings.Fields(b.String()), " ")
 }
 
-// allContextInfos returns the ContextInfo of every message variant. Quotes,
-// mentions and forwarding metadata live on the variant, and a variant without a
-// walk here would silently lose them (§6.1).
+// allContextInfos returns the ContextInfo of every message variant walked below.
+// Quotes, mentions and forwarding metadata live on the variant, so a variant this
+// list does not walk would silently lose them (§6.1).
 func allContextInfos(msg *waE2E.Message) []*waE2E.ContextInfo {
 	if msg == nil {
 		return nil
@@ -442,8 +525,8 @@ func allContextInfos(msg *waE2E.Message) []*waE2E.ContextInfo {
 	add(msg.GetNewsletterAdminInviteMessage().GetContextInfo())
 	add(msg.GetNewsletterFollowerInviteMessageV2().GetContextInfo())
 	add(msg.GetRichResponseMessage().GetContextInfo())
-	// The wrappers add a level: mentions inside an ephemeral or view-once
-	// message are still mentions.
+	// The wrappers add a level: a mention inside an ephemeral, view-once or
+	// poll-wrapper message is still a mention.
 	for _, wrapper := range []*waE2E.FutureProofMessage{
 		msg.GetViewOnceMessage(),
 		msg.GetViewOnceMessageV2(),
@@ -510,9 +593,10 @@ const rawBytesPrefix = "<truncated>"
 
 // rawFields serializes the message tree once (bytes as base64, enums by name)
 // and returns both the stored `raw` subdocument and the flattened search text
-// derived from it. The tree is pruned to the cap so a pathological payload
-// cannot approach the document limit, and `Bytes` always reports the full size
-// so an operator can see how much was dropped (§6.4).
+// derived from it. The tree is pruned to the cap, and the search text is
+// collected under its own cap while walking it, so a pathological payload cannot
+// approach the document limit or the parse cost. `Bytes` always reports the full
+// size so an operator can see how much was dropped (§6.4).
 func rawFields(msg *waE2E.Message) (RawMessage, string, error) {
 	if msg == nil {
 		return RawMessage{Message: map[string]any{}}, "", nil
@@ -529,25 +613,24 @@ func rawFields(msg *waE2E.Message) (RawMessage, string, error) {
 	if len(encoded) > rawJSONMaxBytes {
 		raw.Message, raw.Truncated = pruneRaw(tree, rawJSONMaxBytes)
 	}
-
 	// The search text comes from the tree as it arrived, not from the pruned
 	// copy: the point of `rawSearch` is to find a message whose stored tree had
 	// to be cut down to fit.
-	var leaves []string
-	collectStringLeaves(tree, &leaves)
-	return raw, truncateUTF8(strings.Join(leaves, "\n"), rawSearchMaxBytes), nil
+	return raw, rawSearchText(tree), nil
 }
 
-// pruneRaw keeps the entries whose serialization fits the budget. Keys are
-// visited in sorted order, so the same message always yields the same stored
-// tree and two re-parses stay diffable. When even the largest entry that fits
-// leaves no room, the tree is reduced to a marker rather than an empty object.
+// pruneRaw keeps the entries whose serialization fits the budget, in the same
+// sortRawKeys order the search text uses: when the cap forces a choice, the
+// caption is worth more than the base64 payload beside it. That order is total,
+// so the same message always yields the same stored tree and two re-parses stay
+// diffable. When even the largest entry that fits leaves no room, the tree is
+// reduced to a marker rather than an empty object.
 func pruneRaw(tree map[string]any, max int) (map[string]any, bool) {
 	keys := make([]string, 0, len(tree))
 	for key := range tree {
 		keys = append(keys, key)
 	}
-	sort.Strings(keys)
+	sortRawKeys(keys)
 
 	kept := make(map[string]any, len(tree))
 	used := 2 // the enclosing braces
@@ -572,29 +655,104 @@ func pruneRaw(tree map[string]any, max int) (map[string]any, bool) {
 	return kept, len(kept) != len(tree)
 }
 
-// collectStringLeaves appends every string leaf of the tree in sorted key
-// order, which is what puts message text ahead of the base64 media blobs when
-// the search text is capped.
-func collectStringLeaves(value any, out *[]string) {
+// sortRawKeys orders the keys of a protobuf-derived node. The comparison is
+// case-insensitive so the readable fields sort before the media payloads:
+// protojson emits `caption` alongside `JPEGThumbnail`/`fileSha256`, and byte
+// order would put the base64 blob first and spend a tight byte cap entirely on
+// noise. The raw key breaks ties, so the order is total and identical across
+// re-parses.
+func sortRawKeys(keys []string) {
+	sort.Slice(keys, func(i, j int) bool {
+		lowerI, lowerJ := strings.ToLower(keys[i]), strings.ToLower(keys[j])
+		if lowerI == lowerJ {
+			return keys[i] < keys[j]
+		}
+		return lowerI < lowerJ
+	})
+}
+
+// rawSearchText flattens the string leaves of the message tree into searchable
+// text (R4). It walks the tree as it arrived rather than the stored, possibly
+// pruned copy: the point of `rawSearch` is to find a message whose stored tree
+// had to be cut down to fit.
+func rawSearchText(tree map[string]any) string {
+	text := newBoundedText(rawSearchMaxBytes)
+	collectStringLeaves(tree, text)
+	return text.String()
+}
+
+// collectStringLeaves appends every string leaf in sortRawKeys order and stops as
+// soon as the cap is reached, so a payload far larger than the cap is never
+// walked to the end.
+func collectStringLeaves(value any, out *boundedText) {
+	if out.full {
+		return
+	}
 	switch typed := value.(type) {
 	case map[string]any:
 		keys := make([]string, 0, len(typed))
 		for key := range typed {
 			keys = append(keys, key)
 		}
-		sort.Strings(keys)
+		sortRawKeys(keys)
 		for _, key := range keys {
 			collectStringLeaves(typed[key], out)
+			if out.full {
+				return
+			}
 		}
 	case []any:
 		for _, item := range typed {
 			collectStringLeaves(item, out)
+			if out.full {
+				return
+			}
 		}
 	case string:
-		if typed != "" {
-			*out = append(*out, typed)
-		}
+		out.Add(typed)
 	}
+}
+
+// boundedText accumulates search text up to a byte cap while the tree is walked,
+// so a message carrying a 32 KiB thumbnail never materialises the flattened tree
+// only to cut it back to 8 KiB. The result is always valid UTF-8: the leaf that
+// crosses the cap is trimmed on a rune boundary.
+type boundedText struct {
+	buf  strings.Builder
+	max  int
+	full bool
+}
+
+func newBoundedText(max int) *boundedText {
+	return &boundedText{max: max}
+}
+
+// Add appends one leaf, preceded by the separator that joins leaves.
+func (b *boundedText) Add(leaf string) {
+	if b.full || leaf == "" {
+		return
+	}
+	if b.buf.Len() > 0 {
+		if b.buf.Len()+1 > b.max {
+			b.full = true
+			return
+		}
+		b.buf.WriteByte('\n')
+	}
+	room := b.max - b.buf.Len()
+	if room <= 0 {
+		b.full = true
+		return
+	}
+	if len(leaf) > room {
+		leaf = truncateUTF8(leaf, room)
+		b.full = true
+	}
+	b.buf.WriteString(leaf)
+}
+
+func (b *boundedText) String() string {
+	return b.buf.String()
 }
 
 // truncateUTF8 cuts s to at most max bytes without splitting a rune, so the

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -20,7 +21,9 @@ const ingestFlushTimeout = 10 * time.Second
 // accepted into memory and written in batches, so a slow or unreachable
 // database can never stall the event loop (§6.2).
 type ingestQueue struct {
+	mu         sync.Mutex
 	ch         chan MessageDoc
+	stopped    bool
 	dropped    atomic.Int64
 	flushEvery time.Duration
 	flushMax   int
@@ -40,26 +43,59 @@ func newIngestQueue(size int, flushEvery time.Duration, flushMax int) *ingestQue
 	}
 }
 
-// Enqueue accepts one parsed message without blocking. Overflow is counted
-// rather than buffered: unbounded growth would exhaust the worker's memory, and
-// a counted drop is a visible degradation the dashboard can show (§6.2).
+// Enqueue accepts one parsed message without blocking on the buffer. Overflow is
+// counted rather than buffered: unbounded growth would exhaust the worker's
+// memory, and a counted drop is a visible degradation the dashboard can show
+// (§6.2). A handover after the consumer terminated is counted the same way — the
+// alternative is a document nothing will ever read.
 func (q *ingestQueue) Enqueue(doc MessageDoc) {
+	q.mu.Lock()
+	if q.stopped {
+		q.mu.Unlock()
+		q.dropped.Add(1)
+		return
+	}
 	select {
 	case q.ch <- doc:
+		q.mu.Unlock()
 	default:
+		q.mu.Unlock()
 		q.dropped.Add(1)
 	}
 }
 
+// stop closes the queue to producers and returns everything still buffered.
+// Holding the lock across the flip and the send is what makes the handover
+// race-free: a producer either completed its send before this ran — so the
+// document is in the returned batch — or it observes `stopped` and counts the
+// document as dropped.
+func (q *ingestQueue) stop() []MessageDoc {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.stopped = true
+	var buffered []MessageDoc
+	for {
+		select {
+		case doc := <-q.ch:
+			buffered = append(buffered, doc)
+		default:
+			return buffered
+		}
+	}
+}
+
 // Dropped reports how many messages never reached MongoDB: those dropped by a
-// full queue plus those lost in a flush that failed.
+// full queue, those handed over after the consumer stopped, and those lost in a
+// flush that failed.
 func (q *ingestQueue) Dropped() int64 {
 	return q.dropped.Load()
 }
 
-// Run drains the queue into the store until ctx is cancelled and then flushes
-// what it still holds, so a graceful shutdown does not discard accepted
-// messages. It is meant to run in its own goroutine for the process lifetime.
+// Run drains the queue into the store until ctx is cancelled, then closes the
+// queue and flushes what it holds. From the moment ctx is done, every accepted
+// message is either written or counted as dropped — none is left in a buffer
+// with no reader. It is meant to run in its own goroutine for the process
+// lifetime.
 func (q *ingestQueue) Run(ctx context.Context, store *messageStore) {
 	var batch []MessageDoc
 	var ticks <-chan time.Time
@@ -96,21 +132,18 @@ func (q *ingestQueue) Run(ctx context.Context, store *messageStore) {
 		case <-ticks:
 			flush()
 		case <-ctx.Done():
-			for {
-				select {
-				case doc := <-q.ch:
-					batch = append(batch, doc)
-				default:
-					flush()
-					return
-				}
-			}
+			// Close the queue before the final flush: from here on a producer's
+			// handover is counted as dropped instead of landing in a buffer that
+			// nothing will drain.
+			batch = append(batch, q.stop()...)
+			flush()
+			return
 		}
 	}
 }
 
-// messageStore writes the `messages` collection. Ingestion is a bulk upsert, so
-// a redelivered event costs one no-op write instead of a duplicate row.
+// messageStore writes the `messages` collection. Ingestion is a bulk upsert, so a
+// redelivered event costs one idempotent update instead of a duplicate row.
 type messageStore struct {
 	coll *mongo.Collection
 }
