@@ -24,6 +24,12 @@ const (
 	collOrganizations  = "organizations"
 )
 
+// mongoPing is the connection handshake as a seam: connectMongo's failure path
+// is only observable from a client whose handshake was forced to fail.
+var mongoPing = func(ctx context.Context, client *mongo.Client) error {
+	return client.Ping(ctx, nil)
+}
+
 func connectMongo(ctx context.Context, uri, dbName string) (*mongo.Client, *mongo.Database, error) {
 	client, err := mongo.Connect(options.Client().ApplyURI(uri))
 	if err != nil {
@@ -31,7 +37,15 @@ func connectMongo(ctx context.Context, uri, dbName string) (*mongo.Client, *mong
 	}
 	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if err := client.Ping(pingCtx, nil); err != nil {
+	if err := mongoPing(pingCtx, client); err != nil {
+		// The handshake failed, so this client is ours alone to close: returning
+		// it as nil without disconnecting would leak its connection pool and
+		// topology monitor for the life of the process. The caller's context may
+		// already be the reason the ping failed, so the close gets its own
+		// deadline rather than inheriting a dead one.
+		closeCtx, cancelClose := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancelClose()
+		_ = client.Disconnect(closeCtx)
 		return nil, nil, fmt.Errorf("mongo ping: %w", err)
 	}
 	return client, client.Database(dbName), nil

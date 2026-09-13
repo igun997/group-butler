@@ -2,11 +2,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
+
+// integrationTimeout bounds every test that talks to a real MongoDB, so a hung
+// or unreachable replica set fails the test instead of wedging the suite.
+const integrationTimeout = 30 * time.Second
 
 func testMongoURI(t *testing.T) string {
 	t.Helper()
@@ -16,22 +22,80 @@ func testMongoURI(t *testing.T) string {
 	return env("TEST_MONGODB_URI", "mongodb://127.0.0.1:27017/?replicaSet=rs0")
 }
 
-func TestIndexForMessagesIsUniqueOnWaMessageID(t *testing.T) {
-	idx := ingestIndexes()[collMessages]
-	if len(idx) != 1 {
-		t.Fatalf("expected exactly one messages index in the worker subset, got %d", len(idx))
+func TestIndexForMessagesAndGroupsAreUnique(t *testing.T) {
+	indexes := ingestIndexes()
+	cases := []struct {
+		coll string
+		name string
+		keys []string
+	}{
+		{coll: collMessages, name: "uniq_message", keys: []string{"organizationId", "instanceId", "waMessageId"}},
+		{coll: collGroups, name: "uniq_group", keys: []string{"organizationId", "instanceId", "groupJid"}},
 	}
-	if !idx[0].Unique {
-		t.Error("messages waMessageId index must be unique (idempotent ingest)")
+	if len(indexes) != len(cases) {
+		t.Fatalf("worker ingest subset covers %d collections, want %d", len(indexes), len(cases))
 	}
-	keys := idx[0].Keys
-	if len(keys) != 3 || keys[0] != "organizationId" || keys[1] != "instanceId" || keys[2] != "waMessageId" {
-		t.Errorf("index keys = %v, want organizationId/instanceId/waMessageId", keys)
+	for _, tc := range cases {
+		t.Run(tc.coll, func(t *testing.T) {
+			specs := indexes[tc.coll]
+			if len(specs) != 1 {
+				t.Fatalf("expected exactly one %s index in the worker subset, got %d", tc.coll, len(specs))
+			}
+			if !specs[0].Unique {
+				t.Errorf("%s index must be unique: %s is the redelivery key", tc.coll, tc.name)
+			}
+			if specs[0].Name != tc.name {
+				t.Errorf("%s index name = %q, want %q", tc.coll, specs[0].Name, tc.name)
+			}
+			got := specs[0].Keys
+			if len(got) != len(tc.keys) {
+				t.Fatalf("%s index keys = %v, want %v", tc.coll, got, tc.keys)
+			}
+			for i := range tc.keys {
+				if got[i] != tc.keys[i] {
+					t.Errorf("%s index key %d = %q, want %q (key order defines the index)", tc.coll, i, got[i], tc.keys[i])
+				}
+			}
+		})
+	}
+}
+
+// TestConnectMongoDisconnectsOnPingFailure pins the failure path: a client
+// whose handshake fails must be closed before connectMongo returns, or its
+// connection pool and topology monitor outlive the call. The assertion is the
+// driver's own post-Disconnect state — the handshake is forced to fail, the
+// driver internals are not mocked.
+func TestConnectMongoDisconnectsOnPingFailure(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), integrationTimeout)
+	defer cancel()
+	uri := testMongoURI(t)
+
+	var handshakeClient *mongo.Client
+	origPing := mongoPing
+	mongoPing = func(_ context.Context, client *mongo.Client) error {
+		handshakeClient = client
+		return errors.New("handshake refused")
+	}
+	t.Cleanup(func() { mongoPing = origPing })
+
+	client, db, err := connectMongo(ctx, uri, "group_butler_test")
+	if err == nil {
+		t.Fatal("connectMongo succeeded although the handshake failed")
+	}
+	if client != nil || db != nil {
+		t.Fatalf("connectMongo = (%v, %v) on error, want (nil, nil)", client, db)
+	}
+	if handshakeClient == nil {
+		t.Fatal("no client was handed to the handshake: connectMongo never pinged")
+	}
+	if pingErr := handshakeClient.Ping(ctx, nil); pingErr == nil {
+		t.Fatal("the client of a failed connectMongo still pings: it was leaked instead of disconnected")
 	}
 }
 
 func TestEnsureIndexesIsIdempotent(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), integrationTimeout)
+	defer cancel()
 	client, db, err := connectMongo(ctx, testMongoURI(t), "group_butler_test")
 	if err != nil {
 		t.Fatalf("connectMongo: %v", err)
@@ -49,7 +113,8 @@ func TestEnsureIndexesIsIdempotent(t *testing.T) {
 // guarantee: the unique index, not application code, is what makes a
 // redelivered WhatsApp message a no-op instead of a duplicate row.
 func TestIngestIndexesRejectRedeliveredMessage(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), integrationTimeout)
+	defer cancel()
 	client, db, err := connectMongo(ctx, testMongoURI(t), "group_butler_test")
 	if err != nil {
 		t.Fatalf("connectMongo: %v", err)
