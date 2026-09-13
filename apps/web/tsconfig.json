@@ -6,7 +6,12 @@
     "allowJs": true,
     "noEmit": true,
     "plugins": [{ "name": "next" }],
-    "paths": { "@/*": ["./src/*"] }
+    "paths": { "@/*": ["./src/*"] },
+    // Both are written by `next build` into this file: `esModuleInterop` as a
+    // SWC requirement, `incremental` as its typecheck default. Declaring them
+    // here keeps the build from rewriting a tracked file on every run.
+    "esModuleInterop": true,
+    "incremental": true
   },
   "include": ["src", "scripts", "vitest.config.ts", "next-env.d.ts", ".next/types/**/*.ts"],
   "exclude": ["node_modules"]

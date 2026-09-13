@@ -28,7 +28,7 @@
     "@types/node": "^26.5.1",
     "@types/react": "^19.3.0",
     "mongodb-memory-server": "^11.2.0",
-    "typescript": "^7.0.2",
+    "typescript": "^5.9.3",
     "vitest": "^5.0.0"
   }
 }

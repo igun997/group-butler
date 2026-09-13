@@ -1,0 +1,123 @@
+/*
+ * Baseline styles for the app root. The dashboard of docs/ui-decision.md is not
+ * built, so this file holds only what the one operator-facing page needs: the
+ * §3.2 type ramp steps and 4 px grid, the shadcn semantic tokens of §3.1 in
+ * both shipped themes, and the 2 px focus ring.
+ *
+ * Dial for this page: ENERGY 1 / RHYTHM 1 / MOTION 1. It is a status baseline,
+ * reached by an operator checking a container, not a workspace. The UI decision
+ * has not fixed an accent hue yet, so the accent slot is the focus ring rather
+ * than a colour invented here; the single link is `--foreground` plus an
+ * underline, so it does not depend on colour alone (§4.6 R-A3).
+ */
+:root {
+  color-scheme: light dark;
+
+  --background: #ffffff;
+  --foreground: #18181b;
+  --muted: #f4f4f5;
+  --muted-foreground: #52525b;
+  --border: #d4d4d8;
+  --ring: #18181b;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #09090b;
+    --foreground: #fafafa;
+    --muted: #18181b;
+    --muted-foreground: #a1a1aa;
+    --border: #27272a;
+    --ring: #fafafa;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    sans-serif;
+  font-size: 16px;
+  line-height: 24px;
+}
+
+/* Page gutter 24 → 16 at `md`, and one reading column: §3.2 */
+main {
+  max-width: 68ch;
+  margin: 0 auto;
+  padding: 48px 24px;
+}
+
+h1 {
+  margin: 0 0 16px;
+  font-size: 24px;
+  line-height: 32px;
+  font-weight: 600;
+}
+
+h2 {
+  margin: 32px 0 8px;
+  font-size: 16px;
+  line-height: 22px;
+  font-weight: 600;
+}
+
+p {
+  margin: 0 0 16px;
+}
+
+dl {
+  margin: 0;
+}
+
+dt {
+  margin-top: 12px;
+  font-size: 14px;
+  line-height: 20px;
+}
+
+dd {
+  margin: 0;
+  color: var(--muted-foreground);
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  background: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+
+a {
+  color: var(--foreground);
+  text-underline-offset: 2px;
+}
+
+:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+  border-radius: 4px;
+}
+
+footer {
+  margin-top: 48px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  color: var(--muted-foreground);
+  font-size: 14px;
+  line-height: 20px;
+}
+
+@media (max-width: 640px) {
+  main {
+    padding: 32px 16px;
+  }
+}
