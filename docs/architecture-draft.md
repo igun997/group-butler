@@ -1422,20 +1422,30 @@ Fixtures live in `apps/worker/testdata/`:
   the default suite never requires Docker network access to WhatsApp.
 
 ### 14.5 Local-dev UX contract tests (`scripts/dev.test.ts`)
-The dev entry point is a deliverable, so it is tested like one. `bun test scripts/dev.test.ts`
-runs without Docker or network and fails loudly if the script erodes:
+The dev entry point is a deliverable, so it is tested like one — and **behaviourally**: each test
+builds a throwaway fixture root, puts stub `docker`/`bun`/`go`/`curl` commands on `PATH`, runs the
+launcher, and asserts on observable effects (exit codes, the stub invocation log, files the stubs
+write, surviving processes). No test greps the script, so the suite survives refactoring.
 
-| # | Test | Assertion |
+| # | Test | Behaviour asserted |
 |---|---|---|
-| D1 | `dev script is an executable bash script` | `scripts/dev.sh` exists, is mode `+x`, begins with `#!/usr/bin/env bash`, and sets `-Eeuo pipefail` |
-| D2 | `dev script fails fast without .env` | run with an empty temp `HOME`/root and no `.env` → exit 1, stderr contains `cp .env.example .env` |
-| D3 | `dev script only brings infra up in docker` | the script text contains no `--build`, no `docker build`, and its only `docker compose` invocations target `infra/dev/docker-compose.yml`; `web`/`worker` never appear as compose services |
-| D4 | `dev script forwards signals and cleans up` | declares `trap … INT TERM EXIT`, starts each child via `setsid`, and terminates with a process-group `kill -TERM -<pid>` plus a SIGKILL escalation |
-| D5 | `.env.example` is sourceable and complete` | `bash -eu -c 'set -a; . .env.example'` exits 0; every key in the shared `REQUIRED_ENV` list is present |
-| D6 | `no real secrets in env examples` | no value matches live-key shapes (`AKIA…`, `sk-…`, 40+ hex, `mongodb+srv://`) outside an explicit `PLACEHOLDER`/dev-local exception list |
-| D7 | `R2 preflight is mandatory, and storage is real R2 everywhere` | the dev compose file contains no object-storage service (no `minio`, no host `9000`); the script, `.env.example` and compose contain none of `R2_ENDPOINT` / `R2_FORCE_PATH_STYLE` / `forcePathStyle` / `UsePathStyle` / `path-style`; running the launcher with an R2 value missing or left as `REPLACE_WITH_*` exits 1 and names the variable together with where to obtain it |
+| 1 | missing `.env` | exit 1, actionable `cp .env.example .env`, nothing invoked |
+| 2 | placeholder R2 values | exit 1 before any command runs, each variable named with its dashboard location |
+| 3 | unknown flag | exit 2 with usage |
+| 4 | endpoint derivation | the probe URL is exactly `https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com/<bucket>`, with no override variable in play |
+| 5 | sourcing, not eval | a quoted value in `.env` survives intact into the resolved summary |
+| 6 | `--check` | starts infra, verifies mongo, prints `check ok`, starts no application process |
+| 7 | `--no-infra` | succeeds with no docker binary on `PATH` — docker is never invoked |
+| 8 | run mode | `compose up` precedes both children; the BFF is launched via `bun run --cwd apps/web dev`; `[dev]`/`[web]`/`[worker]` prefixes all appear; only the infra compose file is addressed |
+| 9 | child failure | launcher exits with the child's status, the sibling is stopped, and it observed the forwarded signal |
+| 10 | signal forwarding | both children signal, exit 130, `infra left running`, no `compose down` |
+| 11 | `DEV_STOP_INFRA=1` | `compose down` runs on exit and is reported |
 
-D2/D5/D6/D7 run in CI (`ci.yml`, §12.2); D1/D3/D4 are static and run in the default suite.
+Two launcher invariants these tests pinned down: shutdown liveness must come from the job table
+(`jobs -rp`, redirected to a file because a command substitution would inspect the subshell's empty
+job table), since `kill -0` also succeeds for an exited-but-unreaped child and would stall the grace
+loop; and a child that exits on its own must still be `wait`ed for, or the loggers never see EOF and
+the launcher never exits.
 
 ### 14.6 Fixture and doc-drift guards
 - `TestGroupFixtures_MatchCapturedTranscripts` (T1's golden check) runs in the default suite, so a

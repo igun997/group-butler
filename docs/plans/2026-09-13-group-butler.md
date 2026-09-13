@@ -567,141 +567,38 @@ Required deliverable (§13): brings up **infra only** in Docker, then runs web a
 - Create: `scripts/dev.test.ts`
 - Create: `scripts/dev.sh`
 
-**Step 1: Failing contract tests (D1–D6, §14.5)**
+**Step 1: Failing behaviour tests**
 
-`scripts/dev.test.ts`:
+`scripts/dev.test.ts` is behavioural, not textual: each test builds a throwaway fixture root with stub
+`docker`/`bun`/`go`/`curl` commands on `PATH`, runs the launcher, and asserts on observable effects -
+exit codes, the stub invocation log, files the stubs write, and the processes that survive. No test
+greps the script, so the suite stays valid under refactoring.
 
-```ts
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+| # | Test | Behaviour asserted |
+|---|---|---|
+| 1 | `fails fast and actionably when .env is missing` | exit 1, stderr points at `cp .env.example .env`, and **nothing** was invoked |
+| 2 | `rejects placeholder R2 values before touching docker, naming each one` | exit 1, each offending variable named with where to obtain it, still nothing invoked |
+| 3 | `rejects an unknown flag with a usage exit code` | exit 2 |
+| 4 | `probes the endpoint derived from the account id, with no override variable` | the single probe URL equals `https://<account>.r2.cloudflarestorage.com/<bucket>` |
+| 5 | `reads values through shell sourcing, so quoted values survive intact` | a quoted value in `.env` reaches the resolved summary intact (sourcing, not eval) |
+| 6 | `validates, verifies mongo, and starts no application process` | `--check` runs `compose up`, prints `check ok`, and never starts bun or go |
+| 7 | `--no-infra never invokes docker at all` | with no docker binary on `PATH` it still exits 0 |
+| 8 | `starts infra, then the BFF and the worker as host processes with prefixed logs` | `up` precedes both children; the BFF is launched as `bun run --cwd .../apps/web dev`; `[dev]`/`[web]`/`[worker]` prefixes all appear; only the infra compose file is addressed |
+| 9 | `preserves a child's failure exit code and stops the sibling` | launcher exits with the child's status, the sibling process is gone, and it observed the forwarded signal |
+| 10 | `forwards signals to both children and leaves docker running by default` | both children signal, exit 130, `infra left running`, no `compose down` |
+| 11 | `DEV_STOP_INFRA=1 tears the infra down on exit` | `compose down` runs on exit and is reported |
 
-const root = join(import.meta.dir, "..");
-const scriptPath = join(root, "scripts/dev.sh");
-const script = existsSync(scriptPath) ? readFileSync(scriptPath, "utf8") : "";
-const examplePath = join(root, ".env.example");
-
-async function run(cmd: string[], cwd: string) {
-  const proc = Bun.spawn(cmd, { cwd, stdout: "pipe", stderr: "pipe" });
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-  return { code: await proc.exited, stdout, stderr };
-}
-
-describe("D1: dev script is an executable bash script", () => {
-  test("exists, is executable, and is defensive bash", () => {
-    expect(existsSync(scriptPath)).toBe(true);
-    expect(statSync(scriptPath).mode & 0o111).toBeGreaterThan(0);
-    expect(script.startsWith("#!/usr/bin/env bash")).toBe(true);
-    expect(script).toContain("set -Eeuo pipefail");
-  });
-});
-
-describe("D2: dev script fails fast without .env", () => {
-  let dir: string;
-  beforeAll(() => {
-    dir = mkdtempSync(join(tmpdir(), "butler-dev-test-"));
-    Bun.spawnSync(["mkdir", "-p", join(dir, "scripts")]);
-    writeFileSync(join(dir, "scripts/dev.sh"), readFileSync(scriptPath, "utf8"));
-    chmodSync(join(dir, "scripts/dev.sh"), 0o755);
-  });
-  afterAll(() => rmSync(dir, { recursive: true, force: true }));
-
-  test("exits 1 and points at .env.example", async () => {
-    const res = await run(["bash", join(dir, "scripts/dev.sh")], dir);
-    expect(res.code).toBe(1);
-    expect(res.stderr).toContain("cp .env.example .env");
-  });
-});
-
-describe("D3: dev script only brings infra up in docker", () => {
-  test("no image builds and no app/worker compose services", () => {
-    expect(script).not.toContain("--build");
-    expect(script).not.toContain("docker build");
-    const composeInvocations = script.match(/docker compose[^\n]*/g) ?? [];
-    expect(composeInvocations.length).toBeGreaterThan(0);
-    for (const line of composeInvocations) expect(line).toContain("infra/dev/docker-compose.yml");
-    expect(/docker compose[^\n]*\bup\b[^\n]*\b(web|worker)\b/.test(script)).toBe(false);
-  });
-});
-
-describe("D4: dev script forwards signals and cleans up", () => {
-  test("traps, process groups, and escalation are present", () => {
-    expect(/trap\s+\w+\s+INT\s+TERM\s+EXIT/.test(script)).toBe(true);
-    expect(script).toContain("setsid");
-    expect(script).toContain('kill -TERM "-$pid"');
-    expect(script).toContain('kill -KILL "-$pid"');
-  });
-});
-
-describe("D5: .env.example is sourceable and complete", () => {
-  test("sources cleanly under bash -eu", async () => {
-    const res = await run(["bash", "-eu", "-c", "set -a; . ./.env.example; set +a; echo OK"], root);
-    expect(res.stderr).toBe("");
-    expect(res.stdout.trim()).toBe("OK");
-    expect(res.code).toBe(0);
-  });
-
-  test("every key in REQUIRED_ENV is present", async () => {
-    const { REQUIRED_ENV } = await import("../packages/shared/src/env-contract");
-    const text = readFileSync(examplePath, "utf8");
-    const keys = new Set(
-      text.split("\n").flatMap((l) => {
-        const m = /^([A-Z][A-Z0-9_]*)=/.exec(l.trim());
-        return m ? [m[1]!] : [];
-      }),
-    );
-    expect(REQUIRED_ENV.filter((k) => !keys.has(k))).toEqual([]);
-  });
-});
-
-describe("D6: no real secrets in env examples", () => {
-  test("examples contain only placeholders", () => {
-    for (const rel of [".env.example", "apps/web/.env.production.example", "apps/worker/.env.production.example"]) {
-      const text = readFileSync(join(root, rel), "utf8");
-      expect(/(AKIA[0-9A-Z]{12,}|sk-[A-Za-z0-9]{20,}|mongodb\+srv:\/\/[^\s]+|[0-9a-f]{40,})/.test(text)).toBe(false);
-    }
-  });
-});
-
-describe("D7: R2 preflight is mandatory and actionable", () => {
-  test("media storage is real R2 everywhere: no emulator, no endpoint override, no path-style", () => {
-    const compose = readFileSync(join(root, "infra/dev/docker-compose.yml"), "utf8");
-    expect(compose).not.toMatch(/minio/i);
-    expect(compose).not.toContain("9000");
-    const all = [script, readFileSync(examplePath, "utf8"), compose].join("\n");
-    for (const banned of ["R2_FORCE_PATH_STYLE", "forcePathStyle", "UsePathStyle", "path-style", "R2_ENDPOINT"]) {
-      expect(all).not.toContain(banned);
-    }
-  });
-
-  test("the launcher refuses to start when an R2 value is missing, naming it", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "butler-r2-test-"));
-    Bun.spawnSync(["mkdir", "-p", join(dir, "scripts"), join(dir, "infra/dev")]);
-    writeFileSync(join(dir, "scripts/dev.sh"), readFileSync(scriptPath, "utf8"));
-    chmodSync(join(dir, "scripts/dev.sh"), 0o755);
-    // A .env with Mongo but no R2 credentials.
-    writeFileSync(join(dir, ".env"), "MONGODB_URI=mongodb://127.0.0.1:27017/group_butler?replicaSet=rs0\n");
-    const res = await run(["bash", join(dir, "scripts/dev.sh"), "--check", "--no-infra"], dir);
-    rmSync(dir, { recursive: true, force: true });
-    expect(res.code).toBe(1);
-    expect(res.stderr).toMatch(/R2_ACCOUNT_ID|R2_ACCESS_KEY_ID|R2_SECRET_ACCESS_KEY/);
-    expect(res.stderr).toMatch(/Cloudflare|R2 dashboard|Manage API Tokens/i);
-  });
-
-  test("placeholder values are rejected like missing ones", () => {
-    expect(script).toContain("REPLACE_WITH_R2");
-  });
-});
-```
+Two launcher invariants this suite pinned down (both fixed in the implementation, and mirrored in the
+architecture draft §14.5): shutdown liveness must come from the job table (`jobs -rp`, redirected to a
+file - a command substitution would inspect the subshell's empty job table), because `kill -0` also
+succeeds for an exited-but-unreaped child and would stall the grace loop; and a child that exits on its
+own must still be `wait`ed for, or the loggers never see EOF and the launcher never exits.
 
 **Step 2: Run it — expect failure**
 
 Run: `bun test scripts/dev.test.ts`
-Expected: FAIL — `scripts/dev.sh` does not exist for D1, and D3/D4 fail because the script text is empty.
+Expected: FAIL for all 11 — the fixture cannot copy `scripts/dev.sh`, so every case fails for the same
+missing-launcher reason before any behavioural assertion is reached.
 
 **Step 3: Commit the red tests**
 
@@ -714,30 +611,38 @@ git commit -m "test: add failing contract tests for local dev launcher and env e
 
 ```bash
 #!/usr/bin/env bash
-# Local dev entry point (docs/architecture-draft.md §13).
+# Local development entry point (docs/architecture-draft.md §13).
 #
 #   bun run dev:local                    # infra up, then web + worker as host processes
-#   bun run dev:check                    # validate env + infra, start nothing
-#   DEV_STOP_INFRA=1 bun run dev:local   # also stop containers on exit
+#   bun run dev:check                    # validate env + R2 + mongo, start no app
+#   bash scripts/dev.sh --check --no-infra   # offline validation, never touches Docker
+#   DEV_STOP_INFRA=1 bun run dev:local   # also stop the infra containers on exit
 #
-# Docker is used for infra ONLY (the mongodb replica set). The web and worker
-# apps always run on the host; this script never builds or runs their images.
-# Media storage is a REAL Cloudflare R2 bucket in every environment — there is no
-# local S3 emulator — so this script preflights the R2 credentials before it
-# starts anything and fails with an actionable message when one is missing.
+# Docker runs the local infrastructure ONLY (the mongodb replica set). The BFF and
+# the Go worker always run as host processes; this script never builds or starts
+# their images. Media storage is a real Cloudflare R2 bucket in every environment,
+# so the R2 credentials are preflighted before anything starts.
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="$ROOT/infra/dev/docker-compose.yml"
-ENV_FILE="$ROOT/.env"
+ENV_TEMPLATE="$ROOT/.env.example"
+# The environment file is SOURCED (never eval'd): `set -a` exports what it assigns
+# and quoting inside it is honoured by the shell parser itself.
+ENV_FILE="${DEV_ENV_FILE:-$ROOT/.env}"
+
 MODE="run"
 START_INFRA=1
 for arg in "$@"; do
   case "$arg" in
     --check) MODE="check" ;;
     --no-infra) START_INFRA=0 ;;
-    -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
-    *) echo "[dev] unknown flag: $arg" >&2; exit 2 ;;
+    -h | --help) sed -n '2,14p' "$0"; exit 0 ;;
+    *)
+      printf '[dev] unknown flag: %s\n' "$arg" >&2
+      printf 'usage: scripts/dev.sh [--check] [--no-infra]\n' >&2
+      exit 2
+      ;;
   esac
 done
 
@@ -746,105 +651,112 @@ log() { printf '%s[dev]%s %s\n' "$c_dev" "$c_reset" "$*"; }
 die() { printf '%s[dev]%s %s\n' "$c_err" "$c_reset" "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
 
-need docker; need bun; need go; need curl
-docker compose version >/dev/null 2>&1 || die "docker compose v2 plugin is required"
-
-# --- env ---------------------------------------------------------------------
+# --- environment -------------------------------------------------------------
 [[ -f "$ENV_FILE" ]] || die "missing $ENV_FILE — run: cp .env.example .env"
+[[ -f "$ENV_TEMPLATE" ]] || die "missing $ENV_TEMPLATE — this repository ships it; restore it before running the stack"
 set -a
 # shellcheck disable=SC1090
 . "$ENV_FILE"
 set +a
 : "${MONGODB_URI:?MONGODB_URI is not set — see .env.example}"
 
-compose() { docker compose -f "$COMPOSE_FILE" "$@"; }
+R2_ENDPOINT_DERIVED=""
+r2_unset_or_placeholder() { [[ -z "${1:-}" || "${1}" == REPLACE_WITH_* ]]; }
 
-wait_for_mongo() {
-  local i ok
-  for i in $(seq 1 60); do
-    ok="$(compose exec -T mongo mongosh --quiet --eval 'try{rs.status().ok}catch(e){0}' 2>/dev/null || echo 0)"
-    [[ "$ok" == "1" ]] && return 0
-    sleep 1
-  done
-  return 1
-}
-
-# --- R2 preflight ------------------------------------------------------------
-# Media persistence needs real Cloudflare R2 credentials. There is no local
-# emulator to fall back on and no endpoint to configure, so a missing or
-# placeholder value is a hard, early, actionable failure rather than a runtime
-# surprise deep in the ingest path.
-r2_missing() { [[ -z "${1:-}" || "${1}" == REPLACE_WITH_* ]]; }
-
+# Validates the four R2 inputs media persistence needs, then derives the only
+# endpoint this project can use. There is no endpoint variable and no emulator:
+# an override would be the first step towards a second, divergent storage path.
 validate_r2() {
   local missing=()
-  local -A hints=(
-    [R2_ACCOUNT_ID]="Cloudflare dashboard → R2 → Overview → Account ID"
-    [R2_ACCESS_KEY_ID]="Cloudflare dashboard → R2 → Manage API Tokens → Access Key ID"
-    [R2_SECRET_ACCESS_KEY]="Cloudflare dashboard → R2 → Manage API Tokens → Secret Access Key"
-    [R2_BUCKET]="the name of your DEV bucket (do not point local dev at production)"
+  local hints=(
+    "R2_ACCOUNT_ID|Cloudflare dashboard → R2 → Overview → Account ID"
+    "R2_ACCESS_KEY_ID|Cloudflare dashboard → R2 → Manage API Tokens → Access Key ID"
+    "R2_SECRET_ACCESS_KEY|Cloudflare dashboard → R2 → Manage API Tokens → Secret Access Key"
+    "R2_BUCKET|the name of your DEV bucket (do not point local dev at production)"
   )
-  local name
-  for name in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do
-    if r2_missing "${!name:-}"; then missing+=("$name — ${hints[$name]}"); fi
+  local entry name hint
+  for entry in "${hints[@]}"; do
+    name="${entry%%|*}"
+    hint="${entry#*|}"
+    if r2_unset_or_placeholder "${!name:-}"; then missing+=("$name — $hint"); fi
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
     printf '%s[dev]%s media storage requires Cloudflare R2 (there is no local S3 emulator):\n' "$c_err" "$c_reset" >&2
     printf '  - %s\n' "${missing[@]}" >&2
-    die "fill these in .env (see .env.example) and re-run: bun run dev:local"
+    die "fill these in $ENV_FILE (see .env.example) and re-run: bun run dev:local"
   fi
 
-  # The only endpoint that exists is derived from the account id — there is
-  # nothing to override, which is what keeps emulators out of the picture.
-  local endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+  R2_ENDPOINT_DERIVED="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+  local endpoint="$R2_ENDPOINT_DERIVED"
 
-  # Authenticated probe when the AWS CLI is available; a reachability probe
-  # always runs. 403 is acceptable here: it proves the endpoint is live and
-  # credential-gated, which is exactly what an unauthenticated request should see.
+  # An authenticated probe runs when the AWS CLI is present; otherwise a
+  # reachability probe. 403 is a success here: it proves the endpoint is live and
+  # credential-gated, which is what an unauthenticated request should see.
   if command -v aws >/dev/null 2>&1; then
     if ! AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
-         aws --endpoint-url "$endpoint" s3api head-bucket --bucket "$R2_BUCKET" >/dev/null 2>&1; then
+      aws --endpoint-url "$endpoint" s3api head-bucket --bucket "$R2_BUCKET" >/dev/null 2>&1; then
       die "R2 rejected the credentials or bucket '$R2_BUCKET' at $endpoint — check the token's R2 permissions and the bucket name"
     fi
     log "r2 ok (authenticated): bucket=$R2_BUCKET endpoint=$endpoint"
     return 0
   fi
+
+  need curl
   local code
   code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$endpoint/$R2_BUCKET" || echo 000)"
   case "$code" in
-    200|301|403) log "r2 reachable: bucket=$R2_BUCKET endpoint=$endpoint (install the aws CLI for an authenticated check)" ;;
+    200 | 301 | 403) log "r2 ok (reachable): bucket=$R2_BUCKET endpoint=$endpoint" ;;
     000) die "cannot reach $endpoint — check your network/VPN and that R2_ACCOUNT_ID is correct" ;;
     *) die "unexpected response $code from $endpoint/$R2_BUCKET — check R2_ACCOUNT_ID and the bucket name" ;;
   esac
 }
 
-# --- infra -------------------------------------------------------------------
 validate_r2
+log "config: mongo_db=\"${MONGODB_DB:-group_butler}\" r2_bucket=\"$R2_BUCKET\" endpoint=$R2_ENDPOINT_DERIVED"
+
+# --- infrastructure ----------------------------------------------------------
+compose() { docker compose -f "$COMPOSE_FILE" "$@"; }
+
+wait_for_mongo() {
+  local i out
+  for i in $(seq 1 60); do
+    out="$(compose exec -T mongo mongosh --quiet --eval 'try{rs.status().ok}catch(e){0}' 2>/dev/null || echo 0)"
+    [[ "$out" == "1" ]] && return 0
+    sleep 1
+  done
+  return 1
+}
 
 if [[ "$START_INFRA" == "1" ]]; then
+  need docker
+  docker compose version >/dev/null 2>&1 || die "docker compose v2 plugin is required"
   log "starting infra (mongodb replica set) — apps run on the host, not in Docker"
   compose up -d
+  log "waiting for the mongodb replica set..."
+  wait_for_mongo || die "mongodb replica set never became ready — inspect: docker compose -f infra/dev/docker-compose.yml logs mongo-init"
+else
+  log "infra untouched (--no-infra)"
 fi
 
-log "waiting for mongodb replica set..."
-wait_for_mongo || die "mongodb replica set never became ready — inspect: docker compose -f infra/dev/docker-compose.yml logs mongo-init"
-
-log "infra ready — mongo=${MONGODB_DB:-group_butler} r2_bucket=${R2_BUCKET} worker=http://127.0.0.1:${PORT:-4000}"
-
 if [[ "$MODE" == "check" ]]; then
-  log "check ok: env present and complete (incl. R2), mongo replica set healthy (apps not started)"
+  log "check ok: env present and complete (incl. R2), no application process started"
   exit 0
 fi
 
-# --- children ----------------------------------------------------------------
-# Each child gets its own process group via setsid, so one signal reaches BOTH
-# `go run` and the compiled binary it spawns. Output is piped through a FIFO so
-# prefixing happens here (covering `go run` compile errors) without putting
-# either app in a pipeline whose exit status we would lose.
+# --- application processes ---------------------------------------------------
+need bun
+need go
+
+# Each child gets its own process group (setsid) so one signal reaches `go run`
+# AND the compiled binary it spawns. Output goes through a FIFO so the prefixing
+# happens here — which also covers `go run` compile errors — without putting a
+# child inside a pipeline whose exit status we would lose.
 RUNDIR="$(mktemp -d "${TMPDIR:-/tmp}/butler-dev.XXXXXX")"
-declare -a CHILD_PIDS=() LOGGER_PIDS=()
+CHILD_PIDS=()
+LOGGER_PIDS=()
 HAVE_SETSID=0
 command -v setsid >/dev/null 2>&1 && HAVE_SETSID=1
+CLEANED=0
 
 signal_children() {
   local sig="$1" pid
@@ -855,51 +767,73 @@ signal_children() {
   done
 }
 
+# Liveness is read from the job table rather than `kill -0`: a child that has
+# exited but not yet been reaped is still signalable (a zombie), so `kill -0`
+# would report a finished process as running and stall the shutdown loop.
+# `jobs -rp` lists only *running* jobs. The redirect is intentional: running
+# `jobs` inside a command substitution would inspect the subshell's empty job
+# table instead of ours.
+children_alive() {
+  jobs -rp >"$RUNDIR/running" 2>/dev/null || true
+  local line pid
+  while read -r line; do
+    for pid in "${CHILD_PIDS[@]:-}"; do
+      [[ -n "$pid" && "$line" == "$pid" ]] && return 0
+    done
+  done <"$RUNDIR/running"
+  return 1
+}
+
 cleanup() {
   local status=$?
+  [[ "$CLEANED" == "1" ]] && return
+  CLEANED=1
   trap - INT TERM EXIT
-  log "shutting down (status $status)"
+  log "shutting down"
+
   signal_children TERM
-  local i alive pid
-  for i in $(seq 1 50); do
-    alive=0
-    for pid in "${CHILD_PIDS[@]:-}"; do
-      [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && alive=1
-    done
-    [[ "$alive" == "0" ]] && break
-    sleep 0.1
+  local i
+  for i in $(seq 1 100); do
+    children_alive || break
+    sleep 0.05
   done
   signal_children KILL
+  for pid in "${CHILD_PIDS[@]:-}"; do [[ -n "$pid" ]] && wait "$pid" 2>/dev/null || true; done
   for pid in "${LOGGER_PIDS[@]:-}"; do [[ -n "$pid" ]] && kill -TERM "$pid" 2>/dev/null || true; done
   wait 2>/dev/null || true
   rm -rf "$RUNDIR"
+
+  # Docker is only stopped when explicitly opted in: re-initialising the replica
+  # set on every Ctrl-C would waste the operator's time.
   if [[ "${DEV_STOP_INFRA:-0}" == "1" ]]; then
     log "stopping infra (DEV_STOP_INFRA=1)"
     compose down || true
-  else
+  elif [[ "$START_INFRA" == "1" ]]; then
     log "infra left running — stop it with: bun run dev:down"
   fi
   exit "$status"
 }
-trap cleanup INT TERM EXIT
+trap cleanup EXIT
+trap 'exit $((128 + 2))' INT
+trap 'exit $((128 + 15))' TERM
 
 start_child() {
   local name="$1"; shift
   local fifo="$RUNDIR/$name.fifo"
   mkfifo "$fifo"
-  sed -u "s/^/[$name] /" < "$fifo" &
+  sed -u "s/^/[$name] /" <"$fifo" &
   LOGGER_PIDS+=("$!")
   if [[ "$HAVE_SETSID" == "1" ]]; then
-    setsid "$@" > "$fifo" 2>&1 &
+    setsid "$@" >"$fifo" 2>&1 &
   else
-    "$@" > "$fifo" 2>&1 &
+    "$@" >"$fifo" 2>&1 &
   fi
   CHILD_PIDS+=("$!")
   log "started [$name] pid=$!"
 }
 
 start_child web bun run --cwd "$ROOT/apps/web" dev
-start_child worker bash -lc "cd '$ROOT/apps/worker' && exec go run ./..."
+start_child worker bash -c "cd '$ROOT/apps/worker' && exec go run ./..."
 
 log "web=http://127.0.0.1:3000  worker=http://127.0.0.1:${PORT:-4000}  (Ctrl-C stops both)"
 set +e
@@ -912,18 +846,16 @@ exit "$child_status"
 
 **Step 5: Run the tests to verify they pass**
 
-Run: `chmod +x scripts/dev.sh && bun test scripts/dev.test.ts`
-Expected: PASS — D1–D7 green (D7 is the R2 preflight: presence/shape checks, an actionable message
-naming the missing variable and where to get it, and the assertion that no MinIO/path-style remnant
-exists anywhere).
+Run: `chmod +x scripts/dev.sh && bash -n scripts/dev.sh && bun test scripts/dev.test.ts`
+Expected: `bash -n` clean; 11 pass / 0 fail (40 assertions) in well under a second.
 
 **Step 6: Acceptance — `--check`**
 
 Run: `cp .env.example .env` and fill the four required R2 values from your Cloudflare dashboard
 (`R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`; `R2_PUBLIC_URL` stays
 optional), then `bun run dev:check`
-Expected: `[dev] r2 ok …` (authenticated when the `aws` CLI is present, otherwise a reachability line),
-ending in `check ok: env present and complete (incl. R2), mongo replica set healthy (apps not started)`, exit 0.
+Expected: `[dev] r2 ok (authenticated)` when the `aws` CLI is present, otherwise `[dev] r2 ok (reachable)`;
+ending in `check ok: env present and complete (incl. R2), no application process started`, exit 0.
 
 Run: `bun run dev:check` with a placeholder left in place (`R2_SECRET_ACCESS_KEY=REPLACE_WITH_R2_SECRET_ACCESS_KEY`)
 Expected: exit 1 and a stderr block listing `R2_SECRET_ACCESS_KEY — Cloudflare dashboard → R2 → Manage API Tokens → Secret Access Key`, followed by `fill these in .env (see .env.example) and re-run: bun run dev:local`.
@@ -934,7 +866,7 @@ Expected: `exit=1` and stderr containing `run: cp .env.example .env`.
 **Step 7: Acceptance — prefixed logs and clean shutdown**
 
 Run: `bash -c 'DEV_STOP_INFRA=1 timeout -s INT 20 bun run dev:local; echo "exit=$?"'`
-Expected: `[dev] r2 ok …`, `[dev] starting infra …`, `[dev] infra ready …`, `started [web]`, `started [worker]` (their children fail only because the apps do not exist yet — Task 17), then `[dev] shutting down …` and `[dev] stopping infra (DEV_STOP_INFRA=1)`. Afterwards `pgrep -f 'go run ./...'` prints nothing and `docker compose -f infra/dev/docker-compose.yml ps` shows no containers. This acceptance is re-run for real at Task 25.
+Expected: `[dev] r2 ok …`, `[dev] config: …`, `[dev] starting infra (mongodb replica set) …`, `[dev] waiting for the mongodb replica set...`, `[dev] started [web] pid=…`, `[dev] started [worker] pid=…`, then the prefixed child output (the children fail at this point because the apps do not exist yet — Task 17), then `[dev] shutting down …` and `[dev] stopping infra (DEV_STOP_INFRA=1)`. Afterwards `pgrep -f 'go run ./...'` prints nothing and `docker compose -f infra/dev/docker-compose.yml ps` shows no containers. This acceptance is re-run for real at Task 25.
 
 **Step 8: Commit**
 
