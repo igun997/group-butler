@@ -217,3 +217,93 @@ func TestObservedFieldsDeltaOmitsSyncStamp(t *testing.T) {
 		}
 	}
 }
+
+// bffUpdatedAt is a document-root timestamp written the way the BFF writes it:
+// an owner action on the row (assign, whitelist, note). The worker's sync loop
+// runs every 30 minutes, so if it also wrote the root timestamp the dashboard
+// would read "changed moments ago" for every group on every sync.
+func stampRootUpdatedAt(t *testing.T, store *groupStore, ctx context.Context, groupJID string, at time.Time) {
+	t.Helper()
+	if _, err := store.collection().UpdateOne(ctx,
+		map[string]any{"groupJid": groupJID},
+		map[string]any{"$set": map[string]any{"updatedAt": at}},
+	); err != nil {
+		t.Fatalf("seed bff root timestamp: %v", err)
+	}
+}
+
+func TestUpsertObserved_LeavesRootUpdatedAtToTheBFF(t *testing.T) {
+	store, ctx := newTestGroupStore(t)
+	info := groupInfo("120363043123456789", "Ops Team", 12)
+	if err := store.UpsertFromSync(ctx, "org_default", "inst_1", info, SyncOnConnect); err != nil {
+		t.Fatalf("UpsertFromSync: %v", err)
+	}
+	bffAt := time.Unix(1757800000, 0)
+	stampRootUpdatedAt(t, store, ctx, info.JID.String(), bffAt)
+
+	info.ParticipantCount = 14
+	if err := store.UpsertFromSync(ctx, "org_default", "inst_1", info, SyncOnTimer); err != nil {
+		t.Fatalf("second UpsertFromSync: %v", err)
+	}
+	doc := store.FindOne(ctx, "org_default", "inst_1", info.JID.String())
+	if doc == nil {
+		t.Fatal("group missing after upsert")
+	}
+	if !doc.UpdatedAt.Equal(bffAt) {
+		t.Errorf("root updatedAt = %v, want the BFF's %v: the worker owns observed.* only", doc.UpdatedAt, bffAt)
+	}
+	if doc.Observed.ParticipantCount != 14 {
+		t.Errorf("observed.participantCount = %d, want 14: the observation itself must still land", doc.Observed.ParticipantCount)
+	}
+}
+
+func TestMarkLeft_LeavesRootUpdatedAtToTheBFF(t *testing.T) {
+	store, ctx := newTestGroupStore(t)
+	info := groupInfo("120363043123456789", "Ops Team", 12)
+	if err := store.UpsertFromSync(ctx, "org_default", "inst_1", info, SyncOnConnect); err != nil {
+		t.Fatalf("UpsertFromSync: %v", err)
+	}
+	bffAt := time.Unix(1757800000, 0)
+	stampRootUpdatedAt(t, store, ctx, info.JID.String(), bffAt)
+
+	if err := store.MarkLeft(ctx, "org_default", "inst_1", info.JID.String(), GroupLeft); err != nil {
+		t.Fatalf("MarkLeft: %v", err)
+	}
+	doc := store.FindOne(ctx, "org_default", "inst_1", info.JID.String())
+	if doc == nil {
+		t.Fatal("group missing after MarkLeft")
+	}
+	if !doc.UpdatedAt.Equal(bffAt) {
+		t.Errorf("root updatedAt = %v, want the BFF's %v: leaving is an observation, not a config change", doc.UpdatedAt, bffAt)
+	}
+	if doc.Observed.State != GroupLeft || doc.Observed.LeftDetectedAt.IsZero() {
+		t.Errorf("state/leftDetectedAt = %q/%v, want the left transition recorded", doc.Observed.State, doc.Observed.LeftDetectedAt)
+	}
+}
+
+// A row the worker creates carries root timestamps from the insert branch; after
+// that the root belongs to the BFF, which is what keeps "created" and "changed"
+// meaningful on the dashboard.
+func TestUpsertObserved_StampsRootTimestampsOnlyOnInsert(t *testing.T) {
+	store, ctx := newTestGroupStore(t)
+	info := groupInfo("120363043123456789", "Ops Team", 12)
+	if err := store.UpsertFromSync(ctx, "org_default", "inst_1", info, SyncOnConnect); err != nil {
+		t.Fatalf("UpsertFromSync: %v", err)
+	}
+	created := store.FindOne(ctx, "org_default", "inst_1", info.JID.String())
+	if created.CreatedAt.IsZero() || created.UpdatedAt.IsZero() {
+		t.Fatalf("createdAt/updatedAt = %v/%v, want the insert branch to stamp them", created.CreatedAt, created.UpdatedAt)
+	}
+	if !created.CreatedAt.Equal(created.UpdatedAt) {
+		t.Errorf("createdAt/updatedAt = %v/%v, want the same insert instant", created.CreatedAt, created.UpdatedAt)
+	}
+
+	if err := store.UpsertFromSync(ctx, "org_default", "inst_1", info, SyncOnTimer); err != nil {
+		t.Fatalf("second UpsertFromSync: %v", err)
+	}
+	updated := store.FindOne(ctx, "org_default", "inst_1", info.JID.String())
+	if !updated.CreatedAt.Equal(created.CreatedAt) || !updated.UpdatedAt.Equal(created.UpdatedAt) {
+		t.Errorf("root timestamps moved on an observation update: %v/%v, want %v/%v",
+			updated.CreatedAt, updated.UpdatedAt, created.CreatedAt, created.UpdatedAt)
+	}
+}

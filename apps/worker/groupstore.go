@@ -163,19 +163,23 @@ func (s *groupStore) UpsertFromSync(ctx context.Context, orgID, instanceID strin
 }
 
 // UpsertObserved writes one observation. The filter is the unique index key and
-// the insert branch seeds the org/instance/JID triple plus the BFF's default
-// config; the update branch never touches `config.*`, which is what makes the
-// worker's writes and the BFF's writes commute (§6.6, TDD slice T8).
+// the insert branch seeds the org/instance/JID triple, the root timestamps and
+// the BFF's default config; the update branch touches `observed.*` only. That is
+// what makes the worker's writes and the BFF's writes commute: `config.*` and the
+// document root belong to the BFF, and a worker observation — including the
+// every-30-minutes sync — must never rewrite what the dashboard reads as "last
+// changed" (§6.6, TDD slice T8).
 func (s *groupStore) UpsertObserved(ctx context.Context, orgID, instanceID, groupJID string, observed Observed, fromSync bool) error {
 	at := now().UTC()
 	update := bson.D{
-		{Key: "$set", Value: append(observedFields(observed, fromSync), bson.E{Key: "updatedAt", Value: at})},
+		{Key: "$set", Value: observedFields(observed, fromSync)},
 		{Key: "$setOnInsert", Value: bson.D{
 			{Key: "organizationId", Value: orgID},
 			{Key: "instanceId", Value: instanceID},
 			{Key: "groupJid", Value: groupJID},
 			{Key: "config", Value: groupConfig{Active: true, Tags: []string{}}},
 			{Key: "createdAt", Value: at},
+			{Key: "updatedAt", Value: at},
 		}},
 	}
 	if _, err := s.coll.UpdateOne(ctx, groupIdentity(orgID, instanceID, groupJID), update, options.UpdateOne().SetUpsert(true)); err != nil {
@@ -187,14 +191,14 @@ func (s *groupStore) UpsertObserved(ctx context.Context, orgID, instanceID, grou
 // MarkLeft records that this instance no longer sees a group: absence from a
 // snapshot (§6.6.5 rule 2) or a repair that answered not-found. The retained
 // subject is deliberately left alone — the name a group had is still useful
-// history, and losing it would make the dashboard forget the group entirely.
+// history, and losing it would make the dashboard forget the group entirely —
+// and so is the document root, which belongs to the BFF.
 func (s *groupStore) MarkLeft(ctx context.Context, orgID, instanceID, groupJID string, state GroupState) error {
 	at := now().UTC()
 	_, err := s.coll.UpdateOne(ctx, groupIdentity(orgID, instanceID, groupJID), bson.D{
 		{Key: "$set", Value: bson.D{
 			{Key: "observed.state", Value: state},
 			{Key: "observed.leftDetectedAt", Value: at},
-			{Key: "updatedAt", Value: at},
 		}},
 	})
 	if err != nil {
