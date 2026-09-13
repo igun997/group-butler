@@ -1,0 +1,16 @@
+node_modules/
+.next/
+dist/
+coverage/
+*.tsbuildinfo
+
+# env files: examples are committed, real values never are
+.env
+.env.*
+!.env.example
+!apps/web/.env.production.example
+!apps/worker/.env.production.example
+
+# whatsmeow auth state (linked-device keys) and local worker build output
+apps/worker/.localdata/
+apps/worker/whatsapp-worker
