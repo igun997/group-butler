@@ -2,13 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // handleEvent is the single type-switch dispatcher (§6.1): every whatsmeow
@@ -417,6 +420,13 @@ func (j receiptJob) persist(ctx context.Context, m *manager) error {
 
 // ---- media runner --------------------------------------------------------
 
+// mediaStore is the janitor's Mongo surface (§6.3.5): the pending/failed scan
+// and the retry write.
+type mediaStore interface {
+	pendingMedia(ctx context.Context, orgID string, maxAttempts int) ([]mediaCandidate, error)
+	saveMedia(ctx context.Context, doc MessageDoc, media Media) error
+}
+
 // mediaJob is one attachment to fetch, store and record.
 type mediaJob struct {
 	doc    MessageDoc
@@ -431,13 +441,13 @@ type mediaJob struct {
 type mediaRunner struct {
 	limits   *mediaLimits
 	uploader mediaUploader
-	store    *messageStore
+	store    mediaStore
 	orgID    string
 	workers  int
 	jobs     chan mediaJob
 }
 
-func newMediaRunner(cfg Config, uploader mediaUploader, store *messageStore, orgID string) *mediaRunner {
+func newMediaRunner(cfg Config, uploader mediaUploader, store mediaStore, orgID string) *mediaRunner {
 	if uploader == nil || store == nil {
 		return nil
 	}
@@ -502,27 +512,114 @@ func (r *mediaRunner) attempt(ctx context.Context, job mediaJob) {
 	// result it already paid for.
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ingestFlushTimeout)
 	defer cancel()
-	if err := r.persist(writeCtx, job.doc, media); err != nil {
+	if err := r.store.saveMedia(writeCtx, job.doc, media); err != nil {
 		logf("media %s: persist result: %v", job.doc.WaMessageID, err)
 	}
 }
 
-// persist updates only the `media` subdocument of the message the pipeline ran
-// for. The identity triple is the unique index, so this can never touch another
-// instance's row.
-func (r *mediaRunner) persist(ctx context.Context, doc MessageDoc, media Media) error {
-	filter := bson.D{
-		{Key: "organizationId", Value: doc.OrganizationID},
-		{Key: "instanceId", Value: doc.InstanceID},
-		{Key: "waMessageId", Value: doc.WaMessageID},
+// ---- media janitor -------------------------------------------------------
+
+// runMediaJanitor retries attachments the live path could not finish, on the
+// MEDIA_JANITOR_INTERVAL cadence (§6.3.5). With media storage unconfigured there
+// is no runner and nothing to retry, so the loop exits instead of ticking.
+func (m *manager) runMediaJanitor(ctx context.Context) {
+	if m.media == nil {
+		logf("media janitor disabled: media storage is not configured")
+		return
 	}
-	if _, err := r.store.coll.UpdateOne(ctx, filter, bson.D{{Key: "$set", Value: mediaFields(media)}}); err != nil {
-		return err
+	ticks, stop := m.newTicker(m.cfg.MediaJanitorEvery)
+	defer stop()
+	logf("media janitor started (every %s)", m.cfg.MediaJanitorEvery)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticks:
+			m.janitorSweep(ctx)
+		}
 	}
-	return nil
 }
 
-// mediaFields is the §5.1 spelling of the media subdocument.
+// janitorSweep queues one retry per candidate whose instance has a live client.
+// An attachment whose owner is disconnected is left pending: it is recoverable
+// by definition, and marking it exhausted would lie about what happened.
+func (m *manager) janitorSweep(ctx context.Context) {
+	if m.media == nil {
+		return
+	}
+	candidates, err := m.media.store.pendingMedia(ctx, m.orgID, m.cfg.MediaMaxAttempts)
+	if err != nil {
+		logf("media janitor: %v", err)
+		return
+	}
+	queued := 0
+	for _, candidate := range candidates {
+		client := m.mediaClient(candidate.InstanceID)
+		if client == nil {
+			continue
+		}
+		desc, ok := descriptorFromStored(candidate)
+		if !ok {
+			continue
+		}
+		m.media.enqueue(mediaJob{
+			doc: MessageDoc{
+				OrganizationID: candidate.OrganizationID,
+				InstanceID:     candidate.InstanceID,
+				WaMessageID:    candidate.WaMessageID,
+			},
+			desc:   desc,
+			client: client,
+		})
+		queued++
+	}
+	if len(candidates) > 0 {
+		logf("media janitor: queued %d of %d pending attachment(s) for retry", queued, len(candidates))
+	}
+}
+
+// descriptorFromStored rebuilds the downloadable descriptor for a stored message
+// by decoding its raw protobuf tree, so a retry downloads exactly the node the
+// live path would have used. A tree that no longer parses is not retryable.
+func descriptorFromStored(candidate mediaCandidate) (MediaDescriptor, bool) {
+	if len(candidate.Raw) == 0 {
+		return MediaDescriptor{}, false
+	}
+	encoded, err := json.Marshal(candidate.Raw)
+	if err != nil {
+		return MediaDescriptor{}, false
+	}
+	var msg waE2E.Message
+	if err := protojson.Unmarshal(encoded, &msg); err != nil {
+		return MediaDescriptor{}, false
+	}
+	desc, ok := describeMedia(&msg)
+	if !ok {
+		return MediaDescriptor{}, false
+	}
+	desc.MessageID = candidate.WaMessageID
+	desc.GroupJID = candidate.GroupJID
+	return desc, true
+}
+
+// mediaClient returns the live client able to download for an instance, or nil
+// when the instance is offline.
+func (m *manager) mediaClient(instanceID string) whatsmeowMediaClient {
+	s := m.get(instanceID)
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.status != stateConnected || s.client == nil {
+		return nil
+	}
+	return s.client
+}
+
+// mediaFields is the §5.1 spelling of the media subdocument. `attempts` is
+// absent on purpose: it is incremented by saveMedia, not overwritten per
+// attempt.
 func mediaFields(m Media) bson.D {
 	return bson.D{
 		{Key: "media.status", Value: m.Status},
@@ -539,6 +636,5 @@ func mediaFields(m Media) bson.D {
 		{Key: "media.publicUrl", Value: m.PublicURL},
 		{Key: "media.reason", Value: m.Reason},
 		{Key: "media.error", Value: m.Error},
-		{Key: "media.attempts", Value: m.Attempts},
 	}
 }

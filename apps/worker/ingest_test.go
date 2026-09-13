@@ -372,3 +372,85 @@ func TestSaveMessageEnvelopeRoundTrip(t *testing.T) {
 		t.Errorf("redelivery clobbered the media pipeline's subdocument: %+v", again.Media)
 	}
 }
+
+// TestPendingMediaScanAndAttemptCounting pins the janitor's scan contract
+// (§6.3.5): only retryable attachments are returned, a message that never got a
+// first attempt still qualifies, and each saved attempt advances the budget.
+func TestPendingMediaScanAndAttemptCounting(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), integrationTimeout)
+	defer cancel()
+	client, db, err := connectMongo(ctx, testMongoURI(t), "group_butler_test")
+	if err != nil {
+		t.Fatalf("connectMongo: %v", err)
+	}
+	defer func() { _ = client.Disconnect(ctx) }()
+	if err := ensureIngestIndexes(ctx, db); err != nil {
+		t.Fatalf("ensureIngestIndexes: %v", err)
+	}
+	store := newMessageStore(db)
+	coll := db.Collection(collMessages)
+	const org = "org_media_scan"
+	if _, err := coll.DeleteMany(ctx, map[string]any{"organizationId": org}); err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+
+	seed := func(id string, media Media, truncated bool, attempts int) {
+		t.Helper()
+		doc := MessageDoc{
+			OrganizationID: org, InstanceID: "inst_1", GroupJID: "120363043123456789@g.us",
+			WaMessageID: id, Kind: KindImage, Media: media,
+			Raw: RawMessage{Message: map[string]any{"imageMessage": map[string]any{}}, Truncated: truncated},
+		}
+		if err := store.Save(ctx, []MessageDoc{doc}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+		if attempts > 0 {
+			if _, err := coll.UpdateOne(ctx, map[string]any{"waMessageId": id}, bson.D{{Key: "$set", Value: bson.D{{Key: "media.attempts", Value: attempts}}}}); err != nil {
+				t.Fatalf("seed attempts %s: %v", id, err)
+			}
+		}
+	}
+
+	seed("3EB0PEND", Media{Status: MediaPending, Kind: KindImage}, false, 0)   // candidate despite no attempts field
+	seed("3EB0TRUNC", Media{Status: MediaPending, Kind: KindImage}, true, 0)   // pruned: not retryable
+	seed("3EB0STORED", Media{Status: MediaStored, Kind: KindImage}, false, 1)  // terminal
+	seed("3EB0EXHAUST", Media{Status: MediaFailed, Kind: KindImage}, false, 3) // budget spent
+
+	ids := func() map[string]bool {
+		candidates, err := store.pendingMedia(ctx, org, 3)
+		if err != nil {
+			t.Fatalf("pendingMedia: %v", err)
+		}
+		out := map[string]bool{}
+		for _, c := range candidates {
+			out[c.WaMessageID] = true
+		}
+		return out
+	}
+
+	got := ids()
+	if len(got) != 1 || !got["3EB0PEND"] {
+		t.Fatalf("candidates = %v, want exactly the pending, unpruned, unexhausted message", got)
+	}
+
+	// One saved attempt must not exhaust the budget, and must be cumulative.
+	for i := 1; i <= 3; i++ {
+		if err := store.saveMedia(ctx, MessageDoc{OrganizationID: org, InstanceID: "inst_1", WaMessageID: "3EB0PEND"}, Media{Status: MediaFailed, Kind: KindImage}); err != nil {
+			t.Fatalf("saveMedia #%d: %v", i, err)
+		}
+		var doc struct {
+			Media struct {
+				Attempts int `bson:"attempts"`
+			} `bson:"media"`
+		}
+		if err := coll.FindOne(ctx, map[string]any{"organizationId": org, "waMessageId": "3EB0PEND"}).Decode(&doc); err != nil {
+			t.Fatalf("decode #%d: %v", i, err)
+		}
+		if doc.Media.Attempts != i {
+			t.Fatalf("attempts after %d save(s) = %d", i, doc.Media.Attempts)
+		}
+	}
+	if got := ids(); len(got) != 0 {
+		t.Fatalf("candidates after the budget was spent = %v, want none", got)
+	}
+}

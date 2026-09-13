@@ -410,30 +410,65 @@ func (m *manager) markConnected(ctx context.Context, s *session) {
 	if err := m.pairing.Clear(ctx, m.orgID, s.id); err != nil {
 		logf("instance %s: clear pairing material: %v", s.id, err)
 	}
-	m.syncGroups(s)
+	m.syncGroupsOnConnect(s)
 }
 
-// syncGroups runs the connect-time full sync off the event loop: a slow IQ must
-// not stall message ingest. A failure writes nothing about membership, so a
-// timed-out sync is never mistaken for "we left every group" (§6.6.5).
-func (m *manager) syncGroups(s *session) {
+// syncGroupsOnConnect runs the connect-time full sync off the event loop: a
+// slow IQ must not stall message ingest. A failure writes nothing about
+// membership, so a timed-out sync is never mistaken for "we left every group"
+// (§6.6.5).
+func (m *manager) syncGroupsOnConnect(s *session) {
+	go m.runGroupSyncOnce(m.ctx, s, SyncOnConnect)
+}
+
+// runGroupSyncOnce performs one full sync for one session under its own
+// deadline. It is shared by the connect-time sync and the GROUP_SYNC_INTERVAL
+// scheduler, so both paths reconcile identically.
+func (m *manager) runGroupSyncOnce(ctx context.Context, s *session, source SyncSource) {
 	s.mu.Lock()
 	client := s.client
 	s.mu.Unlock()
 	if client == nil {
 		return
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(m.ctx, groupSyncTimeout)
-		defer cancel()
-		summary, err := runGroupSync(ctx, client, m.groups, m.orgID, s.id, SyncOnConnect, m.cfg.GroupSyncPrune)
-		if err != nil {
-			logf("instance %s: group sync on connect: %v", s.id, err)
+	ctx, cancel := context.WithTimeout(ctx, groupSyncTimeout)
+	defer cancel()
+	summary, err := runGroupSync(ctx, client, m.groups, m.orgID, s.id, source, m.cfg.GroupSyncPrune)
+	if err != nil {
+		logf("instance %s: group sync (%s): %v", s.id, source, err)
+		return
+	}
+	logf("instance %s: group sync (%s): %d group(s), %d added, %d marked left",
+		s.id, source, summary.Total, summary.Added, summary.MarkedLeft)
+}
+
+// runGroupSyncScheduler performs the periodic full reconcile (§6.6.2) until its
+// context is cancelled. It is the offline-rename safety net: without it, a
+// rename that happened while the worker was down would go unseen.
+func (m *manager) runGroupSyncScheduler(ctx context.Context) {
+	ticks, stop := m.newTicker(m.cfg.GroupSyncInterval)
+	defer stop()
+	logf("group sync scheduler started (every %s)", m.cfg.GroupSyncInterval)
+	for {
+		select {
+		case <-ctx.Done():
 			return
+		case <-ticks:
+			m.syncAllConnected(ctx)
 		}
-		logf("instance %s: group sync on connect: %d group(s), %d added, %d marked left",
-			s.id, summary.Total, summary.Added, summary.MarkedLeft)
-	}()
+	}
+}
+
+// syncAllConnected runs one timer-driven sync for every instance with a live
+// client. An offline instance has nothing to ask, so it is skipped rather than
+// recorded as a failed sync.
+func (m *manager) syncAllConnected(ctx context.Context) {
+	for _, s := range m.listActive() {
+		if m.groupClient(s.id) == nil {
+			continue
+		}
+		m.runGroupSyncOnce(ctx, s, SyncOnTimer)
+	}
 }
 
 const groupSyncTimeout = time.Minute

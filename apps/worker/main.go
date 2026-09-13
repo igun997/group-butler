@@ -80,6 +80,10 @@ func run() error {
 	}
 	// Mongo work that originates on the whatsmeow event loop lands here.
 	go mgr.persist.run(ctx, mgr)
+	// The periodic reconcile (GROUP_SYNC_INTERVAL) and the attachment retry
+	// loop (MEDIA_JANITOR_INTERVAL) own their own cadence.
+	go mgr.runGroupSyncScheduler(ctx)
+	go mgr.runMediaJanitor(ctx)
 
 	restoreInstances(ctx, mgr)
 

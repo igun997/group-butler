@@ -183,6 +183,9 @@ type fakeClient struct {
 	qr          chan whatsmeow.QRChannelItem
 	pairCode    string
 	logoutErr   error
+	groups      []*types.GroupInfo
+	groupCalls  int
+	download    []byte
 }
 
 func newFakeClient() *fakeClient {
@@ -218,10 +221,25 @@ func (c *fakeClient) PairPhone(context.Context, string, bool, whatsmeow.PairClie
 func (c *fakeClient) ParseWebMessage(types.JID, *waWeb.WebMessageInfo) (*events.Message, error) {
 	return nil, errors.New("unused in unit tests")
 }
-func (c *fakeClient) DownloadToFile(context.Context, whatsmeow.DownloadableMessage, whatsmeow.File) error {
-	return errors.New("unused in unit tests")
+func (c *fakeClient) DownloadToFile(_ context.Context, _ whatsmeow.DownloadableMessage, file whatsmeow.File) error {
+	if c.download == nil {
+		return errors.New("unused in unit tests")
+	}
+	_, err := file.Write(c.download)
+	return err
 }
-func (c *fakeClient) GetJoinedGroups(context.Context) ([]*types.GroupInfo, error) { return nil, nil }
+func (c *fakeClient) GetJoinedGroups(context.Context) ([]*types.GroupInfo, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.groupCalls++
+	return c.groups, nil
+}
+
+func (c *fakeClient) groupCallCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.groupCalls
+}
 func (c *fakeClient) GetGroupInfo(context.Context, types.JID) (*types.GroupInfo, error) {
 	return nil, errors.New("unused in unit tests")
 }

@@ -184,6 +184,86 @@ func (s *messageStore) Save(ctx context.Context, docs []MessageDoc) error {
 	return nil
 }
 
+// mediaCandidate is one attachment the janitor may retry (§6.3.5): the identity
+// triple it is stored under plus the raw protobuf tree the download node is
+// rebuilt from.
+type mediaCandidate struct {
+	OrganizationID string
+	InstanceID     string
+	WaMessageID    string
+	GroupJID       string
+	Raw            map[string]any
+}
+
+// mediaCandidateDoc is the projection `pendingMedia` reads. MessageDoc has no
+// bson tags (ingest.go maps fields explicitly), so the scan uses its own shape.
+type mediaCandidateDoc struct {
+	OrganizationID string `bson:"organizationId"`
+	InstanceID     string `bson:"instanceId"`
+	WaMessageID    string `bson:"waMessageId"`
+	GroupJID       string `bson:"groupJid"`
+	Raw            struct {
+		Message map[string]any `bson:"message"`
+	} `bson:"raw"`
+}
+
+// pendingMedia returns the attachments a retry could still improve: a pending
+// or failed status, fewer attempts than MEDIA_MAX_ATTEMPTS, and a raw tree that
+// was not pruned (a pruned tree cannot be rebuilt into a downloadable node, so
+// it is terminal for the janitor).
+func (s *messageStore) pendingMedia(ctx context.Context, orgID string, maxAttempts int) ([]mediaCandidate, error) {
+	cursor, err := s.coll.Find(ctx, bson.D{
+		{Key: "organizationId", Value: orgID},
+		{Key: "media.status", Value: bson.D{{Key: "$in", Value: []MediaStatus{MediaPending, MediaFailed}}}},
+		// `$not: {$gte: max}` matches both a lower value and a missing
+		// `media.attempts` — a message enqueued while media storage was
+		// disabled never got a first attempt at all.
+		{Key: "media.attempts", Value: bson.D{{Key: "$not", Value: bson.D{{Key: "$gte", Value: maxAttempts}}}}},
+		{Key: "raw.truncated", Value: bson.D{{Key: "$ne", Value: true}}},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("scan pending media: %w", err)
+	}
+	defer func() { _ = cursor.Close(ctx) }()
+	candidates := make([]mediaCandidate, 0)
+	for cursor.Next(ctx) {
+		var doc mediaCandidateDoc
+		if err := cursor.Decode(&doc); err != nil {
+			return nil, fmt.Errorf("decode pending media: %w", err)
+		}
+		candidates = append(candidates, mediaCandidate{
+			OrganizationID: doc.OrganizationID,
+			InstanceID:     doc.InstanceID,
+			WaMessageID:    doc.WaMessageID,
+			GroupJID:       doc.GroupJID,
+			Raw:            doc.Raw.Message,
+		})
+	}
+	if err := cursor.Err(); err != nil {
+		return nil, fmt.Errorf("scan pending media: %w", err)
+	}
+	return candidates, nil
+}
+
+// saveMedia records one media attempt on the message it belongs to. `attempts`
+// is incremented rather than set, so the janitor's retry budget is cumulative
+// across the live path and every later tick (§6.3.5).
+func (s *messageStore) saveMedia(ctx context.Context, doc MessageDoc, media Media) error {
+	filter := bson.D{
+		{Key: "organizationId", Value: doc.OrganizationID},
+		{Key: "instanceId", Value: doc.InstanceID},
+		{Key: "waMessageId", Value: doc.WaMessageID},
+	}
+	update := bson.D{
+		{Key: "$set", Value: mediaFields(media)},
+		{Key: "$inc", Value: bson.D{{Key: "media.attempts", Value: 1}}},
+	}
+	if _, err := s.coll.UpdateOne(ctx, filter, update); err != nil {
+		return fmt.Errorf("save media: %w", err)
+	}
+	return nil
+}
+
 // identityFields are written only when the document is created: they describe
 // the message as it first arrived. A redelivery of the same message must not
 // rewrite them, and `receivedAt` is the observation that stays first (§6.2).

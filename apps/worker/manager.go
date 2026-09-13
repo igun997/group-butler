@@ -274,6 +274,11 @@ type manager struct {
 	// a socket or a live account.
 	newClient func(*store.Device, waLog.Logger) whatsmeowClient
 
+	// newTicker is the periodic-loop seam: production returns a time.Ticker,
+	// tests push ticks by hand so the group-sync scheduler and media janitor
+	// are provable without sleeping.
+	newTicker func(time.Duration) (<-chan time.Time, func())
+
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -299,6 +304,10 @@ func newManager(cfg Config, groups groupStoreAPI, instances instanceRepo, pairin
 		persist:   newPersistQueue(cfg.EventQueueSize, cfg.EventWorkers),
 		newClient: func(device *store.Device, log waLog.Logger) whatsmeowClient {
 			return whatsmeowNewClient(device, log)
+		},
+		newTicker: func(d time.Duration) (<-chan time.Time, func()) {
+			ticker := time.NewTicker(d)
+			return ticker.C, ticker.Stop
 		},
 		ctx:      ctx,
 		cancel:   cancel,

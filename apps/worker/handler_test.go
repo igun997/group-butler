@@ -107,16 +107,18 @@ func (errorJob) persist(context.Context, *manager) error { return errors.New("bo
 // so event routing is provable without Mongo or a socket.
 func testManagerWithDeps(groups groupStoreAPI, stats receiptWriter, persist *persistQueue) *manager {
 	cfg := Config{
-		OrganizationID:     "org_default",
-		WorkerSecret:       "dev-secret",
-		GroupSyncPrune:     true,
-		HistorySyncMaxDays: 30,
-		MediaConcurrency:   2,
-		EventQueueSize:     8,
-		EventWorkers:       1,
-		GroupSyncInterval:  time.Hour,
-		MediaJanitorEvery:  time.Hour,
-		MediaMaxAttempts:   3,
+		OrganizationID:       "org_default",
+		WorkerSecret:         "dev-secret",
+		GroupSyncPrune:       true,
+		HistorySyncMaxDays:   30,
+		MediaConcurrency:     2,
+		MediaMaxBytes:        1 << 20,
+		MediaMaxAttempts:     3,
+		MediaDownloadTimeout: 5 * time.Second,
+		MediaJanitorEvery:    time.Hour,
+		EventQueueSize:       8,
+		EventWorkers:         1,
+		GroupSyncInterval:    time.Hour,
 	}
 	mgr := newManager(cfg, groups, newFakeInstanceRepo(), newFakePairingStore(), nil, &fakeDeviceStore{})
 	if stats != nil {
