@@ -122,3 +122,31 @@ func TestSignalShutdownDrainsWorkersAndDisconnects(t *testing.T) {
 		t.Error("graceful shutdown must not log out (it would invalidate every linked device)")
 	}
 }
+
+// TestMediaRunnerForIsNilWithoutR2 guards the typed-nil trap: a nil *r2Client
+// wrapped in mediaUploader is a non-nil interface, so a runner built from it
+// would run the media pipeline (and its janitor) with no uploader at all.
+func TestMediaRunnerForIsNilWithoutR2(t *testing.T) {
+	store := &fakeMediaStore{}
+	if runner := mediaRunnerFor(Config{}, store, "org_default"); runner != nil {
+		t.Fatal("media storage must stay disabled when R2 is not configured")
+	}
+
+	// Sanity check that the trap is real: the interface this seam avoids is not
+	// nil for a typed nil pointer.
+	var none *r2Client
+	if mediaUploader(none) == nil {
+		t.Fatal("expected a typed nil *r2Client to be a non-nil mediaUploader")
+	}
+
+	// With credentials present (no network is touched at construction) the
+	// runner exists, so the guard is not simply "always nil".
+	configured := Config{
+		R2AccountID: "abc123", R2AccessKeyID: "key", R2SecretKey: "secret", R2Bucket: "bucket",
+		MediaConcurrency: 1, MediaMaxBytes: 1 << 20, MediaDownloadTimeout: time.Second,
+		IngestQueueSize: 1, EventQueueSize: 1, EventWorkers: 1,
+	}
+	if runner := mediaRunnerFor(configured, store, "org_default"); runner == nil {
+		t.Fatal("media storage must be enabled when R2 is fully configured")
+	}
+}
