@@ -590,3 +590,294 @@ body > main [role="alert"]:empty {
     padding: 32px 16px;
   }
 }
+
+/* ---------------------------------------------------------------------------
+ * P2 — the scope spine, its cells, and the state badges
+ *
+ * The spine is the scope switcher (R11): instances with their state and sync
+ * summary, and under each one its groups with the raw `<id>@g.us` beside the
+ * current name. Above `md` it is the persistent list; below `md` it collapses to
+ * a chip that opens the switcher in a sheet (R-M2), the same collapse the shell
+ * performs for its navigation. Every value below is a token from §3.2 — no raw
+ * length, colour, or curve is written here either.
+ * ------------------------------------------------------------------------- */
+.scope-spine {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+/* R-M2: hidden while the persistent list is the switcher. */
+.scope-spine__chip {
+  display: none;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 24px;
+  padding: var(--space-1) var(--space-2);
+  font: inherit;
+  color: var(--foreground);
+  background: var(--background);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+
+.scope-spine__chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scope-spine__empty {
+  margin: 0;
+  padding: var(--space-1) var(--space-2);
+  color: var(--muted-foreground);
+  font-size: var(--type-body-size);
+  line-height: var(--type-body-line);
+}
+
+.scope-spine__instances,
+.scope-spine__groups {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+/* Nested groups sit inside their instance's own grid, indented by one step. */
+.scope-spine__groups {
+  margin-left: var(--space-3);
+}
+
+.scope-spine__instance,
+.scope-spine__group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  width: 100%;
+  min-height: var(--shell-spine);
+  padding: var(--space-1) var(--space-2);
+  font: inherit;
+  text-align: left;
+  color: var(--foreground);
+  background: transparent;
+  border: var(--border-width) solid transparent;
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+
+.scope-spine__instance:hover,
+.scope-spine__group:hover {
+  background: var(--muted);
+}
+
+/*
+ * Selection (R-A4) is three channels: the accent wash, the weight on the row's
+ * primary label, and the in-flow glyph. It is never an edge — no border-left, no
+ * stripe, no inset shadow — and focus stays the ring, so both are perceptible on
+ * the same row at once.
+ */
+.scope-spine__instance[aria-current="true"],
+.scope-spine__group[aria-current="true"] {
+  background: var(--accent);
+}
+
+.scope-spine__instance[aria-current="true"] .scope-spine__instance-label,
+.scope-spine__group[aria-current="true"] .group-name-cell__name {
+  font-weight: var(--type-body-strong-weight);
+}
+
+.scope-spine__instance-label {
+  font-size: var(--type-body-size);
+  line-height: var(--type-body-line);
+}
+
+.scope-spine__counts {
+  display: flex;
+  gap: var(--space-2);
+  color: var(--muted-foreground);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+  font-variant-numeric: tabular-nums;
+}
+
+.scope-spine__sync {
+  color: var(--muted-foreground);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+}
+
+.scope-spine__current {
+  display: inline-flex;
+  margin-left: auto;
+}
+
+.scope-spine__group-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.scope-spine__group {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* The sheet is a bottom sheet (§3.2: the sheet radius is top-only) and acrylic. */
+.scope-spine__sheet {
+  position: fixed;
+  inset: auto 0 0 0;
+  margin: 0 auto;
+  width: min(560px, 100%);
+  max-height: 80dvh;
+  padding: var(--space-3) var(--space-4) var(--space-4);
+  color: var(--foreground);
+  border: var(--border-width) solid var(--border);
+  border-bottom: 0;
+  border-top-left-radius: var(--radius-sheet-top);
+  border-top-right-radius: var(--radius-sheet-top);
+  box-shadow: var(--elevation-28);
+  overflow-y: auto;
+}
+
+.scope-spine__sheet::backdrop {
+  background: color-mix(in srgb, var(--foreground) 40%, transparent);
+}
+
+.scope-spine__sheet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+
+.scope-spine__sheet-title {
+  margin: 0;
+  font-size: var(--type-subtitle-size);
+  line-height: var(--type-subtitle-line);
+  font-weight: var(--type-subtitle-weight);
+}
+
+.scope-spine__sheet-close {
+  min-height: 24px;
+  padding: var(--space-1) var(--space-2);
+  font: inherit;
+  color: var(--foreground);
+  background: transparent;
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+
+/*
+ * R-M2: below `md` the persistent list steps aside for the chip, which opens the
+ * sheet. Exactly one switcher is exposed at a time, and the sheet's own copy is
+ * `display: none` until it is opened.
+ */
+@media (max-width: 767px) {
+  .scope-spine__chip {
+    display: flex;
+  }
+
+  .scope-spine__list {
+    display: none;
+  }
+}
+
+/*
+ * The group identity cell (§4.6 R-A6, §4.7 R-M7). The JID is monospace and wraps
+ * inside its own container rather than being clipped or abbreviated; the copy
+ * control is a real button, and its glyph is decoration.
+ */
+.jid-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  max-width: 100%;
+}
+
+.jid-cell__value {
+  font-family: var(--font-mono);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+  overflow-wrap: anywhere;
+}
+
+.jid-cell__copy {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: 24px;
+  padding: var(--space-1) var(--space-2);
+  font: inherit;
+  font-size: var(--type-caption-size);
+  color: var(--foreground);
+  background: transparent;
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+
+.jid-cell__copy-glyph {
+  display: inline-flex;
+}
+
+/* The current name, and how it was learned (R11, R-V4). */
+.group-name-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.group-name-cell__name {
+  font-size: var(--type-body-size);
+  line-height: var(--type-body-line);
+  overflow-wrap: anywhere;
+}
+
+.group-name-cell__source,
+.group-name-cell__renames {
+  color: var(--muted-foreground);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+  white-space: nowrap;
+}
+
+/*
+ * State badges (R-A3): a tone, the state's own words, and a glyph. The words
+ * carry the meaning; the tone is assistance, so the badge still reads with
+ * colour removed, and the text meets 4.5:1 against its surface either way.
+ */
+.state-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+  color: var(--muted-foreground);
+}
+
+.state-badge--ok {
+  color: var(--foreground);
+}
+
+.state-badge--warning,
+.state-badge--muted {
+  color: var(--muted-foreground);
+}
+
+.state-badge--bad {
+  color: var(--destructive);
+}
+
+.state-badge__glyph {
+  display: inline-flex;
+}
