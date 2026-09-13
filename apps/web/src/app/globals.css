@@ -1,14 +1,18 @@
 /*
- * Baseline styles for the app root. The dashboard of docs/ui-decision.md is not
- * built, so this file holds only what the one operator-facing page needs: the
- * §3.2 type ramp steps and 4 px grid, the shadcn semantic tokens of §3.1 in
- * both shipped themes, and the 2 px focus ring.
+ * Baseline styles for the app root and the sign-in page. The dashboard of
+ * docs/ui-decision.md is not built, so this file holds only what those two
+ * operator-facing pages need: the §3.2 type ramp steps and 4 px grid, the shadcn
+ * semantic tokens of §3.1 in both shipped themes, the 2 px focus ring, and the
+ * form controls `app/login` uses. Nothing here is a second UI system; the
+ * dashboard brings its own token layer (P0) and this baseline is the floor it
+ * replaces.
  *
- * Dial for this page: ENERGY 1 / RHYTHM 1 / MOTION 1. It is a status baseline,
- * reached by an operator checking a container, not a workspace. The UI decision
- * has not fixed an accent hue yet, so the accent slot is the focus ring rather
- * than a colour invented here; the single link is `--foreground` plus an
- * underline, so it does not depend on colour alone (§4.6 R-A3).
+ * Dial for these pages: ENERGY 1 / RHYTHM 1 / MOTION 1. They are a status
+ * baseline and a door, reached by an operator checking a container, not a
+ * workspace. The UI decision has not fixed an accent hue yet, so the accent slot
+ * is the focus ring rather than a colour invented here; the single link is
+ * `--foreground` plus an underline, and the form failure is text, so neither
+ * depends on colour alone (§4.6 R-A3).
  */
 :root {
   color-scheme: light dark;
@@ -99,6 +103,58 @@ code {
 a {
   color: var(--foreground);
   text-underline-offset: 2px;
+}
+
+/*
+ * The sign-in form (app/login) is the only interactive surface so far: the
+ * controls reuse the tokens above, sit on the 4 px grid, and the failure is text
+ * in a live region rather than a colour (§4.6 R-A3).
+ */
+label {
+  display: block;
+  margin: 16px 0 4px;
+  font-size: 14px;
+  line-height: 20px;
+}
+
+input {
+  display: block;
+  width: 100%;
+  padding: 8px 12px;
+  font: inherit;
+  color: var(--foreground);
+  background: var(--background);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+button {
+  margin-top: 16px;
+  padding: 8px 16px;
+  font: inherit;
+  font-weight: 600;
+  color: var(--background);
+  background: var(--foreground);
+  border: 1px solid var(--foreground);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: progress;
+  opacity: 0.7;
+}
+
+[role="alert"] {
+  margin: 0;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+/* Mounted empty so the message is announced when it arrives. */
+[role="alert"]:empty {
+  display: none;
 }
 
 :focus-visible {

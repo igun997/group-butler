@@ -38,6 +38,7 @@ export const REQUIRED_ENV = [
   "OWNER_PASSWORD_HASH",
   "AUTH_SECRET",
   "LOGIN_RATE_LIMIT",
+  "TRUSTED_PROXY_HOPS",
 
   // --- AI provider ---
   "AI_BASE_URL",

@@ -22,7 +22,27 @@ const MIN_LOGIN_RESPONSE_MS = 350;
 const RATE_WINDOW_MS = 15 * 60 * 1000;
 const DEFAULT_RATE_LIMIT = 5;
 
+/**
+ * A valid hash of a random string nobody holds. It is verified whenever no real
+ * hash is configured, so an unknown email costs the same password work as a
+ * known one and the response time never says whether the owner's address is the
+ * one that was submitted.
+ */
+const DUMMY_PASSWORD_HASH =
+  "scrypt$16384$8$1$e3ee6b033ff78c6cfc44ce65577d94c0$e210b5d43acd12d7d011c297421d250297b0dfd6e8fd8598b45eb4e602cf6d53";
+
 const loginFailures = new Map<string, { count: number; resetAt: number }>();
+
+/**
+ * Two markers name production: the platform's `NODE_ENV` (Next sets it for a
+ * production build and for `next start`) and this project's `ENVIRONMENT`. Both
+ * mean the same thing here, and a deployment that sets only one of them is still
+ * a deployment — so either one refuses the dev-only plaintext password and marks
+ * the session cookie `Secure`.
+ */
+function isProductionDeployment(): boolean {
+  return process.env.NODE_ENV === "production" || process.env.ENVIRONMENT === "production";
+}
 
 /**
  * Length is checked before `timingSafeEqual`, which throws on unequal buffers —
@@ -35,35 +55,46 @@ function constantTimeEqual(left: string, right: string): boolean {
 }
 
 /**
- * The only credential check in the project. The hash wins when it is set; the
- * plaintext `OWNER_PASSWORD` is a development convenience the deployment marker
- * `ENVIRONMENT=production` refuses to read at all. Any failure is `null`, and
- * the caller answers with one generic message either way.
+ * The only credential check in the project. Exactly one password verification is
+ * paid on every path — an unknown email and a misconfigured hash included — so
+ * the work done never says whether the address exists. The hash wins when it is
+ * set; the plaintext `OWNER_PASSWORD` is a development convenience that either
+ * production marker refuses to read at all. Any failure is `null`, and the
+ * caller answers with one generic message either way.
  */
 export function verifyOwnerCredentials(email: string, password: string): OwnerIdentity | null {
   const configuredEmail = process.env.OWNER_EMAIL?.trim() ?? "";
-  if (!configuredEmail) return null;
-  if (!constantTimeEqual(email.trim().toLowerCase(), configuredEmail.toLowerCase())) return null;
+  const emailMatches =
+    configuredEmail.length > 0 && constantTimeEqual(email.trim().toLowerCase(), configuredEmail.toLowerCase());
 
   const organizationId = process.env.ORGANIZATION_ID || "org_default";
   const storedHash = process.env.OWNER_PASSWORD_HASH?.trim() ?? "";
-  if (storedHash) return verifyPassword(password, storedHash) ? { email: configuredEmail, organizationId } : null;
+  if (storedHash.length > 0) {
+    const passwordMatches = verifyPassword(password, storedHash);
+    return emailMatches && passwordMatches ? { email: configuredEmail, organizationId } : null;
+  }
 
+  verifyPassword(password, DUMMY_PASSWORD_HASH);
   const plaintext = process.env.OWNER_PASSWORD ?? "";
-  if (process.env.ENVIRONMENT === "production" || !plaintext) return null;
-  return constantTimeEqual(password, plaintext) ? { email: configuredEmail, organizationId } : null;
+  if (isProductionDeployment() || plaintext.length === 0) return null;
+  return emailMatches && constantTimeEqual(password, plaintext) ? { email: configuredEmail, organizationId } : null;
 }
 
 /**
- * Reads the signed session cookie through the request's cookie store and returns
- * the tenant to work as. Route handlers call this themselves and never take an
- * identity — or an `organizationId` — from a header or a body.
+ * The owner this request is, or `null`. Route handlers call this themselves and
+ * never take an identity — or an `organizationId` — from a header or a body.
  */
-export async function requireOwner(): Promise<OwnerIdentity> {
+export async function currentOwner(): Promise<OwnerIdentity | null> {
   const store = await cookies();
   const session = readSession(store.get(SESSION_COOKIE)?.value);
-  if (!session) throw new UnauthorizedError();
-  return { email: session.email, organizationId: session.organizationId };
+  return session ? { email: session.email, organizationId: session.organizationId } : null;
+}
+
+/** As `currentOwner`, for handlers that cannot serve the request without one. */
+export async function requireOwner(): Promise<OwnerIdentity> {
+  const owner = await currentOwner();
+  if (!owner) throw new UnauthorizedError();
+  return owner;
 }
 
 /**
@@ -79,7 +110,7 @@ export function sessionCookie(value: string, maxAgeSeconds: number = SESSION_TTL
     "SameSite=Lax",
     `Max-Age=${Math.max(0, Math.floor(maxAgeSeconds))}`,
   ];
-  if (process.env.ENVIRONMENT === "production") attributes.push("Secure");
+  if (isProductionDeployment()) attributes.push("Secure");
   return attributes.join("; ");
 }
 

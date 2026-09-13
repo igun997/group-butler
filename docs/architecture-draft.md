@@ -966,8 +966,10 @@ content; §11.5).
 |---|---|
 | `OWNER_EMAIL` | the single owner identity |
 | `OWNER_PASSWORD_HASH` | scrypt hash from `bun run auth:hash` (`scrypt$N$r$p$saltHex$hashHex`); never a plaintext password in prod |
-| `OWNER_PASSWORD` | dev-only convenience; refused when `ENVIRONMENT=production` |
+| `OWNER_PASSWORD` | dev-only convenience; refused when `ENVIRONMENT` **or** `NODE_ENV` is `production` |
 | `AUTH_SECRET` | ≥32 chars, HMAC key for the session cookie; rotation invalidates all sessions |
+| `LOGIN_RATE_LIMIT` | login attempts per client per 15 min; default `5` |
+| `TRUSTED_PROXY_HOPS` | how many of this deployment's own proxies front the web container. `0` (default) reads no forwarded header: all clients share one rate-limit bucket and audit rows record `direct`. Set it to the real count only while the container port is unreachable except through those proxies (§11.1) |
 | `MONGODB_URI`, `MONGODB_DB` | same database as the worker |
 | `ORGANIZATION_ID` | default `org_default` |
 | `WORKER_URL` | the worker's control plane **as this container sees it**: `http://butler-worker:4000` for the container pair in §12.3, `http://worker:4000` under `infra/prod/docker-compose.ghcr.yml`, and `http://127.0.0.1:4000` only when both processes run on the host. Loopback from inside a container reaches that container, never the worker |
@@ -1082,25 +1084,44 @@ Dimensions:
 ## 11. Security boundaries
 
 ### 11.1 Authentication — one owner, env credentials
-- **Identity source:** `OWNER_EMAIL` + (`OWNER_PASSWORD_HASH` | dev-only `OWNER_PASSWORD`). No user
-  collection, no roles, no invitations, no password reset.
-- **Login:** `POST /api/auth/login` → constant-time email compare, scrypt verify, a fixed
-  minimum response time (~350 ms) to blunt timing/latency oracles, per-IP rate limit
-  (`LOGIN_RATE_LIMIT`, default 5 attempts / 15 min, in-process counter — a restart or a second
-  replica resets it), generic failure message. Success/failure is written to `auditLog` with
-  the IP.
+- **Identity source:** `OWNER_EMAIL` + `OWNER_PASSWORD_HASH` (scrypt, printed by `bun run auth:hash`
+  | dev-only `OWNER_PASSWORD`). No user collection, no roles, no invitations, no password reset.
+- **Login:** `POST /api/auth/login` → the email is compared in constant time, and one password
+  verification is paid on *every* path — an unknown email is verified against a fixed dummy hash —
+  so neither the work done nor the fixed ~350 ms response floor says whether the address exists. A
+  stored hash is validated against bounded cost parameters before scrypt runs, so a typo in
+  `OWNER_PASSWORD_HASH` is a refused login rather than a 500 or a memory bill. Failures are counted
+  per client (`LOGIN_RATE_LIMIT`, default 5 attempts / 15 min, in-process counter — a restart or a
+  second replica resets it) and every answer is the same generic message.
+- **Client address:** `X-Forwarded-For` is attacker-controlled, so it is consulted only when the
+  deployment declares how many of its own proxies sit in front: `TRUSTED_PROXY_HOPS`, default `0`.
+  At 0 no forwarded header is read at all — every client shares one bucket, so a forged chain cannot
+  buy a fresh attempt budget, and audit rows record `direct` rather than an address. At N ≥ 1 the
+  key is the N-th entry from the right, the peer the outermost trusted proxy appended; a
+  client-prepended entry can never be it. N ≥ 1 is only meaningful while this process's own port is
+  unreachable except through those proxies (§11.7).
+- **Audit:** every login attempt — success, refusal, rate limit — and every logout writes an
+  `auditLog` row (§5.1) with `actor:"owner"`, the action, the client key as `ip`, and the submitted
+  address (bounded to 254 characters). The write is part of the answer: if it cannot be recorded
+  within its deadline, the route answers 503 and issues no session (and a logout does not end one),
+  because an attempt this deployment cannot account for is not one it should answer.
 - **Session:** stateless, HMAC-SHA256-signed cookie
   `{ sub:"owner", email, organizationId:"org_default", iat, exp }`; `HttpOnly`, `Secure` in
   production (development is served over plain http), `SameSite=Lax`, `Path=/`, 7-day expiry.
   `AUTH_SECRET` is the only signing key; rotating it
-  revokes every session. Logout clears the cookie. No server-side session store.
+  revokes every session. A token whose `iat` lies in the future by more than 60 s, or whose `exp`
+  does not follow its `iat`, is rejected. Logout clears the cookie. No server-side session store.
+- **Production markers:** `ENVIRONMENT=production` **or** `NODE_ENV=production` (Next sets the
+  latter for a production build and for `next start`). Either one refuses the plaintext
+  `OWNER_PASSWORD` and marks the session cookie `Secure`.
 - **Trust rules (explicit):** never accept identity from `X-Forwarded-User`,
   `X-Auth-Request-*`, `X-Remote-User`, `X-Forwarded-Email`, or any header; never accept a
   client-supplied `organizationId`; no OAuth, no SSO, no magic links, no "trust the reverse
   proxy" mode. The only way in is the login route.
 - **Gate:** `src/middleware.ts` protects every route except `/login`, `/api/auth/login`,
   `/api/health`, and static assets. Route handlers independently call `requireOwner()` — middleware
-  is a UX gate, not the sole control.
+  is a UX gate, not the sole control. `/login` (`app/login/page.tsx`) is the real form an
+  unauthenticated browser lands on, and redirects an owner who already has a session to `/`.
 - **Tenant boundary:** `requireOwner()` returns `{ organizationId }`; every data accessor takes it
   and every query includes it. With one org this is a no-op today and a real boundary the day a
   second org exists (assumption 2). A `GET /api/*` handler that omits it is a review-blocking bug.

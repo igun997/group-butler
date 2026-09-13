@@ -3357,6 +3357,21 @@ Run: `bun run dev:local` (in one shell), then
 Expected: `{"authenticated":true,"email":"owner@local","organizationId":"org_default"}`; a second call
 with a wrong password returns 401 and the same generic message.
 
+> **Reviewed and amended after commit `3b768d7`.** Five findings were fixed, so the shipped task is
+> a superset of the code above: (1) the limiter keys on a declared trusted-proxy count
+> (`TRUSTED_PROXY_HOPS`, default `0` = read no forwarded header, all clients share one bucket)
+> instead of an arbitrary `X-Forwarded-For`; (2) `verifyPassword` validates the stored hash against
+> bounded cost parameters and catches crypto failures, so a bad `OWNER_PASSWORD_HASH` is a 401, not
+> a 500; (3) `recordAuthEvent` writes the `auditLog` row (§5.1) for every login attempt and logout
+> with the client key as `ip`, and the routes fail closed with 503 when it cannot be written within
+> its deadline; (4) `app/login/page.tsx` is a real sign-in form (the middleware's redirect target)
+> built on the existing `globals.css` baseline — no second UI system, since the project has no
+> Tailwind; (5) either `NODE_ENV=production` or `ENVIRONMENT=production` refuses the plaintext
+> password and marks the cookie `Secure`. Also: `iat` is validated against clock skew, an unknown
+> email pays a dummy-hash verification so addresses cannot be enumerated by timing, and the route
+> tests run against `MongoMemoryServer` because the audit write is part of the answer.
+> See §11.1 of docs/architecture-draft.md for the contract as it now stands.
+
 ---
 
 ## Task 18: BFF read models — instances/groups (T14)

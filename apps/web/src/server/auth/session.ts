@@ -3,6 +3,9 @@ import { SESSION_COOKIE, SESSION_TTL_SECONDS } from "./cookie";
 
 export { SESSION_COOKIE, SESSION_TTL_SECONDS };
 
+/** A signed cookie issued slightly in the future is a clock, not a forgery (§11.1). */
+const CLOCK_SKEW_SECONDS = 60;
+
 export type OwnerSession = {
   sub: "owner";
   email: string;
@@ -56,8 +59,10 @@ export function readSession(token: string | undefined | null): OwnerSession | nu
     return null;
   }
   if (typeof session !== "object" || session === null) return null;
-  const { sub, email, organizationId, exp } = session as Partial<OwnerSession>;
+  const { sub, email, organizationId, iat, exp } = session as Partial<OwnerSession>;
   if (sub !== "owner" || typeof email !== "string" || typeof organizationId !== "string") return null;
-  if (typeof exp !== "number" || exp <= Math.floor(Date.now() / 1000)) return null;
+  const now = Math.floor(Date.now() / 1000);
+  if (typeof iat !== "number" || iat > now + CLOCK_SKEW_SECONDS) return null;
+  if (typeof exp !== "number" || exp <= now || exp <= iat) return null;
   return session as OwnerSession;
 }

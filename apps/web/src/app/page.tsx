@@ -18,8 +18,8 @@ export default function HomePage() {
       <p>
         The dashboard is not built yet, so this page and the auth routes are the whole surface.
         All but the health report need the owner&apos;s session cookie: middleware sends a browser
-        without one to <code>/login</code>, and <code>/api/auth/login</code> is the only thing that
-        issues one.
+        without one to <code>/login</code>, the sign-in form, and <code>/api/auth/login</code> is
+        the only thing that issues one.
       </p>
 
       <h2>What this container answers</h2>
