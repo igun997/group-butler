@@ -15,6 +15,12 @@
 # updates, §7.4) require one. The member host is 127.0.0.1:27017 — NOT
 # mongo:27017 — because the clients are host processes and a replica set
 # advertises member hosts back to them.
+#
+# The project name is pinned so the resources are always group-butler-dev_*: without
+# it Compose derives the name from this directory ("dev") and would collide with
+# any other generic "dev" compose project on the machine.
+name: group-butler-dev
+
 services:
   mongo:
     image: mongo:7

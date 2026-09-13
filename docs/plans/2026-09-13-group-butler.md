@@ -473,16 +473,22 @@ the R2 credentials instead (Task 4).
 #
 # The Next.js BFF and the Go worker run as HOST processes (see scripts/dev.sh).
 # This file deliberately contains no app or worker services and is never used to
-# build images; production images are standalone (§12).
+# build images; production images are standalone (docs/architecture-draft.md §12).
 #
 # Object storage is NOT here on purpose: media uses a real Cloudflare R2 bucket in
-# development and production alike. There is no MinIO service, no S3 emulator, no
-# endpoint override and no path-style flag anywhere in this project.
+# development and production alike. There is no local S3 emulator, no endpoint
+# override and no path-style flag anywhere in this project.
 #
 # Mongo runs as a single-node replica set because change streams (live dashboard
 # updates, §7.4) require one. The member host is 127.0.0.1:27017 — NOT
 # mongo:27017 — because the clients are host processes and a replica set
 # advertises member hosts back to them.
+#
+# The project name is pinned so the resources are always group-butler-dev_*: without
+# it Compose derives the name from this directory ("dev") and would collide with
+# any other generic "dev" compose project on the machine.
+name: group-butler-dev
+
 services:
   mongo:
     image: mongo:7

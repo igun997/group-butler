@@ -1155,9 +1155,10 @@ Group messages are **attacker-controlled data**. The rules:
 ### 11.7 Network and deployment surface
 - Public: the web container's HTTP port only.
 - Private: worker control port, MongoDB. R2 is public-internet but credential-gated.
-- Locally, Mongo binds to `127.0.0.1` on a non-default host port so a stray public bind is
-  immediately visible. There is no local object-storage service to bind: R2 is reached over HTTPS,
-  and local development uses a **dev bucket** whose token is separate from production (§11.6).
+- Locally, Mongo binds to `127.0.0.1:27017` — the standard port, loopback-only — so a stray public
+  bind is immediately visible while host-run clients keep the familiar URI. There is no local
+  object-storage service to bind: R2 is reached over HTTPS, and local development uses a **dev
+  bucket** whose token is separate from production (§11.6).
 - Production checklist: TLS in front of the web app, `WORKER_SECRET` rotated from the repo default,
   `AUTH_SECRET` ≥32 bytes, Mongo reachable only from the two services, R2 bucket private.
 
@@ -1204,22 +1205,77 @@ image requires it.
 `infra/dev/docker-compose.yml` — **MongoDB only**; the app and worker run on the host, and media
 storage is a real Cloudflare R2 bucket (there is nothing object-storage-shaped to containerise):
 ```yaml
+# Local development infrastructure ONLY.
+#
+#   docker compose -f infra/dev/docker-compose.yml up -d
+#   docker compose -f infra/dev/docker-compose.yml down
+#
+# The Next.js BFF and the Go worker run as HOST processes (see scripts/dev.sh).
+# This file deliberately contains no app or worker services and is never used to
+# build images; production images are standalone (docs/architecture-draft.md §12).
+#
+# Object storage is NOT here on purpose: media uses a real Cloudflare R2 bucket in
+# development and production alike. There is no local S3 emulator, no endpoint
+# override and no path-style flag anywhere in this project.
+#
+# Mongo runs as a single-node replica set because change streams (live dashboard
+# updates, §7.4) require one. The member host is 127.0.0.1:27017 — NOT
+# mongo:27017 — because the clients are host processes and a replica set
+# advertises member hosts back to them.
+#
+# The project name is pinned so the resources are always group-butler-dev_*: without
+# it Compose derives the name from this directory ("dev") and would collide with
+# any other generic "dev" compose project on the machine.
+name: group-butler-dev
+
 services:
   mongo:
     image: mongo:7
-    command: ["--replSet","rs0","--bind_ip_all"]
-    ports: ["127.0.0.1:27017:27017"]
-    volumes: ["mongo-data:/data/db"]
-    healthcheck: { test: ["CMD","mongosh","--quiet","--eval","db.runCommand({ping:1})"], interval: 5s, retries: 20 }
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ping:1}).ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # One-shot, idempotent replica-set init; safe to run on every `up`.
+  #
+  # Two different hosts are involved and they must not be confused:
+  #   * this client connects by SERVICE NAME (`mongo`) because the server runs in
+  #     another container;
+  #   * the replica set ADVERTISES 127.0.0.1:27017, because the clients that
+  #     speak replica-set protocol are the host-run web and worker processes,
+  #     which reach the published port on loopback.
+  # The guard reads local.system.replset rather than calling rs.status(), so it
+  # behaves the same before and after initiation and never fails on re-run.
   mongo-init:
     image: mongo:7
-    depends_on: { mongo: { condition: service_healthy } }
+    depends_on:
+      mongo:
+        condition: service_healthy
     restart: "no"
-    # Connects by SERVICE NAME (`mongo`); the replica set ADVERTISES 127.0.0.1:27017
-    # so the host-run apps can reach the member. The guard reads
-    # local.system.replset, so a re-run is a no-op instead of an error.
-    entrypoint: ["bash","-lc","mongosh --host mongo --quiet --eval 'if (db.getSiblingDB(\"local\").system.replset.countDocuments() > 0) { print(\"replica set already initiated\") } else { rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"127.0.0.1:27017\"}]}); print(\"replica set initiated\") }'"]
-volumes: { mongo-data: {} }
+    entrypoint:
+      - bash
+      - -lc
+      - |
+        set -eu
+        mongosh --host mongo --quiet --eval '
+          const configured = db.getSiblingDB("local").system.replset.countDocuments() > 0;
+          if (configured) {
+            print("replica set already initiated");
+          } else {
+            rs.initiate({_id: "rs0", members: [{_id: 0, host: "127.0.0.1:27017"}]});
+            print("replica set initiated");
+          }
+        '
+
+volumes:
+  mongo-data: {}
 ```
 Why a single-node replica set: change streams (live UI, §7.4) require one, and the local
 environment must not diverge from production semantics. The `mongo-init` one-shot is idempotent, so
