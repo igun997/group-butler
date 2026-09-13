@@ -2,7 +2,11 @@ module github.com/nst/group-butler/apps/worker
 
 go 1.25.0
 
-require go.mongodb.org/mongo-driver/v2 v2.9.1
+require (
+	go.mau.fi/whatsmeow v0.0.0-20260516102357-8d3700152a69
+	go.mongodb.org/mongo-driver/v2 v2.9.1
+	google.golang.org/protobuf v1.36.12
+)
 
 require (
 	filippo.io/edwards25519 v1.1.0 // indirect
@@ -35,11 +39,9 @@ require (
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
 	go.mau.fi/libsignal v0.2.1 // indirect
 	go.mau.fi/util v0.9.9 // indirect
-	go.mau.fi/whatsmeow v0.0.0-20260516102357-8d3700152a69 // indirect
 	golang.org/x/crypto v0.53.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/text v0.39.0 // indirect
-	google.golang.org/protobuf v1.36.12 // indirect
 )
