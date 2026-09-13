@@ -163,6 +163,11 @@ func loadConfig() (Config, error) {
 		}
 	}
 
+	// Every gate above has passed, so this is the configuration the worker will
+	// run with: bind the parser's raw-tree caps to it once, here. A rejected
+	// configuration returns above and never becomes the parser's limits.
+	applyRawLimits(cfg)
+
 	return cfg, nil
 }
 

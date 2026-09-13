@@ -5,6 +5,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestLoadConfig_LocalDefaults(t *testing.T) {
@@ -216,4 +220,88 @@ func TestLoadConfig_RejectsBadDuration(t *testing.T) {
 	if _, err := loadConfig(); err == nil {
 		t.Fatal("loadConfig accepted a malformed GROUP_SYNC_INTERVAL")
 	}
+}
+
+// TestLoadConfigBindsRawCapsToParser is the wiring proof: loadConfig is the only
+// configuration boundary the worker has, so a successful call must leave the
+// parser applying exactly the configured raw-tree caps — not the built-in
+// defaults, which is what an unwired loadConfig leaves behind.
+func TestLoadConfigBindsRawCapsToParser(t *testing.T) {
+	restoreJSON, restoreSearch := rawJSONMaxBytes, rawSearchMaxBytes
+	t.Cleanup(func() { rawJSONMaxBytes, rawSearchMaxBytes = restoreJSON, restoreSearch })
+
+	setDevEnv(t)
+	t.Setenv("RAW_JSON_MAX_BYTES", "4096")
+	t.Setenv("RAW_SEARCH_MAX_BYTES", "64")
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.RawJSONMaxBytes != 4096 || cfg.RawSearchMax != 64 {
+		t.Fatalf("config = %d/%d, want the values from the environment", cfg.RawJSONMaxBytes, cfg.RawSearchMax)
+	}
+	if rawJSONMaxBytes != cfg.RawJSONMaxBytes || rawSearchMaxBytes != cfg.RawSearchMax {
+		t.Fatalf("parser caps = %d/%d, want the configured %d/%d",
+			rawJSONMaxBytes, rawSearchMaxBytes, cfg.RawJSONMaxBytes, cfg.RawSearchMax)
+	}
+
+	// The same caps must reach the parse itself, not just the variables.
+	msg := &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+		Caption:       proto.String("quarterly chart"),
+		Mimetype:      proto.String("image/jpeg"),
+		JPEGThumbnail: make([]byte, 4096),
+	}}
+	doc, err := parseInbound(
+		evtMessage(types.NewJID("120363043123456789", types.GroupServer), types.NewJID("628990000001", types.DefaultUserServer), "3EB0E1", msg),
+		"org_default", "inst_1",
+	)
+	if err != nil {
+		t.Fatalf("parseInbound: %v", err)
+	}
+	if !doc.Raw.Truncated || len(doc.RawSearch) > 64 {
+		t.Errorf("raw truncated=%v (%d bytes), rawSearch=%d bytes, want the configured caps applied",
+			doc.Raw.Truncated, doc.Raw.Bytes, len(doc.RawSearch))
+	}
+}
+
+// TestLoadConfigLeavesRawCapsUntouchedWhenItRejects guards the other half of the
+// boundary: a configuration the worker refuses to run with must not become the
+// parser's limits. The caps start at sentinels no environment value can produce.
+func TestLoadConfigLeavesRawCapsUntouchedWhenItRejects(t *testing.T) {
+	const sentinelJSON, sentinelSearch = 1111, 2222
+	restoreJSON, restoreSearch := rawJSONMaxBytes, rawSearchMaxBytes
+	t.Cleanup(func() { rawJSONMaxBytes, rawSearchMaxBytes = restoreJSON, restoreSearch })
+
+	assertSentinels := func(t *testing.T) {
+		t.Helper()
+		if rawJSONMaxBytes != sentinelJSON || rawSearchMaxBytes != sentinelSearch {
+			t.Errorf("parser caps = %d/%d, want the untouched sentinels %d/%d",
+				rawJSONMaxBytes, rawSearchMaxBytes, sentinelJSON, sentinelSearch)
+		}
+	}
+
+	t.Run("rejected validation", func(t *testing.T) {
+		rawJSONMaxBytes, rawSearchMaxBytes = sentinelJSON, sentinelSearch
+		setDevEnv(t)
+		t.Setenv("RAW_SEARCH_MAX_BYTES", "0") // non-positive: validate rejects it
+
+		if _, err := loadConfig(); err == nil {
+			t.Fatal("loadConfig accepted RAW_SEARCH_MAX_BYTES=0")
+		}
+		assertSentinels(t)
+	})
+
+	t.Run("rejected production gate", func(t *testing.T) {
+		rawJSONMaxBytes, rawSearchMaxBytes = sentinelJSON, sentinelSearch
+		setDevEnv(t)
+		t.Setenv("ENVIRONMENT", productionEnv)
+		t.Setenv("WORKER_SECRET", devWorkerSecret) // the gate rejects this
+		t.Setenv("RAW_JSON_MAX_BYTES", "4096")     // valid, but must stay unapplied
+
+		if _, err := loadConfig(); err == nil {
+			t.Fatal("loadConfig succeeded with the dev WORKER_SECRET in production")
+		}
+		assertSentinels(t)
+	})
 }
