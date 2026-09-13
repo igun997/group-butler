@@ -8,11 +8,9 @@ import (
 )
 
 func TestLoadConfig_LocalDefaults(t *testing.T) {
-	t.Setenv("ENVIRONMENT", "development")
-	t.Setenv("MONGODB_URI", "mongodb://127.0.0.1:27017/group_butler?replicaSet=rs0")
-	t.Setenv("WORKER_SECRET", "dev-secret")
-	t.Setenv("GROUP_SYNC_INTERVAL", "")
-	t.Setenv("MEDIA_DOWNLOAD_TIMEOUT", "")
+	// setDevEnv pins every variable loadConfig reads, so no ambient PORT,
+	// ORGANIZATION_ID, GROUP_SYNC_PRUNE, or knob can shift these defaults.
+	setDevEnv(t)
 
 	cfg, err := loadConfig()
 	if err != nil {
@@ -52,6 +50,112 @@ func TestLoadConfig_DevWhatsmeowDBMatchesEnvExample(t *testing.T) {
 	}
 }
 
+// setDevEnv pins every variable loadConfig reads to a documentedly valid
+// development value, so a test can never be perturbed by what the developer's
+// shell happens to export (PORT, ORGANIZATION_ID, GROUP_SYNC_PRUNE, any knob).
+func setDevEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("ENVIRONMENT", developmentEnv)
+	t.Setenv("MONGODB_URI", devMongoURI)
+	t.Setenv("WORKER_SECRET", devWorkerSecret)
+	for _, key := range []string{
+		"PORT",
+		"ORGANIZATION_ID",
+		"MONGODB_DB",
+		"WHATSMEOW_DB_URI",
+		"LOG_LEVEL",
+		"R2_ACCOUNT_ID",
+		"R2_ACCESS_KEY_ID",
+		"R2_SECRET_ACCESS_KEY",
+		"R2_BUCKET",
+		"R2_PUBLIC_URL",
+		"AI_BASE_URL",
+		"AI_API_KEY",
+		"AI_MODEL",
+		"INGEST_QUEUE_SIZE",
+		"INGEST_FLUSH_MS",
+		"INGEST_FLUSH_MAX",
+		"RAW_JSON_MAX_BYTES",
+		"RAW_SEARCH_MAX_BYTES",
+		"MEDIA_MAX_BYTES",
+		"MEDIA_CONCURRENCY",
+		"MEDIA_DOWNLOAD_TIMEOUT",
+		"MEDIA_MAX_ATTEMPTS",
+		"MEDIA_JANITOR_INTERVAL",
+		"MEDIA_ENRICH_ENABLED",
+		"HISTORY_SYNC_MAX_DAYS",
+		"GROUP_SYNC_INTERVAL",
+		"GROUP_STALE_AFTER",
+		"GROUP_SYNC_PRUNE",
+		"DISPATCH_INTERVAL",
+		"SEND_MAX_ATTEMPTS",
+	} {
+		t.Setenv(key, "")
+	}
+}
+
+func TestLoadConfig_ProductionWhatsmeowDB(t *testing.T) {
+	const prodSecret = "production-secret-from-the-secret-store"
+
+	t.Run("rejects an unset WHATSMEOW_DB_URI", func(t *testing.T) {
+		setDevEnv(t)
+		t.Setenv("ENVIRONMENT", productionEnv)
+		t.Setenv("WORKER_SECRET", prodSecret)
+
+		if _, err := loadConfig(); err == nil {
+			t.Fatal("loadConfig fell back to the development auth store in production")
+		}
+	})
+
+	t.Run("accepts the declared mounted auth path", func(t *testing.T) {
+		setDevEnv(t)
+		t.Setenv("ENVIRONMENT", productionEnv)
+		t.Setenv("WORKER_SECRET", prodSecret)
+		t.Setenv("WHATSMEOW_DB_URI", "file:/data/whatsmeow.db?_foreign_keys=on")
+
+		cfg, err := loadConfig()
+		if err != nil {
+			t.Fatalf("loadConfig: %v", err)
+		}
+		if cfg.WhatsmeowDB != "file:/data/whatsmeow.db?_foreign_keys=on" {
+			t.Errorf("WhatsmeowDB = %q", cfg.WhatsmeowDB)
+		}
+	})
+}
+
+func TestLoadConfig_RejectsNonPositiveLimits(t *testing.T) {
+	// Every operational count, limit, and interval is positive-only: an empty
+	// queue, a zero cap or concurrency, no attempt budget, or a zero interval
+	// either stores nothing or never makes progress (time.NewTicker panics on a
+	// non-positive interval). Booleans and PORT are deliberately absent.
+	for _, key := range []string{
+		"INGEST_QUEUE_SIZE",
+		"INGEST_FLUSH_MS",
+		"INGEST_FLUSH_MAX",
+		"RAW_JSON_MAX_BYTES",
+		"RAW_SEARCH_MAX_BYTES",
+		"MEDIA_MAX_BYTES",
+		"MEDIA_CONCURRENCY",
+		"MEDIA_DOWNLOAD_TIMEOUT",
+		"MEDIA_MAX_ATTEMPTS",
+		"MEDIA_JANITOR_INTERVAL",
+		"HISTORY_SYNC_MAX_DAYS",
+		"GROUP_SYNC_INTERVAL",
+		"GROUP_STALE_AFTER",
+		"DISPATCH_INTERVAL",
+		"SEND_MAX_ATTEMPTS",
+	} {
+		t.Run(key, func(t *testing.T) {
+			setDevEnv(t)
+			t.Setenv(key, "0")
+
+			if _, err := loadConfig(); err == nil {
+				t.Fatalf("loadConfig accepted %s=0", key)
+			}
+		})
+	}
+}
+
 // envExampleValue reads KEY's value out of the root `.env.example`, the single
 // source the dev launcher sources and therefore the definition of every local
 // default. Values there are bare, space-free shell tokens, so a space ends the
@@ -79,6 +183,7 @@ func envExampleValue(t *testing.T, key string) string {
 }
 
 func TestLoadConfig_ProductionRequiresSecrets(t *testing.T) {
+	setDevEnv(t)
 	t.Setenv("ENVIRONMENT", "production")
 	t.Setenv("MONGODB_URI", "mongodb://example/group_butler")
 	t.Setenv("WORKER_SECRET", "dev-secret") // the insecure default
@@ -88,9 +193,7 @@ func TestLoadConfig_ProductionRequiresSecrets(t *testing.T) {
 }
 
 func TestLoadConfig_RejectsBadDuration(t *testing.T) {
-	t.Setenv("ENVIRONMENT", "development")
-	t.Setenv("MONGODB_URI", "mongodb://127.0.0.1:27017/group_butler")
-	t.Setenv("WORKER_SECRET", "dev-secret")
+	setDevEnv(t)
 	t.Setenv("GROUP_SYNC_INTERVAL", "not-a-duration")
 	if _, err := loadConfig(); err == nil {
 		t.Fatal("loadConfig accepted a malformed GROUP_SYNC_INTERVAL")

@@ -141,11 +141,19 @@ func loadConfig() (Config, error) {
 		*d.target = v
 	}
 
+	if err := cfg.validate(); err != nil {
+		return Config{}, err
+	}
+
 	if cfg.Environment == productionEnv {
 		// The dev defaults above are local affordances. Deployment gets no
-		// implicit localhost database and no placeholder bearer token.
+		// implicit localhost database, no relative auth-store path that would
+		// land in the image working directory, and no placeholder bearer token.
 		if os.Getenv("MONGODB_URI") == "" {
 			return Config{}, errors.New("MONGODB_URI is required when ENVIRONMENT=production")
+		}
+		if os.Getenv("WHATSMEOW_DB_URI") == "" {
+			return Config{}, errors.New("WHATSMEOW_DB_URI is required when ENVIRONMENT=production")
 		}
 		switch cfg.WorkerSecret {
 		case "":
@@ -156,6 +164,39 @@ func loadConfig() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// validate rejects configurations the worker could not run with. Every count,
+// cap, and interval is positive-only: an empty queue or a zero cap stores
+// nothing, a zero concurrency or attempt budget can never finish, and a zero
+// interval either spins a loop or panics time.NewTicker. PORT is excluded (a
+// blank port falls back to the documented one) and so are the booleans.
+func (c Config) validate() error {
+	for _, v := range []struct {
+		key   string
+		value int64
+	}{
+		{"INGEST_QUEUE_SIZE", int64(c.IngestQueueSize)},
+		{"INGEST_FLUSH_MS", int64(c.IngestFlush / time.Millisecond)},
+		{"INGEST_FLUSH_MAX", int64(c.IngestFlushMax)},
+		{"RAW_JSON_MAX_BYTES", int64(c.RawJSONMaxBytes)},
+		{"RAW_SEARCH_MAX_BYTES", int64(c.RawSearchMax)},
+		{"MEDIA_MAX_BYTES", c.MediaMaxBytes},
+		{"MEDIA_CONCURRENCY", int64(c.MediaConcurrency)},
+		{"MEDIA_DOWNLOAD_TIMEOUT", int64(c.MediaDownloadTimeout)},
+		{"MEDIA_MAX_ATTEMPTS", int64(c.MediaMaxAttempts)},
+		{"MEDIA_JANITOR_INTERVAL", int64(c.MediaJanitorEvery)},
+		{"HISTORY_SYNC_MAX_DAYS", int64(c.HistorySyncMaxDays)},
+		{"GROUP_SYNC_INTERVAL", int64(c.GroupSyncInterval)},
+		{"GROUP_STALE_AFTER", int64(c.GroupStaleAfter)},
+		{"DISPATCH_INTERVAL", int64(c.DispatchInterval)},
+		{"SEND_MAX_ATTEMPTS", int64(c.SendMaxAttempts)},
+	} {
+		if v.value <= 0 {
+			return fmt.Errorf("%s must be positive, got %d", v.key, v.value)
+		}
+	}
+	return nil
 }
 
 // r2Endpoint derives the account-scoped endpoint. The endpoint is derived here,
