@@ -36,7 +36,6 @@ type Config struct {
 	MongoDB        string
 	WhatsmeowDB    string
 	R2AccountID    string
-	R2Endpoint     string
 	R2AccessKeyID  string
 	R2SecretKey    string
 	R2Bucket       string
@@ -95,7 +94,6 @@ func loadConfig() (Config, error) {
 		WhatsmeowDB:    env("WHATSMEOW_DB_URI", devWhatsmeowURI),
 
 		R2AccountID:   os.Getenv("R2_ACCOUNT_ID"),
-		R2Endpoint:    r2Endpoint(os.Getenv("R2_ACCOUNT_ID")),
 		R2AccessKeyID: os.Getenv("R2_ACCESS_KEY_ID"),
 		R2SecretKey:   os.Getenv("R2_SECRET_ACCESS_KEY"),
 		R2Bucket:      os.Getenv("R2_BUCKET"),
@@ -211,15 +209,6 @@ func (c Config) validate() error {
 		}
 	}
 	return nil
-}
-
-// r2Endpoint derives the account-scoped endpoint. The endpoint is derived here,
-// not configured: there is no emulator and no override anywhere in the project.
-func r2Endpoint(accountID string) string {
-	if accountID == "" {
-		return ""
-	}
-	return "https://" + accountID + ".r2.cloudflarestorage.com"
 }
 
 // env returns the variable, falling back to def when it is unset or empty.
