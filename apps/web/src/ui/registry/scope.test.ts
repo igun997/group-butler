@@ -88,11 +88,11 @@ describe("scope resolution and canonicalisation", () => {
       view: "assistant",
     },
     {
-      name: "the assistant still resolves without the instance it requires",
+      name: "a bare assistant address is not one the view answers",
       path: "/assistant",
       search: "",
-      scope: { kind: "global" },
-      view: "assistant",
+      scope: null,
+      view: null,
     },
     {
       name: "a group query lifts the stats view to group scope",
@@ -176,6 +176,68 @@ describe("scope resolution and canonicalisation", () => {
     }
   });
 
+  test("a stale but well-formed bookmark resolves to its view, not to an error", () => {
+    // The instance is gone; that is the read model's fact to report, not a
+    // reason for the address to stop resolving (R-E1 `unavailable`, not a 404).
+    const resolved = resolveView("/instances/inst_gone/groups", new URLSearchParams());
+    expect(resolved?.id).toBe("groups");
+    expect(resolved?.scope).toEqual({ kind: "instance", instanceId: "inst_gone" });
+    expect(resolved?.canonical).toBe("/instances/inst_gone/groups");
+  });
+
+  test("a malformed percent escape is a nonmatch, never a thrown decode", () => {
+    expect(() => resolveView("/instances/%E0%A4%A", new URLSearchParams())).not.toThrow();
+    expect(resolveView("/instances/%E0%A4%A", new URLSearchParams())).toBeNull();
+    expect(resolveView("/groups/%E0%A4%A", new URLSearchParams("instance=inst_1"))).toBeNull();
+    expect(resolveView("/%", new URLSearchParams())).toBeNull();
+    expect(parseScope("/instances/%", new URLSearchParams())).toBeNull();
+  });
+
+  test("a scoped address carrying params has one query string, and round-trips", () => {
+    const addresses: readonly string[] = [
+      "/",
+      "/groups?assigned=true&q=ops",
+      "/instances/inst_1/groups?cursor=abc&q=ops",
+      "/groups/120363043123456789%40g.us?instance=inst_1&q=ops",
+      "/instances/inst_1/activity?q=invoice",
+      "/instances/inst_1/activity?kind=image&q=photo",
+      "/stats?group=120363043123456789%40g.us&instance=inst_1&tab=bots",
+      "/assistant?call=abc&instance=inst_1",
+      "/assistant?group=120363043123456789%40g.us&instance=inst_1",
+    ];
+
+    for (const address of addresses) {
+      const [path, query = ""] = address.split("?");
+      const resolved = resolveView(path!, new URLSearchParams(query));
+      expect([address, resolved?.canonical]).toEqual([address, address]);
+      expect(resolved?.canonical.match(/\?/g)?.length ?? 0).toBeLessThanOrEqual(1);
+
+      // Resolving the canonical address again is a fixed point: same view, same
+      // scope, same params, same string.
+      const [canonicalPath, canonicalQuery = ""] = resolved!.canonical.split("?");
+      const again = resolveView(canonicalPath!, new URLSearchParams(canonicalQuery));
+      expect(again?.id).toBe(resolved?.id);
+      expect(again?.scope).toEqual(resolved?.scope);
+      expect(again?.params).toEqual(resolved?.params);
+      expect(again?.canonical).toBe(address);
+    }
+  });
+
+  test("the assistant needs an instance and accepts an optional group", () => {
+    expect(resolveView("/assistant", new URLSearchParams())).toBeNull();
+    expect(resolveView("/assistant", new URLSearchParams("group=120363043123456789%40g.us"))).toBeNull();
+    expect(resolveView("/assistant", new URLSearchParams("instance=inst_1"))?.scope).toEqual({
+      kind: "instance",
+      instanceId: "inst_1",
+    });
+    expect(
+      resolveView(
+        "/assistant",
+        new URLSearchParams("instance=inst_1&group=120363043123456789%40g.us"),
+      )?.scope,
+    ).toEqual({ kind: "group", instanceId: "inst_1", groupJid: "120363043123456789@g.us" });
+  });
+
   test("invalid params are dropped and the view still renders a working default", () => {
     const resolved = resolveView("/messages", new URLSearchParams("limit=not-a-number"));
     expect(resolved?.id).toBe("messages");
@@ -194,6 +256,20 @@ describe("scope resolution and canonicalisation", () => {
     expect(resolveView("/instances", new URLSearchParams("status=connected"))?.params.status).toBe(
       "connected",
     );
+  });
+
+  test("a group address with params keeps its scope query and its params apart, once", () => {
+    const resolved = resolveView(
+      "/groups/120363043123456789%40g.us",
+      new URLSearchParams("instance=inst_1&q=ops"),
+    );
+    expect(resolved?.canonical).toBe("/groups/120363043123456789%40g.us?instance=inst_1&q=ops");
+    expect(resolved?.params).toEqual({ q: "ops" });
+    expect(resolved?.scope).toEqual({
+      kind: "group",
+      instanceId: "inst_1",
+      groupJid: "120363043123456789@g.us",
+    });
   });
 
   test("the canonical address carries the scope in the path and drops the query that expressed it", () => {

@@ -215,7 +215,7 @@ body > main [role="alert"]:empty {
 }
 
 .app-shell__nav-sheet::backdrop {
-  background: color-mix(in srgb, var(--foreground) 40%, transparent);
+  background: var(--scrim);
 }
 
 .app-shell__nav-sheet .app-shell__nav {
@@ -389,7 +389,7 @@ body > main [role="alert"]:empty {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
-  min-height: 24px;
+  min-height: var(--target-min);
   padding: var(--space-1) var(--space-2);
   font: inherit;
   color: var(--foreground);
@@ -468,7 +468,7 @@ body > main [role="alert"]:empty {
  * opaque fallback comes from `.acrylic` in the token layer.
  */
 .app-palette {
-  width: min(560px, calc(100vw - 32px));
+  width: min(var(--surface-max-width), calc(100vw - var(--space-8)));
   margin: 12vh auto auto;
   padding: var(--space-4);
   color: var(--foreground);
@@ -478,7 +478,7 @@ body > main [role="alert"]:empty {
 }
 
 .app-palette::backdrop {
-  background: color-mix(in srgb, var(--foreground) 40%, transparent);
+  background: var(--scrim);
 }
 
 .app-palette__title {
@@ -613,7 +613,7 @@ body > main [role="alert"]:empty {
   display: none;
   align-items: center;
   gap: var(--space-2);
-  min-height: 24px;
+  min-height: var(--target-min);
   padding: var(--space-1) var(--space-2);
   font: inherit;
   color: var(--foreground);
@@ -733,8 +733,8 @@ body > main [role="alert"]:empty {
   position: fixed;
   inset: auto 0 0 0;
   margin: 0 auto;
-  width: min(560px, 100%);
-  max-height: 80dvh;
+  width: min(var(--surface-max-width), 100%);
+  max-height: var(--sheet-max-height);
   padding: var(--space-3) var(--space-4) var(--space-4);
   color: var(--foreground);
   border: var(--border-width) solid var(--border);
@@ -746,7 +746,7 @@ body > main [role="alert"]:empty {
 }
 
 .scope-spine__sheet::backdrop {
-  background: color-mix(in srgb, var(--foreground) 40%, transparent);
+  background: var(--scrim);
 }
 
 .scope-spine__sheet-head {
@@ -765,7 +765,7 @@ body > main [role="alert"]:empty {
 }
 
 .scope-spine__sheet-close {
-  min-height: 24px;
+  min-height: var(--target-min);
   padding: var(--space-1) var(--space-2);
   font: inherit;
   color: var(--foreground);
@@ -778,7 +778,9 @@ body > main [role="alert"]:empty {
 /*
  * R-M2: below `md` the persistent list steps aside for the chip, which opens the
  * sheet. Exactly one switcher is exposed at a time, and the sheet's own copy is
- * `display: none` until it is opened.
+ * `display: none` until it is opened. The boundary literal is `--breakpoint-md`
+ * (a media query cannot read a custom property); `tokens.test.ts` holds it to the
+ * token.
  */
 @media (max-width: 767px) {
   .scope-spine__chip {
@@ -814,7 +816,7 @@ body > main [role="alert"]:empty {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
-  min-height: 24px;
+  min-height: var(--target-min);
   padding: var(--space-1) var(--space-2);
   font: inherit;
   font-size: var(--type-caption-size);

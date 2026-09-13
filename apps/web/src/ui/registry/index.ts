@@ -20,7 +20,6 @@ export {
   VIEW_PARAMS,
   cursorParam,
   parseParams,
-  serializeParams,
   type ParamValue,
   type ViewParams,
 } from "./params";

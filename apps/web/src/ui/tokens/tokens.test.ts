@@ -1,6 +1,19 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, test } from "vitest";
-import { FOCUS, MOTION, RADIUS, ROW_HEIGHT, SHELL, SHADOW, SPACE, TYPE_RAMP } from "./index";
+import {
+  BREAKPOINT,
+  FOCUS,
+  MOTION,
+  RADIUS,
+  ROW_HEIGHT,
+  SHEET,
+  SHELL,
+  SHADOW,
+  SPACE,
+  SURFACE,
+  TARGET,
+  TYPE_RAMP,
+} from "./index";
 
 describe("token layer (spec §3.2)", () => {
   test("spatial scale is the 4px grid with the specified steps", () => {
@@ -113,6 +126,22 @@ describe("token layer (spec §3.2)", () => {
     expect(light.get("--focus-ring-width")).toBe(`${FOCUS.width}px`);
     expect(light.get("--focus-ring-offset")).toBe(`${FOCUS.offset}px`);
 
+    // The interactive floor, the modal surfaces, and the scrim are tokens too:
+    // a control, a palette, and a sheet consume the same values, not their own.
+    for (const [name, px] of Object.entries(TARGET)) {
+      expect(light.get(asToken(`--target-${name}`))).toBe(`${px}px`);
+    }
+    for (const [name, px] of Object.entries(SURFACE)) {
+      expect(light.get(asToken(`--surface-${name}`))).toBe(`${px}px`);
+    }
+    for (const [name, value] of Object.entries(SHEET)) {
+      expect(light.get(asToken(`--sheet-${name}`))).toBe(value);
+    }
+    for (const [name, px] of Object.entries(BREAKPOINT)) {
+      expect(light.get(asToken(`--breakpoint-${name}`))).toBe(`${px}px`);
+    }
+    expect(light.get("--scrim")).toBe("color-mix(in srgb, var(--foreground) 40%, transparent)");
+
     // The acrylic material and its opaque fallback are a P0 contract (§3.2,
     // R-A9), not something a surface re-invents.
     expect(light.get("--acrylic-blur")).toBe("30px");
@@ -125,6 +154,22 @@ describe("token layer (spec §3.2)", () => {
     const still = declarations(css, ":root", "@media (prefers-reduced-motion: reduce)");
     expect([...still.keys()]).toEqual(Object.entries(MOTION.duration).map(([name]) => `--motion-duration-${name}`));
     for (const ms of still.values()) expect(ms).toBe("0ms");
+  });
+
+  /*
+   * R-M2 collapses the chrome below `md` and R-T3 moves the toasts below `sm`, and
+   * a media query cannot read a custom property — so the stylesheet writes the
+   * literal and this holds every one of them to the named boundary. A new
+   * breakpoint must be named in the token layer before it can be used.
+   */
+  test("every media boundary in the stylesheet is a named breakpoint", () => {
+    const css = readFileSync(new URL("../../app/globals.css", import.meta.url), "utf8");
+    const boundaries = [...css.matchAll(/@media \(max-width: (\d+)px\)/g)].map((match) =>
+      Number(match[1]),
+    );
+
+    expect(boundaries.length).toBeGreaterThan(0);
+    expect(new Set(boundaries)).toEqual(new Set(Object.values(BREAKPOINT)));
   });
 
   /*

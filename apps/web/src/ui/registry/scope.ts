@@ -1,3 +1,4 @@
+import type { ViewParams } from "./params";
 import type { Scope, ScopeMode, ViewDescriptor } from "./types";
 import { SCOPE_DEPTH } from "./types";
 
@@ -82,11 +83,22 @@ export function matchRoute(routes: readonly string[], segments: readonly string[
     for (let i = 0; i < expected.length; i += 1) {
       const part = expected[i]!;
       const field = PLACEHOLDERS[part];
-      if (field) match[field] = decodeURIComponent(segments[i]!);
-      else if (part !== segments[i]) {
+      if (!field) {
+        if (part !== segments[i]) {
+          fits = false;
+          break;
+        }
+        continue;
+      }
+
+      const value = decodeSegment(segments[i]!);
+      if (value === null) {
+        // A malformed escape is not a segment any view can be asked for: the
+        // template does not match, and the caller sees a nonmatch.
         fits = false;
         break;
       }
+      match[field] = value;
     }
     if (fits) return match;
   }
@@ -119,12 +131,69 @@ function deeperRoute(routes: readonly string[], field: ":instanceId" | ":groupJi
   return routes.find((route) => route.includes(field)) ?? null;
 }
 
-/** Append query entries in a stable order, or return `null` when there is no base address. */
-function withScopeQuery(base: string | null, entries: Record<string, string>): string | null {
-  if (base === null) return null;
+/** Percent-decoding that reports a malformed escape instead of throwing on it. */
+function decodeSegment(segment: string): string | null {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return null;
+  }
+}
+
+/** An address in two parts, so the scope's query and the view's params merge once. */
+interface Address {
+  path: string;
+  query: Record<string, string | number | boolean>;
+}
+
+/** The address a scope is served at: a route of the view's, plus the query it still needs. */
+function scopeAddress(view: ViewDescriptor, scope: Scope): Address | null {
+  switch (scope.kind) {
+    case "global": {
+      const route = globalRoute(view.routes);
+      return route ? { path: route, query: {} } : null;
+    }
+    case "instance": {
+      const deeper = deeperRoute(view.routes, ":instanceId");
+      if (deeper) {
+        return {
+          path: deeper.replace(":instanceId", encodeURIComponent(scope.instanceId)),
+          query: {},
+        };
+      }
+      const route = globalRoute(view.routes);
+      return route ? { path: route, query: { instance: scope.instanceId } } : null;
+    }
+    case "group": {
+      const deeper = deeperRoute(view.routes, ":groupJid");
+      if (deeper) {
+        return {
+          path: deeper.replace(":groupJid", encodeURIComponent(scope.groupJid)),
+          query: { instance: scope.instanceId },
+        };
+      }
+      const route = globalRoute(view.routes);
+      return route
+        ? { path: route, query: { group: scope.groupJid, instance: scope.instanceId } }
+        : null;
+    }
+  }
+}
+
+/**
+ * One address, one query string: the scope's own entries and the view's validated
+ * params merged and serialised once, in a stable key order, so a scoped address
+ * (`/groups/<jid>?instance=…`) that also carries params is a single `?` and
+ * resolving it again yields the same string.
+ */
+function serializeAddress(address: Address, params: ViewParams): string {
+  const entries: Record<string, string | number | boolean> = { ...address.query, ...params };
+  const keys = Object.keys(entries).sort();
+  if (keys.length === 0) return address.path;
+
   const query = new URLSearchParams();
-  for (const key of Object.keys(entries).sort()) query.set(key, entries[key]!);
-  return `${base}?${query.toString()}`;
+  for (const key of keys) query.set(key, String(entries[key]));
+  return `${address.path}?${query.toString()}`;
 }
 
 /**
@@ -133,31 +202,22 @@ function withScopeQuery(base: string | null, entries: Record<string, string>): s
  * — the instance address is canonical once an instance is selected); otherwise
  * the scope travels as the query alias of the view's global address
  * (`/assistant?instance=<id>`). A scope deeper than the view accepts has no
- * canonical address at all, which is what makes normalization mandatory rather
- * than advisory.
+ * canonical address, and neither has a scope shallower than a view declares as
+ * required (`/assistant` without an instance is not that view's address) — which
+ * is what makes normalization mandatory rather than advisory.
+ *
+ * The view's validated params are merged into that address once, here, so a
+ * scoped address that also carries params is one well-formed query string rather
+ * than a scope query with a second one appended to it.
  */
-export function canonicalPath(view: ViewDescriptor, scope: Scope): string | null {
+export function canonicalPath(
+  view: ViewDescriptor,
+  scope: Scope,
+  params: ViewParams = {},
+): string | null {
   if (SCOPE_DEPTH[scope.kind] > SCOPE_DEPTH[view.scopeMode]) return null;
+  if (view.minScope && SCOPE_DEPTH[scope.kind] < SCOPE_DEPTH[view.minScope]) return null;
 
-  switch (scope.kind) {
-    case "global":
-      return globalRoute(view.routes);
-    case "instance": {
-      const deeper = deeperRoute(view.routes, ":instanceId");
-      return deeper
-        ? deeper.replace(":instanceId", encodeURIComponent(scope.instanceId))
-        : withScopeQuery(globalRoute(view.routes), { instance: scope.instanceId });
-    }
-    case "group": {
-      const deeper = deeperRoute(view.routes, ":groupJid");
-      return deeper
-        ? withScopeQuery(deeper.replace(":groupJid", encodeURIComponent(scope.groupJid)), {
-            instance: scope.instanceId,
-          })
-        : withScopeQuery(globalRoute(view.routes), {
-            group: scope.groupJid,
-            instance: scope.instanceId,
-          });
-    }
-  }
+  const address = scopeAddress(view, scope);
+  return address ? serializeAddress(address, params) : null;
 }

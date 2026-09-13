@@ -1,6 +1,6 @@
-import { VIEW_PARAMS, parseParams, serializeParams, type ViewParams } from "./params";
+import { VIEW_PARAMS, parseParams, type ViewParams } from "./params";
 import { canonicalPath, matchRoute, normalizeScope, pathSegments, scopeOf, type RouteMatch } from "./scope";
-import { SCOPE_DEPTH, type Scope, type ScopeMode, type ViewDescriptor } from "./types";
+import type { Scope, ScopeMode, ViewDescriptor } from "./types";
 
 /**
  * The registry (spec §2.1, §2.3, §2.5): the ten declared views of the workspace
@@ -59,11 +59,13 @@ const VIEWS: readonly ViewDescriptor[] = [
   {
     id: "assistant",
     title: "Assistant",
-    // The instance scope is a route constraint (§2.3): the deepest scope this
-    // view accepts is a group inside an instance, and a request without an
-    // instance resolves to global so the view can explain what it needs rather
-    // than fail to resolve.
+    // The assistant answers inside one instance and, optionally, one of its
+    // groups — §2.3: "instance (required), group optional". Its address carries
+    // both as scope (`?instance=`, `?group=`), and the instance requirement is a
+    // route constraint, not a default: `/assistant` on its own is not an address
+    // this view answers, so it never resolves to a global assistant.
     scopeMode: "group",
+    minScope: "instance",
     routes: ["/assistant"],
     params: VIEW_PARAMS.assistant,
   },
@@ -105,8 +107,9 @@ const PROBE: Record<ScopeMode, Scope> = {
 /**
  * The views an operator can open while the scope is this mode: those that accept
  * the scope *and* have a canonical address for it. `/instances/<id>` is not
- * reachable at global scope and `/settings` is not reachable at group scope, so
- * neither appears — which is exactly what a nav model built from this list needs.
+ * reachable at global scope, `/settings` is not reachable at group scope, and
+ * `/assistant` requires an instance, so none of the three appears where it does
+ * not belong — which is what a nav or palette model built from this list needs.
  */
 export function viewsFor(scopeMode: ScopeMode): readonly ViewDescriptor[] {
   return views().filter((view) => canonicalPath(view, PROBE[scopeMode]) !== null);
@@ -137,9 +140,9 @@ function matchView(segments: readonly string[]): { view: ViewDescriptor; match: 
  * is normalized to what the view accepts, and invalid or unknown params are
  * dropped, because a stale bookmark is a normal event and never an error page.
  *
- * The returned `canonical` address is what the URL is rewritten to: path, scope,
- * and the validated params in a stable order, so every link an operator copies is
- * the same link.
+ * The returned `canonical` address is what the URL is rewritten to, and it is
+ * built once from the view, the normalized scope, and the validated params, so
+ * every link an operator copies is the same link and carries one query string.
  */
 export function resolveView(pathname: string, search: URLSearchParams): ResolvedView | null {
   const found = matchView(pathSegments(pathname));
@@ -149,17 +152,11 @@ export function resolveView(pathname: string, search: URLSearchParams): Resolved
   if (!scope) return null;
 
   const normalized = normalizeScope(scope, found.view.scopeMode);
-  const canonical = canonicalPath(found.view, normalized);
+  const params = parseParams(found.view.params, search);
+  const canonical = canonicalPath(found.view, normalized, params);
   if (!canonical) return null;
 
-  const params = parseParams(found.view.params, search);
-  return {
-    id: found.view.id,
-    view: found.view,
-    scope: normalized,
-    params,
-    canonical: `${canonical}${serializeParams(params)}`,
-  };
+  return { id: found.view.id, view: found.view, scope: normalized, params, canonical };
 }
 
 /**
@@ -170,9 +167,3 @@ export function resolveView(pathname: string, search: URLSearchParams): Resolved
 export function parseScope(pathname: string, search: URLSearchParams): Scope | null {
   return resolveView(pathname, search)?.scope ?? null;
 }
-
-/**
- * The registry contract §2.3 describes as `scopeMode` bounds. Exported so a view
- * or a nav model can compare depths without re-deriving the ordering.
- */
-export { SCOPE_DEPTH };

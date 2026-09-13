@@ -40,6 +40,28 @@ export const ROW_HEIGHT = { comfortable: 40, compact: 32, header: 36 } as const;
 export const SHELL = { header: 48, spine: 40, sidebar: 240, rail: 48 } as const;
 
 /**
+ * The interactive floor (§4.7 R-M4), in px: the WCAG 2.2 minimum a control may
+ * occupy. It is a token rather than a padding choice because it is a rule about
+ * the target, and every control that is not deliberately larger uses it.
+ */
+export const TARGET = { min: 24 } as const;
+
+/** Modal surfaces (§3.2), in px: the width the palette and a sheet stop growing at. */
+export const SURFACE = { maxWidth: 560 } as const;
+
+/** A bottom sheet's own cap (§3.2): it never covers the workspace it was opened from. */
+export const SHEET = { maxHeight: "80dvh" } as const;
+
+/**
+ * The two viewport boundaries the chrome collapses at and the toasts move at
+ * (§3.2, R-M2, R-T3), in px: the largest width that still belongs to the smaller
+ * tier, which is the value a `max-width` query carries. A media query cannot read
+ * a custom property, so the token layer names the value and `tokens.test.ts`
+ * holds every `@media` boundary in `globals.css` to it.
+ */
+export const BREAKPOINT = { md: 767, sm: 640 } as const;
+
+/**
  * The focus rectangle (§3.2, R-A4): 2 px ring at a 1 px offset, two-tone — a
  * neutral inner line in the offset gap plus the `--ring` outline — so it
  * survives dark and acrylic surfaces. It is drawn only as a line: never a fill,

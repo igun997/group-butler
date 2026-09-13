@@ -47,10 +47,22 @@ describe("the view registry (spec §2.3, §2.5)", () => {
         const deep = route
           .replace(":instanceId", "inst_1")
           .replace(":groupJid", "120363043123456789%40g.us");
-        const search = route.includes(":groupJid") ? "?instance=inst_1" : "";
+        // A group address needs its instance, and a view with a required scope
+        // needs it in the query when its route has no segment for one.
+        const search =
+          route.includes(":groupJid") || view.minScope === "instance" ? "?instance=inst_1" : "";
         expect(resolveView(deep, new URLSearchParams(search))?.id).toBe(view.id);
       }
     }
+  });
+
+  test("a view whose scope is required does not resolve at a shallower one (R5)", () => {
+    const assistant = views().find((view) => view.id === "assistant")!;
+    expect(assistant.minScope).toBe("instance");
+    expect(canonicalPath(assistant, { kind: "global" })).toBeNull();
+    expect(resolveView("/assistant", new URLSearchParams())).toBeNull();
+    expect(viewsFor("global").map((view) => view.id)).not.toContain("assistant");
+    expect(viewsFor("instance").map((view) => view.id)).toContain("assistant");
   });
 
   test("the alias of a view resolves to the same view as its canonical route", () => {
@@ -95,7 +107,6 @@ describe("the view registry (spec §2.3, §2.5)", () => {
       "groups",
       "messages",
       "sends",
-      "assistant",
       "stats",
       "settings",
     ]);

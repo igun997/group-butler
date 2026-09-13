@@ -124,6 +124,29 @@ describe("ScopeSpine (R11, R-M2)", () => {
     expect(html).toContain(`id="${controls}"`);
   });
 
+  test("exposes exactly one switcher: the sheet's copy is not in the DOM until it opens (R-M2)", () => {
+    const html = render(null);
+
+    // The persistent list is the switcher until the chip opens the sheet, so a
+    // screen reader is never handed two trees of the same rows.
+    expect(html.match(/class="scope-spine__instances"/g)).toHaveLength(1);
+    const sheet = html.slice(html.indexOf("<dialog"));
+    expect(sheet).not.toContain("scope-spine__instances");
+    expect(sheet).not.toContain("scope-spine__group-row");
+
+    // The sheet names itself and offers a control to leave it other than Escape.
+    expect(sheet).toContain(">Scope<");
+    expect(sheet).toContain("Close");
+  });
+
+  test("marks every group row's copy control by the value it copies (R-A6)", () => {
+    const html = render(null);
+
+    for (const group of groups) {
+      expect(html).toContain(`aria-label="Copy group ID ${group.groupJid}"`);
+    }
+  });
+
   test("names the whole-instance scope when nothing is selected", () => {
     const html = render(null);
     const chip = html.match(/<button[^>]*class="scope-spine__chip"[^>]*>([\s\S]*?)<\/button>/)?.[1] ?? "";

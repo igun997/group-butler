@@ -91,12 +91,3 @@ export function parseParams(schema: z.ZodType, search: URLSearchParams): ViewPar
   }
   return params;
 }
-
-/** Serialise validated params into a canonical query string, or "" when there are none. */
-export function serializeParams(params: ViewParams): string {
-  const keys = Object.keys(params).sort();
-  if (keys.length === 0) return "";
-  const query = new URLSearchParams();
-  for (const key of keys) query.set(key, String(params[key]));
-  return `?${query.toString()}`;
-}

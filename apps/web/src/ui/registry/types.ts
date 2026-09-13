@@ -210,6 +210,14 @@ export interface ViewDescriptor<P extends ZodType = ZodType> {
   icon?: ViewIcon;
   /** The deepest scope this view accepts. */
   scopeMode: ScopeMode;
+  /**
+   * The shallowest scope this view can be opened at, when its address cannot
+   * carry that much on its own. `/assistant` has no segment for an instance, yet
+   * the assistant cannot answer without one (§2.3: "the assistant's instance
+   * scope is a route constraint"), so a bare `/assistant` is not its address and
+   * does not resolve to it.
+   */
+  minScope?: ScopeMode;
   /** Canonical first, aliases after. */
   routes: readonly string[];
   /** The view's search params: filters, cursor, sort, density, peek (spec §1.3). */
