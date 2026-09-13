@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
+
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
@@ -124,6 +126,9 @@ type storedMessage struct {
 		Status       string `bson:"status"`
 		Kind         string `bson:"kind"`
 		DeclaredType string `bson:"declaredType"`
+		Mime         string `bson:"mime"`
+		R2Key        string `bson:"r2Key"`
+		Attempts     int    `bson:"attempts"`
 	} `bson:"media"`
 	Raw struct {
 		Bytes     int            `bson:"bytes"`
@@ -218,6 +223,18 @@ func TestSaveMessageEnvelopeRoundTrip(t *testing.T) {
 		t.Errorf("parse = %+v, want ok/empty-array/version %d", got.Parse, messageSchemaVersion)
 	}
 
+	// The media pipeline writes media.* after the document exists (§6.2). A
+	// redelivery must not undo that work, which is the whole point of the unique
+	// index being a redelivery guard rather than a duplicate guard.
+	if _, err := coll.UpdateOne(ctx, key, bson.D{{Key: "$set", Value: bson.D{
+		{Key: "media.status", Value: string(MediaStored)},
+		{Key: "media.mime", Value: "image/png"},
+		{Key: "media.r2Key", Value: "org/org_default/instance/inst_envelope/3EB0ENVELOPE.png"},
+		{Key: "media.attempts", Value: 1},
+	}}}); err != nil {
+		t.Fatalf("simulate media pipeline write: %v", err)
+	}
+
 	// A redelivery of the same message must not rewrite what the message is, but
 	// a better parse of it (a name learned later) is worth storing. The
 	// redelivery is parsed again, so its observation time is strictly later —
@@ -258,5 +275,9 @@ func TestSaveMessageEnvelopeRoundTrip(t *testing.T) {
 	}
 	if !again.ReceivedAt.Equal(got.ReceivedAt) || !again.Timestamp.Equal(got.Timestamp) {
 		t.Errorf("redelivery rewrote the identity timestamps: %v/%v", again.ReceivedAt, again.Timestamp)
+	}
+	if again.Media.Status != string(MediaStored) || again.Media.Mime != "image/png" ||
+		again.Media.R2Key != "org/org_default/instance/inst_envelope/3EB0ENVELOPE.png" || again.Media.Attempts != 1 {
+		t.Errorf("redelivery clobbered the media pipeline's subdocument: %+v", again.Media)
 	}
 }

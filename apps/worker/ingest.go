@@ -154,6 +154,12 @@ func (s *messageStore) Save(ctx context.Context, docs []MessageDoc) error {
 // identityFields are written only when the document is created: they describe
 // the message as it first arrived. A redelivery of the same message must not
 // rewrite them, and `receivedAt` is the observation that stays first (§6.2).
+//
+// The parse-time media descriptor belongs here for the same reason: once the
+// document exists, `media.*` is the media pipeline's subdocument (§5.2). Were it
+// part of the update, the next redelivery — the very case the unique index
+// exists for — would write the parser's empty mime/r2Key/sha256 back over what
+// the pipeline stored, and reset `stored` to `pending`.
 func identityFields(doc MessageDoc) bson.D {
 	return bson.D{
 		{Key: "organizationId", Value: doc.OrganizationID},
@@ -166,14 +172,15 @@ func identityFields(doc MessageDoc) bson.D {
 		{Key: "fromMe", Value: doc.FromMe},
 		{Key: "timestamp", Value: doc.Timestamp},
 		{Key: "receivedAt", Value: doc.ReceivedAt},
+		{Key: "media.status", Value: doc.Media.Status},
+		{Key: "media.kind", Value: doc.Media.Kind},
+		{Key: "media.declaredType", Value: doc.Media.DeclaredType},
 	}
 }
 
 // messageFields are the values a re-parse may improve, in the MongoDB spelling
-// of §5.1. The media and parse subdocuments are flattened into dotted keys so
-// the media pipeline and a later re-parse can update a single field without
-// replacing the others. `media.status` here is what the parser saw (none or
-// pending); the media pipeline owns every later transition.
+// of §5.1. The parse subdocument is flattened into dotted keys so a later
+// re-parse can update one field without replacing the others.
 func messageFields(doc MessageDoc) bson.D {
 	return bson.D{
 		{Key: "senderLid", Value: doc.SenderLID},
@@ -185,21 +192,6 @@ func messageFields(doc MessageDoc) bson.D {
 		{Key: "rawSearch", Value: doc.RawSearch},
 		{Key: "links", Value: doc.Links},
 		{Key: "mentions", Value: doc.Mentions},
-		{Key: "media.status", Value: doc.Media.Status},
-		{Key: "media.kind", Value: doc.Media.Kind},
-		{Key: "media.declaredType", Value: doc.Media.DeclaredType},
-		{Key: "media.mime", Value: doc.Media.Mime},
-		{Key: "media.fileName", Value: doc.Media.FileName},
-		{Key: "media.size", Value: doc.Media.Size},
-		{Key: "media.sha256", Value: doc.Media.SHA256},
-		{Key: "media.width", Value: doc.Media.Width},
-		{Key: "media.height", Value: doc.Media.Height},
-		{Key: "media.durationSec", Value: doc.Media.DurationSec},
-		{Key: "media.r2Key", Value: doc.Media.R2Key},
-		{Key: "media.publicUrl", Value: doc.Media.PublicURL},
-		{Key: "media.reason", Value: doc.Media.Reason},
-		{Key: "media.error", Value: doc.Media.Error},
-		{Key: "media.attempts", Value: doc.Media.Attempts},
 		{Key: "raw.message", Value: doc.Raw.Message},
 		{Key: "raw.truncated", Value: doc.Raw.Truncated},
 		{Key: "raw.bytes", Value: doc.Raw.Bytes},
