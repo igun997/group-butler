@@ -1,0 +1,20 @@
+{
+  "instanceId": "V1StGXR8_Z5jdHi6B-myT",
+  "syncedAt": "2026-09-13T10:00:00Z",
+  "groups": [
+    {
+      "groupJid": "120363043123456789@g.us", "name": "Ops Team", "nameSource": "event",
+      "nameSetAt": "2026-09-01T08:12:00Z", "nameSetBy": "628990000001@s.whatsapp.net",
+      "participantCount": 12, "isAnnounce": false, "isLocked": false, "state": "active",
+      "lastActivityAt": "2026-09-13T09:59:00Z", "messageCount": 4211,
+      "assigned": true, "whitelisted": true
+    },
+    {
+      "groupJid": "120363043987654321@g.us", "name": "", "nameSource": "fallback",
+      "nameSetAt": null, "nameSetBy": null, "participantCount": 0,
+      "isAnnounce": false, "isLocked": false, "state": "active",
+      "lastActivityAt": "2026-09-13T09:10:00Z", "messageCount": 3,
+      "assigned": false, "whitelisted": false
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+{
+  "type": "group.updated", "instanceId": "V1StGXR8_Z5jdHi6B-myT", "groupJid": "120363043123456789@g.us",
+  "changes": ["subject"], "name": "Ops Team", "previousName": "Support",
+  "nameSetAt": "2026-09-13T10:00:00Z", "state": "active", "occurredAt": "2026-09-13T10:00:01Z"
+}
