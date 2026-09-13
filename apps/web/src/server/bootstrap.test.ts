@@ -1,7 +1,22 @@
 import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
+import type { Db } from "mongodb";
 import { MongoMemoryReplSet } from "mongodb-memory-server";
 import { connectForTest } from "./mongo";
-import { createIndexes, seedDefaults } from "./bootstrap";
+import { createIndexes, runBootstrap, seedDefaults } from "./bootstrap";
+
+/** The `_id_` index always exists; every other name is the canonical set's. */
+async function indexNames(db: Db, collection: string): Promise<string[]> {
+  const indexes = await db.collection(collection).indexes();
+  return indexes
+    .map((index) => index.name ?? "")
+    .filter((name) => name !== "_id_")
+    .sort();
+}
+
+async function indexKey(db: Db, collection: string, name: string) {
+  const indexes = await db.collection(collection).indexes();
+  return indexes.find((index) => index.name === name)?.key;
+}
 
 let replSet: MongoMemoryReplSet;
 let uri: string;
@@ -29,12 +44,37 @@ describe("bootstrap", () => {
   test("creates the messages uniqueness guarantee and the group lookup indexes", async () => {
     const { client, db } = await connectForTest(uri, "butler_test");
     await createIndexes(db);
-    const groupNames = (await db.collection("groups").indexes()).map((i) => i.name);
-    expect(groupNames).toContain("uniq_group");
-    expect(groupNames).toContain("group_activity");
-    const messageNames = (await db.collection("messages").indexes()).map((i) => i.name);
-    expect(messageNames).toContain("uniq_message");
-    expect(messageNames).toContain("messages_text");
+    // Every canonical index of §5.1, by name — a missing index silently changes
+    // read cost and (for the unique ones) ingest correctness.
+    expect(await indexNames(db, "groups")).toEqual([
+      "group_activity",
+      "group_by_jid",
+      "group_name_search",
+      "group_reconcile",
+      "uniq_group",
+    ]);
+    expect(await indexNames(db, "messages")).toEqual([
+      "group_stream",
+      "media_status",
+      "messages_text",
+      "sender_stream",
+      "uniq_message",
+    ]);
+    expect(await indexNames(db, "instances")).toEqual(["instance_deleted", "instance_status", "org_label"]);
+    expect(await indexNames(db, "sendRequests")).toEqual([
+      "send_by_group",
+      "send_by_instance",
+      "send_due",
+      "uniq_send_idempotency",
+    ]);
+    // Names alone are not the contract: assert the shape of the two lookups
+    // that are easy to get subtly wrong (soft-delete scan, per-group send list).
+    expect(await indexKey(db, "instances", "instance_deleted")).toEqual({ organizationId: 1, deletedAt: 1 });
+    expect(await indexKey(db, "sendRequests", "send_by_group")).toEqual({
+      organizationId: 1,
+      groupJid: 1,
+      createdAt: -1,
+    });
     await client.close();
   });
 
@@ -51,6 +91,21 @@ describe("bootstrap", () => {
       retention: { messagesDays: 7 },
       ui: { timezone: "Asia/Jakarta" },
     });
+    vi.unstubAllEnvs();
+    await client.close();
+  });
+
+  test("runBootstrap honours a dbName override while taking the configured URI", async () => {
+    vi.stubEnv("MONGODB_URI", uri);
+    vi.stubEnv("MONGODB_DB", "butler_configured_db");
+    vi.stubEnv("ORGANIZATION_ID", "org_default");
+    await runBootstrap({ dbName: "butler_override_db" });
+
+    const { client, db } = await connectForTest(uri, "butler_override_db");
+    expect(await indexNames(db, "messages")).toContain("uniq_message");
+    expect(await db.collection("organizations").countDocuments({ _id: "org_default" as never })).toBe(1);
+    // The configured database is only a default: the override must not leak into it.
+    expect(await client.db("butler_configured_db").collection("organizations").countDocuments({})).toBe(0);
     vi.unstubAllEnvs();
     await client.close();
   });

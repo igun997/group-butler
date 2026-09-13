@@ -4,10 +4,17 @@ export const DEFAULT_DB_NAME = "group_butler";
 
 let cached: { client: MongoClient; db: Db } | null = null;
 
-export function mongoConfig(): { uri: string; dbName: string } {
-  const uri = process.env.MONGODB_URI;
+/**
+ * Env-derived target with optional overrides, so a caller can point one run at
+ * another database (bootstrap smoke runs) without a second copy of the defaults.
+ */
+export function mongoConfig(overrides: { uri?: string; dbName?: string } = {}): {
+  uri: string;
+  dbName: string;
+} {
+  const uri = overrides.uri ?? process.env.MONGODB_URI;
   if (!uri) throw new Error("MONGODB_URI is required");
-  return { uri, dbName: process.env.MONGODB_DB ?? DEFAULT_DB_NAME };
+  return { uri, dbName: overrides.dbName ?? process.env.MONGODB_DB ?? DEFAULT_DB_NAME };
 }
 
 /** Process-wide pooled client (Next dev reloads reuse it). */

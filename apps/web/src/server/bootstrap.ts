@@ -1,6 +1,6 @@
 import { MongoClient, type Db, type IndexDescription } from "mongodb";
 import { COLLECTIONS } from "./collections";
-import { DEFAULT_DB_NAME, mongoConfig } from "./mongo";
+import { mongoConfig } from "./mongo";
 
 /**
  * The canonical index set of docs/architecture-draft.md §5.1 — one writer of
@@ -21,6 +21,8 @@ export const INDEXES: Record<string, IndexDescription[]> = {
       partialFilterExpression: { deletedAt: null },
     },
     { name: "instance_status", key: { organizationId: 1, "runtime.status": 1 } },
+    // Soft-delete scans ("what is still live for this org").
+    { name: "instance_deleted", key: { organizationId: 1, deletedAt: 1 } },
   ],
   [COLLECTIONS.pairingSessions]: [
     // Transient pairing material lives outside `instances` precisely so this
@@ -53,6 +55,7 @@ export const INDEXES: Record<string, IndexDescription[]> = {
     { name: "uniq_send_idempotency", key: { organizationId: 1, idempotencyKey: 1 }, unique: true },
     { name: "send_due", key: { status: 1, scheduledFor: 1 } },
     { name: "send_by_instance", key: { organizationId: 1, instanceId: 1, createdAt: -1 } },
+    { name: "send_by_group", key: { organizationId: 1, groupJid: 1, createdAt: -1 } },
   ],
   [COLLECTIONS.aiCalls]: [
     { name: "ai_recent", key: { organizationId: 1, createdAt: -1 } },
@@ -133,9 +136,7 @@ export async function seedDefaults(db: Db, organizationId = ORG_DEFAULT_ID): Pro
 
 /** Creates the full canonical index set, then seeds the two default documents. */
 export async function runBootstrap(opts: { uri?: string; dbName?: string } = {}): Promise<void> {
-  const { uri, dbName } = opts.uri
-    ? { uri: opts.uri, dbName: opts.dbName ?? DEFAULT_DB_NAME }
-    : mongoConfig();
+  const { uri, dbName } = mongoConfig(opts);
   const organizationId = process.env.ORGANIZATION_ID ?? ORG_DEFAULT_ID;
 
   const client = new MongoClient(uri);
