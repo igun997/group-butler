@@ -16,8 +16,12 @@ const (
 	// refuses to boot while WORKER_SECRET is missing or still this value.
 	devWorkerSecret = "dev-secret"
 
-	devMongoURI     = "mongodb://127.0.0.1:27017/group_butler?replicaSet=rs0"
-	devWhatsmeowURI = "file:/data/whatsmeow.db?_foreign_keys=on"
+	devMongoURI = "mongodb://127.0.0.1:27017/group_butler?replicaSet=rs0"
+
+	// devWhatsmeowURI mirrors the value root `.env.example` supplies, so the
+	// fallback stays inside the git-ignored apps/worker/.localdata/. Deployment
+	// sets the mounted-volume path explicitly (apps/worker/.env.production.example).
+	devWhatsmeowURI = "file:./.localdata/whatsmeow.db?_foreign_keys=on"
 )
 
 // Config is the worker's whole runtime configuration, read from the
