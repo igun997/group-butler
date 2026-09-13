@@ -228,7 +228,7 @@ function Navigation({ destinations, currentId, rail, navId, onToggleRail, onClos
   return (
     <>
       <div className="app-shell__nav-head">
-        <span className="app-shell__brand">Group Butler</span>
+        <span className={`app-shell__brand${rail ? " visually-hidden" : ""}`}>Group Butler</span>
         {onToggleRail ? (
           <button
             type="button"
@@ -262,7 +262,9 @@ function Navigation({ destinations, currentId, rail, navId, onToggleRail, onClos
                     {destination.icon}
                   </span>
                 ) : null}
-                <span className="app-shell__nav-label">{destination.title}</span>
+                <span className={`app-shell__nav-label${rail ? " visually-hidden" : ""}`}>
+                  {destination.title}
+                </span>
                 {current ? (
                   <span className="app-shell__nav-current" aria-hidden="true">
                     <CurrentGlyph />

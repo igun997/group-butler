@@ -42,6 +42,14 @@ body > main {
   padding: 48px 24px;
 }
 
+/* The sign-in page's gutter on a small viewport. It is the sign-in surface's own
+   rule, so it lives with it: the shell's `<main>` is `.app-shell__main`. */
+@media (max-width: 640px) {
+  body > main {
+    padding: 32px 16px;
+  }
+}
+
 h1 {
   margin: 0 0 16px;
   font-size: 24px;
@@ -201,7 +209,7 @@ body > main [role="alert"]:empty {
   position: fixed;
   inset: 0 auto 0 0;
   margin: 0;
-  width: min(var(--shell-sidebar), 82vw);
+  width: min(var(--shell-sidebar), var(--sheet-max-viewport));
   max-width: 100vw;
   height: 100dvh;
   max-height: 100dvh;
@@ -283,31 +291,12 @@ body > main [role="alert"]:empty {
   margin-left: auto;
 }
 
-/* The icon rail (R-M2): labels stay in the accessibility tree, on screen only the glyph. */
-.app-shell--rail .app-shell__nav--sidebar .app-shell__brand {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip-path: inset(50%);
-  white-space: nowrap;
-  border: 0;
-}
-
-.app-shell--rail .app-shell__nav--sidebar .app-shell__nav-label {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip-path: inset(50%);
-  white-space: nowrap;
-  border: 0;
-}
-
+/*
+ * The icon rail (R-M2): labels stay in the accessibility tree, on screen only the
+ * glyph. The shell adds the shared `.visually-hidden` utility to the brand and the
+ * labels while the rail is collapsed, so the recipe exists once and this section
+ * carries no geometry of its own.
+ */
 .app-shell--rail .app-shell__nav--sidebar .app-shell__nav-link,
 .app-shell--rail .app-shell__nav--sidebar .app-shell__nav-head {
   justify-content: center;
@@ -445,7 +434,7 @@ body > main [role="alert"]:empty {
   position: absolute;
   right: 0;
   top: calc(100% + var(--space-1));
-  min-width: 200px;
+  min-width: var(--menu-min-width);
   padding: var(--space-1);
   background: var(--popover);
   color: var(--popover-foreground);
@@ -469,7 +458,7 @@ body > main [role="alert"]:empty {
  */
 .app-palette {
   width: min(var(--surface-max-width), calc(100vw - var(--space-8)));
-  margin: 12vh auto auto;
+  margin: var(--palette-offset-block) auto auto;
   padding: var(--space-4);
   color: var(--foreground);
   border: var(--border-width) solid var(--border);
@@ -503,7 +492,7 @@ body > main [role="alert"]:empty {
   list-style: none;
   margin: var(--space-2) 0 0;
   padding: 0;
-  max-height: 50vh;
+  max-height: var(--palette-list-max-height);
   overflow-y: auto;
 }
 
@@ -573,7 +562,7 @@ body > main [role="alert"]:empty {
   }
 
   .app-shell__owner > summary {
-    max-width: 40vw;
+    max-width: var(--menu-label-max-width);
     overflow: hidden;
     white-space: nowrap;
   }
@@ -582,12 +571,6 @@ body > main [role="alert"]:empty {
   .app-shell__footer,
   .app-shell__main {
     padding-inline: var(--space-3);
-  }
-}
-
-@media (max-width: 640px) {
-  body > main {
-    padding: 32px 16px;
   }
 }
 

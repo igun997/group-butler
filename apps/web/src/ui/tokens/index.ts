@@ -49,8 +49,20 @@ export const TARGET = { min: 24 } as const;
 /** Modal surfaces (§3.2), in px: the width the palette and a sheet stop growing at. */
 export const SURFACE = { maxWidth: 560 } as const;
 
-/** A bottom sheet's own cap (§3.2): it never covers the workspace it was opened from. */
-export const SHEET = { maxHeight: "80dvh" } as const;
+/**
+ * A sheet's own cap (§3.2): it never stands taller than most of the viewport it
+ * was opened in, and on a phone it leaves the workspace visible beside it.
+ */
+export const SHEET = { maxHeight: "80dvh", maxViewport: "82vw" } as const;
+
+/**
+ * The command palette's geometry (§3.2): how far it sits from the top edge, and
+ * how tall its list grows before it scrolls.
+ */
+export const PALETTE = { offsetBlock: "12vh", listMaxHeight: "50vh" } as const;
+
+/** The owner menu's width, and how much of a phone the owner's address may take before it truncates. */
+export const MENU = { minWidth: 200, labelMaxWidth: "40vw" } as const;
 
 /**
  * The two viewport boundaries the chrome collapses at and the toasts move at

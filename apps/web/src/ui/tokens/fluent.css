@@ -119,6 +119,18 @@
   --sheet-max-height: 80dvh;
 
   /*
+   * Overlay geometry (§3.2). The palette's distance from the top edge and the
+   * height its list reaches before it scrolls; the share of a small viewport a
+   * side sheet may take; and the owner menu's own width. Each is one decision, so
+   * each is a name rather than a literal in the rule that happens to need it.
+   */
+  --palette-offset-block: 12vh;
+  --palette-list-max-height: 50vh;
+  --sheet-max-viewport: 82vw;
+  --menu-min-width: 200px;
+  --menu-label-max-width: 40vw;
+
+  /*
    * The scrim every modal layer's backdrop uses (§3.3). It is the backdrop
    * colour at the one opacity the decision allows, defined once so a sheet, a
    * dialog, and the palette cannot each pick their own tint.

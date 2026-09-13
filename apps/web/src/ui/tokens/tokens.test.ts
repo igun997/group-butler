@@ -3,7 +3,9 @@ import { describe, expect, test } from "vitest";
 import {
   BREAKPOINT,
   FOCUS,
+  MENU,
   MOTION,
+  PALETTE,
   RADIUS,
   ROW_HEIGHT,
   SHEET,
@@ -137,6 +139,12 @@ describe("token layer (spec §3.2)", () => {
     for (const [name, value] of Object.entries(SHEET)) {
       expect(light.get(asToken(`--sheet-${name}`))).toBe(value);
     }
+    // The palette's offset and list cap, the owner menu's width, and how much of
+    // a phone the owner's address may take are named for the same reason.
+    expect(light.get("--palette-offset-block")).toBe(PALETTE.offsetBlock);
+    expect(light.get("--palette-list-max-height")).toBe(PALETTE.listMaxHeight);
+    expect(light.get("--menu-min-width")).toBe(`${MENU.minWidth}px`);
+    expect(light.get("--menu-label-max-width")).toBe(MENU.labelMaxWidth);
     for (const [name, px] of Object.entries(BREAKPOINT)) {
       expect(light.get(asToken(`--breakpoint-${name}`))).toBe(`${px}px`);
     }
@@ -154,6 +162,55 @@ describe("token layer (spec §3.2)", () => {
     const still = declarations(css, ":root", "@media (prefers-reduced-motion: reduce)");
     expect([...still.keys()]).toEqual(Object.entries(MOTION.duration).map(([name]) => `--motion-duration-${name}`));
     for (const ms of still.values()) expect(ms).toBe("0ms");
+  });
+
+  /*
+   * P0's stated proof — "every value consumed by name, no raw hex or px" — was a
+   * grep over the components, and a grep is not a gate. This is that proof as a
+   * test over the shell's and the spine's own sources, so a hand-written colour or
+   * pixel length fails the suite instead of a reviewer's eye.
+   */
+  test("the shell and spine components name their values instead of writing them", () => {
+    const sources = [
+      "../../components/app-shell.tsx",
+      "../../components/command-palette.tsx",
+      "../../components/toaster.tsx",
+      "../../components/scope-spine.tsx",
+      "../../components/jid-cell.tsx",
+      "../../components/group-name-cell.tsx",
+      "../../components/state-badges.tsx",
+    ] as const;
+    const raw = /#[0-9a-fA-F]{3,8}\b|\b\d+(\.\d+)?px\b/g;
+
+    for (const source of sources) {
+      const component = readFileSync(new URL(source, import.meta.url), "utf8");
+      expect([source, component.match(raw) ?? []]).toEqual([source, []]);
+    }
+  });
+
+  /*
+   * And the same rule for the stylesheets the shell and the spine own (§2.2
+   * invariant 5: the surfaces are the token layer's consumers). The scanned
+   * region is the P1 banner through the end of the file — the shell's chrome and
+   * the P2 scope spine — with comments and media preludes removed, because the
+   * breakpoint test above already governs those. Anything else that is not a
+   * `var(--…)` reference or a full-bleed declaration is a value that belongs in
+   * the token layer.
+   */
+  test("the shell and spine stylesheets write no layout value of their own", () => {
+    const css = readFileSync(new URL("../../app/globals.css", import.meta.url), "utf8");
+    const surfaces = css
+      .slice(css.indexOf("P1 — the one shell"))
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/@media[^{]+/g, "");
+
+    const length = /(?<![\w-])\d*\.?\d+(px|rem|em|ch|ex|vh|vw|vmin|vmax|dvh|dvw|%)(?![\w-])/g;
+    const fullBleed = /^100(vh|vw|dvh|dvw|%)$/;
+    const literals = [...surfaces.matchAll(length)].map((match) => match[0]);
+
+    // The scan has something to look at, so a renamed banner cannot pass it.
+    expect(literals.length).toBeGreaterThan(0);
+    expect(literals.filter((value) => !fullBleed.test(value))).toEqual([]);
   });
 
   /*
