@@ -53,40 +53,43 @@ const (
 const subjectHistoryMax = 20
 
 // SubjectHistoryEntry is one superseded name: what it was, WhatsApp's own stamp
-// for it, and who set it.
+// for it, and who set it. The tags are the §5.1 ring spelling.
 type SubjectHistoryEntry struct {
-	Name string
-	At   time.Time
-	By   string
+	Name string    `bson:"name"`
+	At   time.Time `bson:"at"`
+	By   string    `bson:"by"`
 }
 
 // Observed is the worker-owned half of a `groups` document (§5.1) in Go form.
-// The BFF's `config.*` is deliberately absent: the worker never writes it.
+// The BFF's `config.*` is deliberately absent: the worker never writes it. The
+// bson tags are the decode spelling of §5.1; the write path spells the same keys
+// as dotted `$set` entries in groupstore.go, where the ingest-owned counters are
+// filtered out.
 type Observed struct {
-	Subject               string
-	SubjectSearch         string
-	SubjectUpdatedAt      time.Time
-	SubjectObservedAt     time.Time
-	SubjectSetBy          string
-	SubjectSetByLID       string
-	SubjectSource         SubjectSource
-	SubjectHistory        []SubjectHistoryEntry
-	Topic                 string
-	TopicUpdatedAt        time.Time
-	IsAnnounce            bool
-	IsLocked              bool
-	IsEphemeral           bool
-	IsDefaultSubGroup     bool
-	ParticipantCount      int
-	ParticipantCountDirty bool
-	GroupCreatedAt        time.Time
-	State                 GroupState
-	LastActivityAt        time.Time
-	MessageCount          int
-	MediaStored           int
-	LastSyncedAt          time.Time
-	LastSyncSource        SyncSource
-	LeftDetectedAt        time.Time
+	Subject               string                `bson:"subject"`
+	SubjectSearch         string                `bson:"subjectSearch"`
+	SubjectUpdatedAt      time.Time             `bson:"subjectUpdatedAt"`
+	SubjectObservedAt     time.Time             `bson:"subjectObservedAt"`
+	SubjectSetBy          string                `bson:"subjectSetBy"`
+	SubjectSetByLID       string                `bson:"subjectSetByLid"`
+	SubjectSource         SubjectSource         `bson:"subjectSource"`
+	SubjectHistory        []SubjectHistoryEntry `bson:"subjectHistory"`
+	Topic                 string                `bson:"topic"`
+	TopicUpdatedAt        time.Time             `bson:"topicUpdatedAt"`
+	IsAnnounce            bool                  `bson:"isAnnounce"`
+	IsLocked              bool                  `bson:"isLocked"`
+	IsEphemeral           bool                  `bson:"isEphemeral"`
+	IsDefaultSubGroup     bool                  `bson:"isDefaultSubGroup"`
+	ParticipantCount      int                   `bson:"participantCount"`
+	ParticipantCountDirty bool                  `bson:"participantCountDirty"`
+	GroupCreatedAt        time.Time             `bson:"groupCreatedAt"`
+	State                 GroupState            `bson:"state"`
+	LastActivityAt        time.Time             `bson:"lastActivityAt"`
+	MessageCount          int                   `bson:"messageCount"`
+	MediaStored           int                   `bson:"mediaStored"`
+	LastSyncedAt          time.Time             `bson:"lastSyncedAt"`
+	LastSyncSource        SyncSource            `bson:"lastSyncSource"`
+	LeftDetectedAt        time.Time             `bson:"leftDetectedAt"`
 }
 
 // subjectUpdate is the name state the acceptance rule needs: the value,
