@@ -51,6 +51,7 @@ type lifecycleHealth struct {
 	Applied   int64  `json:"applied"`
 	Failed    int64  `json:"failed"`
 	Abandoned int64  `json:"abandoned"`
+	Rejected  int64  `json:"rejected"`
 	Stopped   bool   `json:"stopped"`
 	Error     string `json:"error,omitempty"`
 }
@@ -151,6 +152,7 @@ func (a *api) handleHealth(w http.ResponseWriter, r *http.Request) {
 			Applied:   a.lifecycle.Applied(),
 			Failed:    a.lifecycle.Failed(),
 			Abandoned: a.lifecycle.Abandoned(),
+			Rejected:  a.lifecycle.Rejected(),
 			Stopped:   a.lifecycle.Stopped(),
 		}
 		switch {
@@ -164,6 +166,11 @@ func (a *api) handleHealth(w http.ResponseWriter, r *http.Request) {
 			// reconcile repairs them, but the state is degraded until then.
 			body.OK = false
 			body.Lifecycle.Error = "lifecycle transitions were abandoned"
+		case body.Lifecycle.Rejected > 0:
+			// Transitions arrived after admission closed: their rows stay stale
+			// until the next start reconciles them, so this is not healthy.
+			body.OK = false
+			body.Lifecycle.Error = "lifecycle transitions were rejected"
 		case body.Lifecycle.Depth >= lifecycleWarnDepth:
 			// Lifecycle transitions are rare, so a backlog this deep means the
 			// consumer is stalled, not merely busy.

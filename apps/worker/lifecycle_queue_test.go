@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -141,5 +142,74 @@ func TestLifecycleQueueReportsTransitionsItCouldNotApply(t *testing.T) {
 	}
 	if q.Abandoned() != 1 {
 		t.Errorf("abandoned = %d, want 1 (reported, not silently dropped)", q.Abandoned())
+	}
+}
+
+// TestLifecycleQueueRejectsTransitionsAfterAdmissionCloses is the P1: a
+// transition that arrives after the drain finished must be rejected and
+// accounted, never appended to a queue nothing will consume.
+func TestLifecycleQueueRejectsTransitionsAfterAdmissionCloses(t *testing.T) {
+	q := newLifecycleQueue()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// The consumer shuts down with nothing queued: admission closes.
+	q.run(ctx, testManagerWithDeps(newFakeGroupStore(), nil, nil))
+
+	if !q.Stopped() {
+		t.Fatal("admission must be closed once the consumer has stopped")
+	}
+	if q.enqueue(okJob{}) {
+		t.Fatal("a transition was accepted after admission closed")
+	}
+	if got := q.Rejected(); got != 1 {
+		t.Fatalf("rejected = %d, want 1 (accounted, not silently appended)", got)
+	}
+	if got := q.Depth(); got != 0 {
+		t.Fatalf("depth = %d, want 0 (a post-close transition must not be appended)", got)
+	}
+}
+
+// TestLifecycleQueueConcurrentHandoffAccountsForEveryTransition exercises the
+// exact handoff the P1 describes — a producer passes the ctx check, shutdown
+// closes admission, then the producer enqueues — and asserts no transition can
+// be accepted without being accounted for.
+func TestLifecycleQueueConcurrentHandoffAccountsForEveryTransition(t *testing.T) {
+	q := newLifecycleQueue()
+	var applied, attempts, accepted atomic.Int64
+	mgr := testManagerWithDeps(newFakeGroupStore(), nil, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); q.run(ctx, mgr) }()
+
+	var producers sync.WaitGroup
+	for range 8 {
+		producers.Add(1)
+		go func() {
+			defer producers.Done()
+			for range 250 {
+				attempts.Add(1)
+				if q.enqueue(countingTransition{&applied}) {
+					accepted.Add(1)
+				}
+			}
+		}()
+	}
+	// Close admission while producers are still enqueueing.
+	time.Sleep(time.Millisecond)
+	cancel()
+	producers.Wait()
+	<-done
+
+	if q.Depth() != 0 {
+		t.Fatalf("depth = %d, want 0 after shutdown", q.Depth())
+	}
+	if got := accepted.Load(); got != applied.Load()+q.Failed()+q.Abandoned() {
+		t.Fatalf("accepted = %d but applied=%d failed=%d abandoned=%d: a transition was accepted unaccounted",
+			got, applied.Load(), q.Failed(), q.Abandoned())
+	}
+	if got := attempts.Load(); got != accepted.Load()+q.Rejected() {
+		t.Fatalf("attempts = %d but accepted=%d rejected=%d: an attempt vanished",
+			got, accepted.Load(), q.Rejected())
 	}
 }

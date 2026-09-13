@@ -416,6 +416,11 @@ type lifecycleQueue struct {
 
 	abandonOnce sync.Once
 	abandoned   atomic.Int64
+
+	// rejected counts transitions that arrived after admission closed. They are
+	// the one case where a control-plane transition is not applied, and they are
+	// always visible: /health degrades and the next start reconciles the row.
+	rejected atomic.Int64
 }
 
 func newLifecycleQueue() *lifecycleQueue {
@@ -425,13 +430,22 @@ func newLifecycleQueue() *lifecycleQueue {
 	}
 }
 
-// enqueue never blocks and never drops. A transition is retained in memory until
-// a consumer applies it.
-func (q *lifecycleQueue) enqueue(job persistJob) {
+// enqueue never blocks. It returns false when admission has closed — a
+// transition that arrives after the drain finished is *rejected and counted*,
+// never appended to a queue that nothing will consume. Acceptance and the stop
+// share the lock, so the handoff (producer passes a liveness check, shutdown
+// closes admission, producer enqueues) can never lose a transition silently.
+func (q *lifecycleQueue) enqueue(job persistJob) bool {
 	if q == nil {
-		return
+		return false
 	}
 	q.mu.Lock()
+	if q.stopped {
+		q.mu.Unlock()
+		q.rejected.Add(1)
+		logf("lifecycle transition %T rejected after admission closed; /health is degraded and the next start reconciles the row", job)
+		return false
+	}
 	q.jobs = append(q.jobs, job)
 	depth := len(q.jobs)
 	q.mu.Unlock()
@@ -442,6 +456,7 @@ func (q *lifecycleQueue) enqueue(job persistJob) {
 	case q.notify <- struct{}{}:
 	default:
 	}
+	return true
 }
 
 // stop closes admission. It does not discard anything: what is already queued is
@@ -595,6 +610,14 @@ func (q *lifecycleQueue) Abandoned() int64 {
 		return 0
 	}
 	return q.abandoned.Load()
+}
+
+// Rejected is the number of transitions that arrived after admission closed.
+func (q *lifecycleQueue) Rejected() int64 {
+	if q == nil {
+		return 0
+	}
+	return q.rejected.Load()
 }
 
 func (q *persistQueue) Depth() int {

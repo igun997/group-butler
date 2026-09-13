@@ -340,9 +340,12 @@ func (m *manager) enqueuePersist(job persistJob) {
 	m.persist.enqueue(job)
 }
 
-// enqueueLifecycle queues an ordered instance transition.
-func (m *manager) enqueueLifecycle(job persistJob) {
-	m.lifecycle.enqueue(job)
+// enqueueLifecycle queues an ordered instance transition. A false result means
+// admission had already closed: the queue has counted it, /health is degraded
+// and the next start reconciles the row, so the caller has a deterministic
+// outcome rather than a silently lost transition.
+func (m *manager) enqueueLifecycle(job persistJob) bool {
+	return m.lifecycle.enqueue(job)
 }
 
 func (m *manager) get(id string) *session {

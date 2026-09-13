@@ -205,3 +205,28 @@ func TestHealthIsUnavailableWhenTheLifecycleConsumerStalls(t *testing.T) {
 		t.Error("a degraded lifecycle must say why")
 	}
 }
+
+// TestHealthIsUnavailableWhenTransitionsWereRejected closes the P1 loop: a
+// transition that arrived after admission closed must degrade health, so the
+// stale row it leaves behind is never invisible.
+func TestHealthIsUnavailableWhenTransitionsWereRejected(t *testing.T) {
+	lifecycle := newLifecycleQueue()
+	lifecycle.stop()
+	if lifecycle.enqueue(okJob{}) {
+		t.Fatal("a transition was accepted after admission closed")
+	}
+	a := &api{
+		secret:    "dev-secret",
+		ping:      func(context.Context) error { return nil },
+		queue:     newIngestQueue(4, 0, 0),
+		lifecycle: lifecycle,
+	}
+
+	code, body := healthBody(t, a)
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 after a rejected transition", code)
+	}
+	if body.Lifecycle.Rejected != 1 || body.Lifecycle.Error == "" {
+		t.Errorf("lifecycle = %+v, want a rejected count and a reason", body.Lifecycle)
+	}
+}
