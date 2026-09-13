@@ -1,40 +1,22 @@
 /*
- * Baseline styles for the app root and the sign-in page. The dashboard of
- * docs/ui-decision.md is not built, so this file holds only what those two
- * operator-facing pages need: the §3.2 type ramp steps and 4 px grid, the shadcn
- * semantic tokens of §3.1 in both shipped themes, the 2 px focus ring, and the
- * form controls `app/login` uses. Nothing here is a second UI system; the
- * dashboard brings its own token layer (P0) and this baseline is the floor it
- * replaces.
+ * The token layer and the baseline styles the app root and the sign-in page
+ * need. `fluent.css` is docs/ui-decision.md P0: the shadcn semantic tokens of
+ * §3.1 in both shipped themes (§3.4), the §3.2 type ramp, 4 px grid, elevation,
+ * motion, focus and acrylic vocabulary. It is the only place in the app that
+ * defines a colour.
  *
- * Dial for these pages: ENERGY 1 / RHYTHM 1 / MOTION 1. They are a status
- * baseline and a door, reached by an operator checking a container, not a
- * workspace. The UI decision has not fixed an accent hue yet, so the accent slot
- * is the focus ring rather than a colour invented here; the single link is
- * `--foreground` plus an underline, and the form failure is text, so neither
- * depends on colour alone (§4.6 R-A3).
+ * What is left here is the pre-shell baseline: how the two operator-facing pages
+ * that exist before the dashboard (a status page and a door) lay their content
+ * out, and the form controls `app/login` uses. This is the floor P1 replaces —
+ * nothing here is a second UI system, and no value here is outside the token
+ * layer it imports.
+ *
+ * Dial for these pages: ENERGY 1 / RHYTHM 1 / MOTION 1. The UI decision has not
+ * fixed an accent hue yet, so the accent slot is the focus ring rather than a
+ * colour invented here; the single link is `--foreground` plus an underline, and
+ * the form failure is text, so neither depends on colour alone (§4.6 R-A3).
  */
-:root {
-  color-scheme: light dark;
-
-  --background: #ffffff;
-  --foreground: #18181b;
-  --muted: #f4f4f5;
-  --muted-foreground: #52525b;
-  --border: #d4d4d8;
-  --ring: #18181b;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #09090b;
-    --foreground: #fafafa;
-    --muted: #18181b;
-    --muted-foreground: #a1a1aa;
-    --border: #27272a;
-    --ring: #fafafa;
-  }
-}
+@import "../ui/tokens/fluent.css";
 
 * {
   box-sizing: border-box;
@@ -44,8 +26,7 @@ body {
   margin: 0;
   background: var(--background);
   color: var(--foreground);
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
-    sans-serif;
+  font-family: var(--font-ui);
   font-size: 16px;
   line-height: 24px;
 }
@@ -91,7 +72,7 @@ dd {
 }
 
 code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 13px;
   font-variant-numeric: tabular-nums;
   background: var(--muted);
@@ -155,12 +136,6 @@ button:disabled {
 /* Mounted empty so the message is announced when it arrives. */
 [role="alert"]:empty {
   display: none;
-}
-
-:focus-visible {
-  outline: 2px solid var(--ring);
-  outline-offset: 1px;
-  border-radius: 4px;
 }
 
 footer {

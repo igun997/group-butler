@@ -1,0 +1,272 @@
+/*
+ * P0 — the token layer of docs/ui-decision.md §3.2.
+ *
+ * Two things live here and nothing else:
+ *
+ *   1. The shadcn semantic colour tokens (§3.1/§3.4) — the only colour source in
+ *      the application, defined once per shipped theme. No component reads a raw
+ *      colour and no component branches on the theme.
+ *   2. The Fluent-derived vocabulary §3.2 names: the 4 px spatial grid, radii,
+ *      row heights, shell chrome, the type ramp, elevation, borders and the
+ *      reveal transition, motion, the focus rectangle, and the acrylic material
+ *      with its opaque fallback.
+ *
+ * Components and views consume these names, which is what keeps a raw colour,
+ * length, or curve out of the component tree. The numeric tables are mirrored in
+ * TypeScript (`ui/tokens/{index,type-ramp,shadow,motion}.ts`) for React-side
+ * consumers; `tokens.test.ts` fails if the two sources drift apart.
+ */
+
+/* Light — the reference theme (§3.4): what an OS set to light receives. */
+:root {
+  color-scheme: light;
+
+  /*
+   * shadcn semantic colour tokens (§3.1, §3.4). Both themes declare every name,
+   * so a component cannot exist in only one of them.
+   */
+  --background: #ffffff;
+  --foreground: #18181b;
+  --card: #ffffff;
+  --card-foreground: #18181b;
+  --popover: #ffffff;
+  --popover-foreground: #18181b;
+  --primary: #18181b;
+  --primary-foreground: #fafafa;
+  --secondary: #f4f4f5;
+  --secondary-foreground: #18181b;
+  --muted: #f4f4f5;
+  --muted-foreground: #52525b;
+  --accent: #f4f4f5;
+  --accent-foreground: #18181b;
+  --destructive: #dc2626;
+  --destructive-foreground: #ffffff;
+  --border: #d4d4d8;
+  --input: #d4d4d8;
+  --ring: #18181b;
+
+  /*
+   * Type face (§3.2). The stack carries its own fallbacks; a bundled fallback
+   * face is a font asset, not a token, and this decision ships none.
+   * Identifiers — JIDs, `waMessageId`, group IDs, token counts — use the
+   * monospace face with `tabular-nums`.
+   */
+  --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* Spatial: the 4 px grid, keyed by grid units — `--space-4` is 16 px. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
+
+  /* Radius: elevation and radius move together; the sheet radius is top-only. */
+  --radius-control: 4px;
+  --radius-panel: 8px;
+  --radius-dialog: 12px;
+  --radius-sheet-top: 16px;
+
+  /* Table row heights. Comfortable is the default; compact is the operator's choice. */
+  --row-height-comfortable: 40px;
+  --row-height-compact: 32px;
+  --row-height-header: 36px;
+
+  /* Shell chrome: the three orientation regions. */
+  --shell-header: 48px;
+  --shell-spine: 40px;
+  --shell-sidebar: 240px;
+  --shell-rail: 48px;
+
+  /* The labelled type ramp of §3.2, step for step. */
+  --type-caption-size: 12px;
+  --type-caption-line: 16px;
+  --type-caption-weight: 400;
+  --type-body-size: 14px;
+  --type-body-line: 20px;
+  --type-body-weight: 400;
+  --type-body-strong-size: 14px;
+  --type-body-strong-line: 20px;
+  --type-body-strong-weight: 600;
+  --type-subtitle-size: 16px;
+  --type-subtitle-line: 22px;
+  --type-subtitle-weight: 600;
+  --type-title3-size: 20px;
+  --type-title3-line: 26px;
+  --type-title3-weight: 600;
+  --type-title2-size: 24px;
+  --type-title2-line: 32px;
+  --type-title2-weight: 600;
+  --type-display-size: 28px;
+  --type-display-line: 36px;
+  --type-display-weight: 600;
+
+  /*
+   * Elevation, keyed by its own step (§3.2). Depth carries meaning: 16 is a
+   * panel on hover or focus, and a dialog; 28 is the command palette and sheets
+   * only. Nothing floats at rest — the page is flat and its regions are
+   * separated by space and a single hairline (§3.3).
+   */
+  --elevation-4: 0 2px 4px rgb(0 0 0 / .14), 0 0 2px rgb(0 0 0 / .12);
+  --elevation-8: 0 4px 8px rgb(0 0 0 / .14), 0 0 2px rgb(0 0 0 / .12);
+  --elevation-16: 0 8px 16px rgb(0 0 0 / .14), 0 0 2px rgb(0 0 0 / .12);
+  --elevation-28: 0 14px 28px rgb(0 0 0 / .24), 0 0 8px rgb(0 0 0 / .20);
+
+  /*
+   * Borders and the Fluent reveal (§3.2): a card is stroke-only at rest, and the
+   * border is dropped as the elevation appears. The transition moves
+   * `border-color`, never `border-width`, so the box keeps its geometry.
+   */
+  --border-width: 1px;
+  --reveal-transition: border-color var(--motion-duration-state) var(--motion-curve-standard),
+    box-shadow var(--motion-duration-state) var(--motion-curve-standard);
+
+  /* Motion: feedback only, never longer than 300 ms. */
+  --motion-duration-state: 100ms;
+  --motion-duration-enter: 150ms;
+  --motion-duration-panel: 200ms;
+  --motion-duration-sheet: 300ms;
+  --motion-curve-standard: cubic-bezier(.33,0,.67,1);
+  --motion-curve-decelerate: cubic-bezier(0,0,0,1);
+  --motion-curve-accelerate: cubic-bezier(1,0,1,1);
+
+  /* Focus: 2 px ring at a 1 px offset, two-tone (R-A4). */
+  --focus-ring-width: 2px;
+  --focus-ring-offset: 1px;
+  --focus-inner: var(--foreground);
+  --focus-outer: var(--ring);
+  /*
+   * The neutral inner line as a shadow layer, so a surface that lifts on focus
+   * composes rather than replaces it:
+   * `box-shadow: var(--elevation-16), var(--focus-inner-line)`.
+   */
+  --focus-inner-line: 0 0 0 var(--focus-ring-offset) var(--focus-inner);
+
+  /*
+   * Acrylic (§3.2): the command palette and sheets only. The tint derives from
+   * the theme's own popover surface, and the fallback is that surface opaque, so
+   * neither is authored for one theme.
+   */
+  --acrylic-blur: 30px;
+  --acrylic-saturate: 125%;
+  --acrylic-tint: color-mix(in srgb, var(--popover) 85%, transparent);
+  --acrylic-fallback: var(--popover);
+}
+
+/*
+ * Dark — a fully supported peer, not a recoloured afterthought (§3.4). One
+ * `.dark` class on the document root flips these names, and an OS set to dark
+ * gets the same set with no class at all; an explicit light override adds
+ * `.light`, which excludes the OS match. The block is written twice because CSS
+ * has no way to say "media query or class" in one selector — the duplication is
+ * the contract and `tokens.test.ts` holds the two copies identical.
+ */
+@media (prefers-color-scheme: dark) {
+  :root:not(.light) {
+    color-scheme: dark;
+
+    --background: #09090b;
+    --foreground: #fafafa;
+    --card: #09090b;
+    --card-foreground: #fafafa;
+    --popover: #09090b;
+    --popover-foreground: #fafafa;
+    --primary: #fafafa;
+    --primary-foreground: #18181b;
+    --secondary: #18181b;
+    --secondary-foreground: #fafafa;
+    --muted: #18181b;
+    --muted-foreground: #a1a1aa;
+    --accent: #27272a;
+    --accent-foreground: #fafafa;
+    --destructive: #f87171;
+    --destructive-foreground: #09090b;
+    --border: #27272a;
+    --input: #27272a;
+    --ring: #fafafa;
+  }
+}
+
+:root.dark {
+  color-scheme: dark;
+
+  --background: #09090b;
+  --foreground: #fafafa;
+  --card: #09090b;
+  --card-foreground: #fafafa;
+  --popover: #09090b;
+  --popover-foreground: #fafafa;
+  --primary: #fafafa;
+  --primary-foreground: #18181b;
+  --secondary: #18181b;
+  --secondary-foreground: #fafafa;
+  --muted: #18181b;
+  --muted-foreground: #a1a1aa;
+  --accent: #27272a;
+  --accent-foreground: #fafafa;
+  --destructive: #f87171;
+  --destructive-foreground: #09090b;
+  --border: #27272a;
+  --input: #27272a;
+  --ring: #fafafa;
+}
+
+/*
+ * Motion floor (R-L7, R-A9). Consumers read the durations, so zeroing them
+ * switches every consumer off at once and no geometry moves: the enter/exit and
+ * elevation wake are absent, and a shimmer degrades to its static block.
+ */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-duration-state: 0ms;
+    --motion-duration-enter: 0ms;
+    --motion-duration-panel: 0ms;
+    --motion-duration-sheet: 0ms;
+  }
+}
+
+/*
+ * Focus (R-A4): one treatment everywhere — a 2 px `--ring` outline at a 1 px
+ * offset, with the neutral inner line in the offset gap. It is a line, never a
+ * fill and never a border, and it is removed by nothing.
+ */
+:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-outer);
+  outline-offset: var(--focus-ring-offset);
+  box-shadow: var(--focus-inner-line);
+}
+
+/*
+ * The acrylic material (§3.2), for the command palette and sheets only. The
+ * material is the tint plus the blur; every other surface stays opaque.
+ */
+.acrylic {
+  --_acrylic-material: var(--acrylic-tint);
+  --_acrylic-filter: blur(var(--acrylic-blur)) saturate(var(--acrylic-saturate));
+
+  background: var(--_acrylic-material);
+  -webkit-backdrop-filter: var(--_acrylic-filter);
+  backdrop-filter: var(--_acrylic-filter);
+}
+
+/*
+ * Opaque fallback (§3.2, R-A9), always defined: `prefers-reduced-transparency`
+ * replaces the material with the opaque surface at the same elevation (the
+ * elevation is the consumer's shadow and is untouched here), and a viewport
+ * that cannot blur gets the same treatment rather than an unreadable tint.
+ */
+@media (prefers-reduced-transparency: reduce) {
+  .acrylic {
+    --_acrylic-material: var(--acrylic-fallback);
+    --_acrylic-filter: none;
+  }
+}
+
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .acrylic {
+    --_acrylic-material: var(--acrylic-fallback);
+    --_acrylic-filter: none;
+  }
+}
