@@ -587,6 +587,8 @@ greps the script, so the suite stays valid under refactoring.
 | 9 | `preserves a child's failure exit code and stops the sibling` | launcher exits with the child's status, the sibling process is gone, and it observed the forwarded signal |
 | 10 | `forwards signals to both children and leaves docker running by default` | both children signal, exit 130, `infra left running`, no `compose down` |
 | 11 | `DEV_STOP_INFRA=1 tears the infra down on exit` | `compose down` runs on exit and is reported |
+| 12 | `--no-infra with DEV_STOP_INFRA=1 never invokes docker` | zero docker invocations and no teardown messaging — a run that did not start infra must never stop one |
+| 13 | `--no-infra needs no docker binary at all` | with no docker on `PATH` the child's status still propagates and no teardown is attempted |
 
 Two launcher invariants this suite pinned down (both fixed in the implementation, and mirrored in the
 architecture draft §14.5): shutdown liveness must come from the job table (`jobs -rp`, redirected to a
@@ -803,9 +805,11 @@ cleanup() {
   wait 2>/dev/null || true
   rm -rf "$RUNDIR"
 
-  # Docker is only stopped when explicitly opted in: re-initialising the replica
-  # set on every Ctrl-C would waste the operator's time.
-  if [[ "${DEV_STOP_INFRA:-0}" == "1" ]]; then
+  # Docker is only stopped when this run actually started it AND teardown was
+  # explicitly opted into: re-initialising the replica set on every Ctrl-C would
+  # waste the operator's time, and a --no-infra run must never stop a stack that
+  # belongs to whoever started it.
+  if [[ "$START_INFRA" == "1" && "${DEV_STOP_INFRA:-0}" == "1" ]]; then
     log "stopping infra (DEV_STOP_INFRA=1)"
     compose down || true
   elif [[ "$START_INFRA" == "1" ]]; then
@@ -847,7 +851,7 @@ exit "$child_status"
 **Step 5: Run the tests to verify they pass**
 
 Run: `chmod +x scripts/dev.sh && bash -n scripts/dev.sh && bun test scripts/dev.test.ts`
-Expected: `bash -n` clean; 11 pass / 0 fail (40 assertions) in well under a second.
+Expected: `bash -n` clean; 13 pass / 0 fail (47 assertions) in well under a second.
 
 **Step 6: Acceptance — `--check`**
 
@@ -866,7 +870,8 @@ Expected: `exit=1` and stderr containing `run: cp .env.example .env`.
 **Step 7: Acceptance — prefixed logs and clean shutdown**
 
 Run: `bash -c 'DEV_STOP_INFRA=1 timeout -s INT 20 bun run dev:local; echo "exit=$?"'`
-Expected: `[dev] r2 ok …`, `[dev] config: …`, `[dev] starting infra (mongodb replica set) …`, `[dev] waiting for the mongodb replica set...`, `[dev] started [web] pid=…`, `[dev] started [worker] pid=…`, then the prefixed child output (the children fail at this point because the apps do not exist yet — Task 17), then `[dev] shutting down …` and `[dev] stopping infra (DEV_STOP_INFRA=1)`. Afterwards `pgrep -f 'go run ./...'` prints nothing and `docker compose -f infra/dev/docker-compose.yml ps` shows no containers. This acceptance is re-run for real at Task 25.
+Expected: `[dev] r2 ok …`, `[dev] config: …`, `[dev] starting infra (mongodb replica set) …`, `[dev] waiting for the mongodb replica set...`, `[dev] started [web] pid=…`, `[dev] started [worker] pid=…`, then the prefixed child output (the children fail at this point because the apps do not exist yet — Task 17), then `[dev] shutting down …` and `[dev] stopping infra (DEV_STOP_INFRA=1)` — teardown happens only
+because this run started infra; a `--no-infra` run never stops a stack it did not start. Afterwards `pgrep -f 'go run ./...'` prints nothing and `docker compose -f infra/dev/docker-compose.yml ps` shows no containers. This acceptance is re-run for real at Task 25.
 
 **Step 8: Commit**
 

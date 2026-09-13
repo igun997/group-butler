@@ -1305,7 +1305,8 @@ What the script MUST do:
    binary that `go run` spawns). On any child exiting or on the first Ctrl-C: terminate both groups
    (SIGTERM, then SIGKILL after a grace period), reap them, remove the FIFOs, and exit with the
    triggering child's status. No orphans, ever. Infra containers are left running by default
-   (restarting Mongo costs seconds and re-init risk); `DEV_STOP_INFRA=1` stops them on exit, and
+   (restarting Mongo costs seconds and re-init risk); `DEV_STOP_INFRA=1` stops them on exit — and only when that run actually started them, so
+a `--no-infra` invocation never tears down a stack it did not create — and
    `bun run dev:down` is the explicit teardown.
 4. **Fail fast with actionable messages.** Missing `.env` → print `cp .env.example .env` and exit 1.
    **R2 preflight, before anything else starts:** `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
@@ -1440,6 +1441,8 @@ write, surviving processes). No test greps the script, so the suite survives ref
 | 9 | child failure | launcher exits with the child's status, the sibling is stopped, and it observed the forwarded signal |
 | 10 | signal forwarding | both children signal, exit 130, `infra left running`, no `compose down` |
 | 11 | `DEV_STOP_INFRA=1` | `compose down` runs on exit and is reported |
+| 12 | `--no-infra` + `DEV_STOP_INFRA=1` | zero docker invocations and no teardown messaging: teardown requires that this run started infra |
+| 13 | `--no-infra` with no docker binary on `PATH` | the child's status still propagates and no teardown is attempted |
 
 Two launcher invariants these tests pinned down: shutdown liveness must come from the job table
 (`jobs -rp`, redirected to a file because a command substitution would inspect the subshell's empty

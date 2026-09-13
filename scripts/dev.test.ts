@@ -1,13 +1,33 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const repoRoot = join(import.meta.dir, "..");
 const launcherSource = join(repoRoot, "scripts/dev.sh");
 
-/** Real binaries the launcher needs; stub commands are prepended in the fixture. */
-const SYSTEM_PATH = "/usr/bin:/bin";
+/** Commands the launcher legitimately needs from the host system. */
+const SYSTEM_COMMANDS = ["bash", "env", "sed", "seq", "mktemp", "mkfifo", "rm", "sleep", "cat", "dirname", "setsid", "uname"];
+
+/**
+ * A PATH containing only these commands, so "no docker binary" really means no
+ * docker — the host's own docker must never be reachable from a test (a fixture
+ * without a docker stub previously reached the real one and ran `compose down`).
+ */
+function makeSystemPath(dir: string): string {
+  const bin = join(dir, "sysbin");
+  mkdirSync(bin, { recursive: true });
+  for (const name of SYSTEM_COMMANDS) {
+    const resolved = Bun.which(name);
+    if (!resolved) continue;
+    try {
+      symlinkSync(resolved, join(bin, name));
+    } catch {
+      // Already linked by an earlier fixture in this process; harmless.
+    }
+  }
+  return bin;
+}
 
 const fixtures: string[] = [];
 afterAll(() => {
@@ -126,7 +146,7 @@ printf '403'
 
   const env = (extra: Record<string, string> = {}) => ({
     ...process.env,
-    PATH: `${stubPath}:${SYSTEM_PATH}`,
+    PATH: `${stubPath}:${makeSystemPath(dir)}`,
     STUB_STATE: state,
     DEV_ENV_FILE: join(dir, ".env"),
     ...(opts.failWeb ? { STUB_FAIL_WEB: "1" } : {}),
@@ -351,5 +371,28 @@ describe("dev launcher: run mode", () => {
 
     await waitFor(() => fx.invocations().some((l) => l.startsWith("docker") && l.includes(" down")), "docker compose down");
     expect(res.stdout).toContain("stopping infra");
+  });
+
+  test("--no-infra with DEV_STOP_INFRA=1 never invokes docker", async () => {
+    // Teardown requires that THIS run started infra: --no-infra means the
+    // launcher never touched Docker, so it must not stop someone else's stack.
+    const fx = makeFixture({ failWeb: true });
+    const res = await collect(fx.spawn(["--no-infra"], { DEV_STOP_INFRA: "1" }));
+
+    expect(res.code).toBe(3);
+    expect(fx.invocations().filter((l) => l.startsWith("docker"))).toEqual([]);
+    expect(res.stdout).not.toContain("stopping infra");
+    expect(res.stdout).not.toContain("infra left running");
+  });
+
+  test("--no-infra needs no docker binary at all", async () => {
+    const fx = makeFixture({ stubDocker: false, failWeb: true });
+    const res = await collect(fx.spawn(["--no-infra"], { DEV_STOP_INFRA: "1" }));
+
+    // Nothing docker-related may be attempted, so no teardown messaging and the
+    // child's status survives (a docker call would surface as 127 or a warning).
+    expect(res.code).toBe(3);
+    expect(res.stdout).not.toContain("stopping infra");
+    expect(res.stdout).not.toContain("infra left running");
   });
 });

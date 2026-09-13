@@ -191,9 +191,11 @@ cleanup() {
   wait 2>/dev/null || true
   rm -rf "$RUNDIR"
 
-  # Docker is only stopped when explicitly opted in: re-initialising the replica
-  # set on every Ctrl-C would waste the operator's time.
-  if [[ "${DEV_STOP_INFRA:-0}" == "1" ]]; then
+  # Docker is only stopped when this run actually started it AND teardown was
+  # explicitly opted into: re-initialising the replica set on every Ctrl-C would
+  # waste the operator's time, and a --no-infra run must never stop a stack that
+  # belongs to whoever started it.
+  if [[ "$START_INFRA" == "1" && "${DEV_STOP_INFRA:-0}" == "1" ]]; then
     log "stopping infra (DEV_STOP_INFRA=1)"
     compose down || true
   elif [[ "$START_INFRA" == "1" ]]; then
