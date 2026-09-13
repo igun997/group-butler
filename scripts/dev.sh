@@ -176,7 +176,10 @@ cleanup() {
   local status=$?
   [[ "$CLEANED" == "1" ]] && return
   CLEANED=1
-  trap - INT TERM EXIT
+  # Repeated INT/TERM are ignored, not restored to their default action: the
+  # default disposition kills this shell mid-shutdown and abandons everything
+  # below — the escalation, the reaping, the FIFO cleanup and any teardown.
+  trap '' INT TERM
   log "shutting down"
 
   signal_children TERM

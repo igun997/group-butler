@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -38,7 +38,6 @@ const COMPLETE_ENV = [
   "ORGANIZATION_ID=org_default",
   "MONGODB_URI=mongodb://127.0.0.1:27017/group_butler?replicaSet=rs0",
   'MONGODB_DB="group butler"',
-  "MONGODB_DB_FOR_SUMMARY=unused",
   "ENVIRONMENT=development",
   "WORKER_SECRET=dev-secret",
   "PORT=4000",
@@ -60,7 +59,7 @@ interface Fixture {
   spawn: (args: string[], extraEnv?: Record<string, string>) => Bun.Subprocess<"pipe", "pipe", "pipe">;
 }
 
-function makeFixture(opts: { env?: string | null; stubDocker?: boolean; failWeb?: boolean } = {}): Fixture {
+function makeFixture(opts: { env?: string | null; stubDocker?: boolean; failWeb?: boolean; stubbornWeb?: boolean } = {}): Fixture {
   const dir = mkdtempSync(join(tmpdir(), "butler-launcher-"));
   fixtures.push(dir);
   const state = join(dir, "state");
@@ -111,9 +110,20 @@ esac
     );
   }
 
+  // A child that ignores TERM forces the launcher's bounded SIGKILL escalation, so
+  // the shutdown stays open long enough for a repeat signal to land mid-cleanup. Its
+  // own loop is bounded, so even a failed run leaves no stray process behind.
   write(
     "bun",
-    `#!/usr/bin/env bash
+    opts.stubbornWeb
+      ? `#!/usr/bin/env bash
+echo "bun $*" >> "$STUB_STATE/invocations"
+echo "$$" > "$STUB_STATE/web.pid"
+trap '' TERM INT
+echo "[web] stub bff started"
+for _ in $(seq 1 150); do sleep 0.2; done
+`
+      : `#!/usr/bin/env bash
 echo "bun $*" >> "$STUB_STATE/invocations"
 echo "$$" > "$STUB_STATE/web.pid"
 trap 'echo web-signal >> "$STUB_STATE/child_signals"; exit 143' TERM INT
@@ -333,6 +343,44 @@ describe("dev launcher: run mode", () => {
     const upFiles = readFileSyncIfPresent(join(fx.state, "up_files")) ?? "";
     expect(upFiles).toContain("infra/dev/docker-compose.yml");
   });
+
+  test("a repeated INT/TERM during cleanup cannot abort it", async () => {
+    // The stubborn web child ignores the initial TERM, so cleanup must escalate to
+    // SIGKILL, which keeps it busy long enough for the repeats to land inside the
+    // shutdown window — a developer mashing Ctrl-C, or a supervisor that follows a
+    // Ctrl-C with a TERM.
+    const fx = makeFixture({ stubbornWeb: true });
+    const tmp = join(fx.dir, "tmp");
+    mkdirSync(tmp, { recursive: true });
+    const proc = fx.spawn([], { DEV_STOP_INFRA: "1", TMPDIR: tmp });
+    await waitForFile(join(fx.state, "web.pid"), "the bff child to start");
+    await waitForFile(join(fx.state, "worker.pid"), "the worker child to start");
+    const webPid = readPid(join(fx.state, "web.pid"));
+    expect(webPid).not.toBeNull();
+
+    proc.kill("SIGINT");
+    // The worker's term trap is the observable proof that cleanup is underway and
+    // already past the point where it decides what to do with further signals.
+    await waitForFileText(join(fx.state, "child_signals"), "worker-signal");
+    proc.kill("SIGINT");
+    proc.kill("SIGTERM");
+
+    // Observing the launcher's own exit (rather than draining its pipes) matters:
+    // if it dies mid-shutdown its orphaned loggers keep the pipes open, so a
+    // collected stdout would only time out instead of reporting the status.
+    const code = await proc.exited;
+    // The first signal's status survives; the repeats are not a second shutdown.
+    expect(code).toBe(130);
+
+    // Escalation still reached SIGKILL, so the child that ignored TERM is gone.
+    await waitForGone(webPid);
+    // Reaping finished: the FIFOs and the temp dir holding them are removed...
+    expect(readdirSync(tmp)).toEqual([]);
+    // ...and the opt-in teardown still ran.
+    expect(fx.invocations().some((l) => l.startsWith("docker") && l.includes(" down"))).toBe(true);
+    // The launcher's grace loop is the full 100 × 0.05s before it escalates, so the
+    // default 5s per-test bound would time the test out before the shutdown ends.
+  }, 25_000);
 
   test("preserves a child's failure exit code and stops the sibling", async () => {
     const fx = makeFixture({ failWeb: true });

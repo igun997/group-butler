@@ -1304,10 +1304,13 @@ What the script MUST do:
    (`setsid`), so `SIGINT`/`SIGTERM` are forwarded to the whole group (including the compiled Go
    binary that `go run` spawns). On any child exiting or on the first Ctrl-C: terminate both groups
    (SIGTERM, then SIGKILL after a grace period), reap them, remove the FIFOs, and exit with the
-   triggering child's status. No orphans, ever. Infra containers are left running by default
-   (restarting Mongo costs seconds and re-init risk); `DEV_STOP_INFRA=1` stops them on exit — and only when that run actually started them, so
-a `--no-infra` invocation never tears down a stack it did not create — and
-   `bun run dev:down` is the explicit teardown.
+   triggering child's status. Repeated `INT`/`TERM` while that shutdown runs are ignored rather than
+   restored to their default action, so a second Ctrl-C (or a supervisor's TERM) cannot abandon a
+   half-finished shutdown. No orphans, ever. Infra containers are left running by default
+   (restarting Mongo costs seconds and re-init risk). `DEV_STOP_INFRA=1` applies to `dev:local` runs
+   only: it stops the containers on exit, and only when that run actually started them, so a
+   `--no-infra` invocation never tears down a stack it did not create. `--check` installs no cleanup
+   trap at all, so it leaves the infra alone either way; `bun run dev:down` is the explicit teardown.
 4. **Fail fast with actionable messages.** Missing `.env` → print `cp .env.example .env` and exit 1.
    **R2 preflight, before anything else starts:** `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
    `R2_SECRET_ACCESS_KEY` and `R2_BUCKET` must be present and not left as `REPLACE_WITH_*`
@@ -1443,12 +1446,15 @@ write, surviving processes). No test greps the script, so the suite survives ref
 | 11 | `DEV_STOP_INFRA=1` | `compose down` runs on exit and is reported |
 | 12 | `--no-infra` + `DEV_STOP_INFRA=1` | zero docker invocations and no teardown messaging: teardown requires that this run started infra |
 | 13 | `--no-infra` with no docker binary on `PATH` | the child's status still propagates and no teardown is attempted |
+| 14 | repeated `INT`/`TERM` mid-shutdown | with a child that ignores TERM (forcing the SIGKILL escalation) a second signal still cannot abort cleanup: exit 130 survives, the child is gone, the temp FIFO dir is removed, and the opt-in teardown still runs |
 
-Two launcher invariants these tests pinned down: shutdown liveness must come from the job table
+Three launcher invariants these tests pinned down: shutdown liveness must come from the job table
 (`jobs -rp`, redirected to a file because a command substitution would inspect the subshell's empty
 job table), since `kill -0` also succeeds for an exited-but-unreaped child and would stall the grace
-loop; and a child that exits on its own must still be `wait`ed for, or the loggers never see EOF and
-the launcher never exits.
+loop; a child that exits on its own must still be `wait`ed for, or the loggers never see EOF and
+the launcher never exits; and cleanup must `trap '' INT TERM` instead of restoring the default
+disposition, or the second manual signal kills the launcher mid-shutdown and abandons both the
+escalation and the teardown.
 
 ### 14.6 Fixture and doc-drift guards
 - `TestGroupFixtures_MatchCapturedTranscripts` (T1's golden check) runs in the default suite, so a

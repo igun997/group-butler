@@ -589,12 +589,16 @@ greps the script, so the suite stays valid under refactoring.
 | 11 | `DEV_STOP_INFRA=1 tears the infra down on exit` | `compose down` runs on exit and is reported |
 | 12 | `--no-infra with DEV_STOP_INFRA=1 never invokes docker` | zero docker invocations and no teardown messaging — a run that did not start infra must never stop one |
 | 13 | `--no-infra needs no docker binary at all` | with no docker on `PATH` the child's status still propagates and no teardown is attempted |
+| 14 | `a repeated INT/TERM during cleanup cannot abort it` | with a child that ignores TERM (so cleanup escalates to SIGKILL) a second signal still cannot abort the shutdown: exit 130 survives, the child is gone, the FIFO temp dir is removed, and `DEV_STOP_INFRA=1` teardown still runs |
 
-Two launcher invariants this suite pinned down (both fixed in the implementation, and mirrored in the
+Three launcher invariants this suite pinned down (fixed in the implementation, and mirrored in the
 architecture draft §14.5): shutdown liveness must come from the job table (`jobs -rp`, redirected to a
 file - a command substitution would inspect the subshell's empty job table), because `kill -0` also
-succeeds for an exited-but-unreaped child and would stall the grace loop; and a child that exits on its
-own must still be `wait`ed for, or the loggers never see EOF and the launcher never exits.
+succeeds for an exited-but-unreaped child and would stall the grace loop; a child that exits on its
+own must still be `wait`ed for, or the loggers never see EOF and the launcher never exits; and cleanup
+must replace the INT/TERM traps with `trap '' INT TERM` rather than restore their default disposition,
+because the default action kills the launcher mid-shutdown — the regression sends the repeats during
+the forced SIGKILL escalation and asserts the child, temp dir and teardown all still complete.
 
 **Step 2: Run it — expect failure**
 
@@ -790,7 +794,10 @@ cleanup() {
   local status=$?
   [[ "$CLEANED" == "1" ]] && return
   CLEANED=1
-  trap - INT TERM EXIT
+  # Repeated INT/TERM are ignored, not restored to their default action: the
+  # default disposition kills this shell mid-shutdown and abandons everything
+  # below — the escalation, the reaping, the FIFO cleanup and any teardown.
+  trap '' INT TERM
   log "shutting down"
 
   signal_children TERM
@@ -851,7 +858,9 @@ exit "$child_status"
 **Step 5: Run the tests to verify they pass**
 
 Run: `chmod +x scripts/dev.sh && bash -n scripts/dev.sh && bun test scripts/dev.test.ts`
-Expected: `bash -n` clean; 13 pass / 0 fail (47 assertions) in well under a second.
+Expected: `bash -n` clean; 14 pass / 0 fail (51 assertions). All but the repeated-signal regression finish in
+well under a second; that one deliberately spends the launcher's full 100 × 0.05 s grace loop before its
+SIGKILL escalation, so it costs a few seconds and carries an explicit per-test timeout.
 
 **Step 6: Acceptance — `--check`**
 
@@ -870,8 +879,7 @@ Expected: `exit=1` and stderr containing `run: cp .env.example .env`.
 **Step 7: Acceptance — prefixed logs and clean shutdown**
 
 Run: `bash -c 'DEV_STOP_INFRA=1 timeout -s INT 20 bun run dev:local; echo "exit=$?"'`
-Expected: `[dev] r2 ok …`, `[dev] config: …`, `[dev] starting infra (mongodb replica set) …`, `[dev] waiting for the mongodb replica set...`, `[dev] started [web] pid=…`, `[dev] started [worker] pid=…`, then the prefixed child output (the children fail at this point because the apps do not exist yet — Task 17), then `[dev] shutting down …` and `[dev] stopping infra (DEV_STOP_INFRA=1)` — teardown happens only
-because this run started infra; a `--no-infra` run never stops a stack it did not start. Afterwards `pgrep -f 'go run ./...'` prints nothing and `docker compose -f infra/dev/docker-compose.yml ps` shows no containers. This acceptance is re-run for real at Task 25.
+Expected: `[dev] r2 ok …`, `[dev] config: …`, `[dev] starting infra (mongodb replica set) …`, `[dev] waiting for the mongodb replica set...`, `[dev] started [web] pid=…`, `[dev] started [worker] pid=…`, then the prefixed child output (the children fail at this point because the apps do not exist yet — Task 17), then `[dev] shutting down …` and `[dev] stopping infra (DEV_STOP_INFRA=1)` — teardown happens only because this run started infra, and it applies to `dev:local` runs only, so a `--no-infra` run never stops a stack it did not start. Afterwards `pgrep -f 'go run ./...'` prints nothing and `docker compose -f infra/dev/docker-compose.yml ps` shows no containers. This acceptance is re-run for real at Task 25.
 
 **Step 8: Commit**
 
