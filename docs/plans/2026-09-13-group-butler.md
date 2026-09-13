@@ -391,23 +391,47 @@ STREAM_POLL_MS=3000
 `apps/worker/.env.production.example`:
 
 ```bash
-# Production env for the WORKER image. Checklist only — never commit values (§6.9).
+# Production env for the WORKER image (ghcr.io/<owner>/group-butler/worker).
+#
+# Deployment checklist only — never commit values. See docs/architecture-draft.md §6.9 and §12.3.
+#
+# This file is read by Docker's env-file parser (`docker run --env-file .env.worker`, and
+# `env_file:` in infra/prod/docker-compose.ghcr.yml). That parser does NOT strip a trailing
+# comment: `KEY=value  # note` sets KEY to "value  # note". Every comment here therefore sits on
+# its own line, above the key it explains. Keep it that way when you fill this in.
+#
+#   cp apps/worker/.env.production.example .env.worker     # then fill every blank line below
+
 PORT=4000
 ENVIRONMENT=production
-WORKER_SECRET=            # REQUIRED: 32+ random bytes
-MONGODB_URI=              # mongodb+srv://... (replica set required for change streams)
+
+# REQUIRED: 32+ random bytes, and identical to the web container's WORKER_SECRET.
+WORKER_SECRET=
+
+# mongodb+srv://... — the deployment must be a replica set: change streams carry the live UI (§7.4).
+MONGODB_URI=
 MONGODB_DB=group_butler
 ORGANIZATION_ID=org_default
-WHATSMEOW_DB_URI=file:/data/whatsmeow.db?_foreign_keys=on   # keep /data persistent
+
+# Keep /data persistent — this file holds the linked-device keys (§11.6).
+WHATSMEOW_DB_URI=file:/data/whatsmeow.db?_foreign_keys=on
+
+# Cloudflare R2 — the real service. The endpoint is derived from R2_ACCOUNT_ID in
+# code (https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com); there is no endpoint variable to set.
 R2_ACCOUNT_ID=
 R2_BUCKET=
 R2_ACCESS_KEY_ID=
 R2_SECRET_ACCESS_KEY=
+
+# Optional: CDN/custom domain for reads. Empty = presigned reads.
 R2_PUBLIC_URL=
+
 MEDIA_ENRICH_ENABLED=false
+
 AI_BASE_URL=
 AI_API_KEY=
 AI_MODEL=
+
 GROUP_SYNC_INTERVAL=30m
 GROUP_STALE_AFTER=6h
 GROUP_SYNC_PRUNE=true
@@ -418,26 +442,60 @@ LOG_LEVEL=info
 `apps/web/.env.production.example`:
 
 ```bash
-# Production env for the WEB image. Checklist only — never commit values (§7.7).
+# Production env for the WEB image (ghcr.io/<owner>/group-butler/web).
+#
+# Deployment checklist only — never commit values. See docs/architecture-draft.md §7.7 and §12.3.
+#
+# This file is read by Docker's env-file parser (`docker run --env-file .env.web`, and
+# `env_file:` in infra/prod/docker-compose.ghcr.yml). That parser does NOT strip a trailing
+# comment: `KEY=value  # note` sets KEY to "value  # note". Every comment here therefore sits on
+# its own line, above the key it explains. Keep it that way when you fill this in.
+#
+#   cp apps/web/.env.production.example .env.web     # then fill every blank line below
+
 ENVIRONMENT=production
+
 MONGODB_URI=
 MONGODB_DB=group_butler
 ORGANIZATION_ID=org_default
-WORKER_URL=               # e.g. http://127.0.0.1:4000 with host networking
-WORKER_SECRET=            # must equal the worker's
+
+# Where THIS container reaches the worker's control plane. A container that resolves 127.0.0.1
+# reaches itself, so loopback is correct only when the web app runs on the host next to the worker
+# (§7.7). The value below matches §12.3's `docker run` pair: the worker container is named
+# butler-worker and both containers join the `butler` network, which is what makes that name
+# resolve. infra/prod/docker-compose.ghcr.yml overrides this line with http://worker:4000, the
+# service name on its own network.
+WORKER_URL=http://butler-worker:4000
+
+# Must equal the worker container's WORKER_SECRET.
+WORKER_SECRET=
+
 OWNER_EMAIL=
-OWNER_PASSWORD_HASH=      # scrypt hash from `bun run auth:hash`
-AUTH_SECRET=              # >=32 chars
+
+# scrypt hash from `bun run auth:hash` — never a plaintext password.
+OWNER_PASSWORD_HASH=
+
+# >=32 chars; rotating it invalidates every session.
+AUTH_SECRET=
+
+LOGIN_RATE_LIMIT=5
+
 AI_BASE_URL=
 AI_API_KEY=
 AI_MODEL=
 AI_MAX_TOKENS_PER_DAY=200000
+
+# Cloudflare R2 — used to mint short-lived presigned GETs. The endpoint is derived
+# from R2_ACCOUNT_ID in code; there is no endpoint variable to set.
 R2_ACCOUNT_ID=
 R2_BUCKET=
 R2_ACCESS_KEY_ID=
 R2_SECRET_ACCESS_KEY=
 R2_PRESIGN_TTL_SECONDS=300
+
+# 0 = keep messages forever.
 RETENTION_MESSAGES_DAYS=0
+STREAM_POLL_MS=3000
 ```
 
 **Step 6: Verify**
@@ -5252,10 +5310,19 @@ deployment credential: the workflow stops at GHCR.
 
 **Step 5: Optional pull-only compose**
 
-`infra/prod/docker-compose.ghcr.yml` wires the two published images with `env_file: .env`, `restart:
-unless-stopped`, `network_mode: host` for the worker (so the web app reaches it at
-`http://127.0.0.1:4000`) and `volumes: [butler-wa:/data]`. A comment states it is **optional**: both
-images are standalone and `docker run` is the documented path.
+`infra/prod/docker-compose.ghcr.yml` wires the two published images and nothing else: no `build:` key
+(pull-only), no Mongo of its own, `env_file: .env.worker` / `.env.web` resolved against its **own**
+directory, `restart: unless-stopped`, `volumes: [butler-wa:/data]` on the worker, and one
+user-defined `butler` bridge. The worker publishes **no** port — the control plane is reachable only
+by the web service, as `http://worker:4000` — and the web service therefore sets
+`WORKER_URL: ${BUTLER_WORKER_URL:-http://worker:4000}` under `environment:`, which Compose gives
+precedence over `env_file`. That override is the point of the file: `.env.web` carries the `docker
+run` value (§12.3), where the worker is a hand-named container, and the BFF's own loopback is never
+a way to reach a worker in another container. Images are
+`ghcr.io/${BUTLER_GHCR_OWNER:?set BUTLER_GHCR_OWNER ...}/group-butler/{web,worker}:${BUTLER_TAG:-latest}`,
+so a missing owner fails loudly instead of pulling from the wrong namespace. A header comment states
+it is **optional**: both images are standalone and `docker run` on the same network is the documented
+path.
 
 **Step 6: Verify the images build and run**
 
@@ -5263,8 +5330,16 @@ Run: `docker build -f apps/worker/Dockerfile -t butler-worker:dev apps/worker &&
 Expected: both succeed; the web image reports a dry-run start (`docker run --rm --env-file .env -p 3000:3000 butler-web:dev node -e "console.log('image ok')"`).
 
 Run the worker image against the local infra to prove the standalone contract:
-`docker run --rm --env-file .env -e MONGODB_URI="mongodb://host.docker.internal:27017/group_butler?replicaSet=rs0" -p 4000:4000 butler-worker:dev` then `curl -sf localhost:4000/health`.
-Expected: `{"ok":true}`.
+`docker run --rm --env-file .env -e MONGODB_URI="mongodb://host.docker.internal:27017/group_butler?replicaSet=rs0" --add-host=host.docker.internal:host-gateway -p 4000:4000 butler-worker:dev` then `curl -sf localhost:4000/health`.
+Expected: `{"ok":true}`. (`--add-host` is what makes `host.docker.internal` resolve on Linux; Docker
+Desktop supplies it without the flag.)
+
+Prove the compose wrapper interpolates against both env files without a daemon (after the two `cp`
+commands in §12.3 — Compose refuses to render a service whose `env_file` is missing, by design):
+`BUTLER_GHCR_OWNER=<owner> docker compose -f infra/prod/docker-compose.ghcr.yml config`.
+Expected: the resolved document — `WORKER_URL: http://worker:4000`, one published port, `butler-wa`
+on `/data`, and no `build:` key anywhere. Run it once with `BUTLER_GHCR_OWNER` unset to confirm the
+loud failure instead of a pull from `ghcr.io//group-butler/...`.
 
 **Step 7: Commit**
 

@@ -1,0 +1,68 @@
+# Production rollout of the two PUBLISHED images — pull only.
+#
+# This file has no `build:` key: every service is a pull of an image built and pushed by
+# .github/workflows/deploy.yml, and MongoDB is the operator's own replica set reached through
+# MONGODB_URI (architecture §5 assumption 5) — nothing here starts a database.
+#
+#   cp apps/worker/.env.production.example infra/prod/.env.worker   # then fill every blank
+#   cp apps/web/.env.production.example   infra/prod/.env.web       # then fill every blank
+#   BUTLER_GHCR_OWNER=<github-owner> docker compose -f infra/prod/docker-compose.ghcr.yml up -d
+#
+# Both `env_file:` paths and the interpolation variables below resolve against THIS directory, not
+# the shell's working directory, so the commands above are complete as written. BUTLER_GHCR_OWNER
+# has no default on purpose: a wrong owner is a silent pull failure, and Compose fails loudly
+# instead. Pin a release with BUTLER_TAG=v1.2.3 rather than floating on `latest`.
+#
+# It is OPTIONAL: both images are standalone and the two `docker run` commands in
+# docs/architecture-draft.md §12.3 are the documented path. What this wrapper adds is the piece
+# those commands leave to the operator — one user-defined network, so the BFF reaches the worker
+# by name. That is not cosmetic: inside a container, 127.0.0.1 is *that container*, so a
+# WORKER_URL pointing at loopback makes every BFF call to the worker fail while both containers
+# look healthy.
+#
+# Networking (§11.7): the worker publishes NO host port — its control plane is reachable only by
+# the web service, as http://worker:4000 over this bridge. Only the web HTTP port is published;
+# TLS is terminated in front of it. `internal: true` is deliberately absent: both services need
+# the internet for MongoDB, Cloudflare R2 and the WhatsApp servers.
+
+name: group-butler-prod
+
+services:
+  worker:
+    image: ghcr.io/${BUTLER_GHCR_OWNER:?set BUTLER_GHCR_OWNER to the GitHub owner that publishes the images}/group-butler/worker:${BUTLER_TAG:-latest}
+    env_file:
+      - .env.worker
+    restart: unless-stopped
+    # The whatsmeow auth store (linked-device keys). Losing this volume means re-pairing every
+    # instance, so it is a named volume and never a container-local path (§11.6).
+    volumes:
+      - butler-wa:/data
+    # No `ports:` — the control plane stays private. To probe it from the host:
+    #   docker compose -f infra/prod/docker-compose.ghcr.yml exec worker curl -fsS localhost:4000/health
+    networks:
+      - butler
+
+  web:
+    image: ghcr.io/${BUTLER_GHCR_OWNER:?set BUTLER_GHCR_OWNER to the GitHub owner that publishes the images}/group-butler/web:${BUTLER_TAG:-latest}
+    env_file:
+      - .env.web
+    environment:
+      # Compose gives `environment` precedence over `env_file`, and it has to win here: the
+      # example carries the value for the `docker run` pair (a hand-named container), while on
+      # this network the worker answers to its service name.
+      WORKER_URL: ${BUTLER_WORKER_URL:-http://worker:4000}
+    restart: unless-stopped
+    depends_on:
+      worker:
+        condition: service_healthy
+    ports:
+      - "${BUTLER_WEB_PORT:-3000}:3000"
+    networks:
+      - butler
+
+networks:
+  butler:
+    driver: bridge
+
+volumes:
+  butler-wa: {}

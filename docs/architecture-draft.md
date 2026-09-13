@@ -174,7 +174,7 @@ group-butler/
 │  └─ dev.test.ts                           # contract tests for scripts/dev.sh + .env.example
 ├─ infra/
 │  ├─ dev/docker-compose.yml                # MongoDB replica set only (dev); R2 is the real service
-│  └─ prod/docker-compose.ghcr.yml          # OPTIONAL pull-only sample
+│  └─ prod/docker-compose.ghcr.yml          # OPTIONAL: pull-only wrapper for the two images
 ├─ docs/{architecture-draft.md,plans/}
 ├─ .github/workflows/{ci.yml,deploy.yml}
 ├─ .env.example                             # sourceable local-dev env (no real secrets)
@@ -970,7 +970,7 @@ content; §11.5).
 | `AUTH_SECRET` | ≥32 chars, HMAC key for the session cookie; rotation invalidates all sessions |
 | `MONGODB_URI`, `MONGODB_DB` | same database as the worker |
 | `ORGANIZATION_ID` | default `org_default` |
-| `WORKER_URL` | e.g. `http://127.0.0.1:4000` (host network) or `http://worker:4000` |
+| `WORKER_URL` | the worker's control plane **as this container sees it**: `http://butler-worker:4000` for the container pair in §12.3, `http://worker:4000` under `infra/prod/docker-compose.ghcr.yml`, and `http://127.0.0.1:4000` only when both processes run on the host. Loopback from inside a container reaches that container, never the worker |
 | `WORKER_SECRET` | must equal the worker's |
 | `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL` | OpenAI-compatible endpoint |
 | `AI_MAX_TOKENS_PER_DAY` | global ceiling, instance override in Mongo |
@@ -1196,18 +1196,42 @@ image carries a dev stage. Image names are `ghcr.io/<owner>/group-butler/web` an
 `apps/worker`.
 
 ### 12.3 Production rollout
+
+Both images are standalone: `docker run` them, or use the optional pull-only compose wrapper
+below. Either way the two containers must share **one user-defined network**, because that is what
+makes the worker's control plane resolvable by name. Inside a container `127.0.0.1` is *that
+container*, so a `WORKER_URL` pointing at loopback cannot reach a worker in another container: the
+BFF's `/api/health` then reports the worker it cannot see and every control-plane call fails, while
+both containers look healthy from the outside.
 ````
-docker run -d --name butler-worker \
-  -v butler-wa:/data -p 127.0.0.1:4000:4000 --env-file .env.worker \
+docker network create butler
+
+docker run -d --name butler-worker --network butler --restart unless-stopped \
+  -v butler-wa:/data --env-file .env.worker \
   ghcr.io/<owner>/group-butler/worker:latest
-docker run -d --name butler-web -p 3000:3000 --env-file .env.web \
+docker run -d --name butler-web --network butler --restart unless-stopped \
+  -p 3000:3000 --env-file .env.web \
   ghcr.io/<owner>/group-butler/web:latest
 ````
-The worker's port is published to loopback only and the web container reaches it at
-`http://127.0.0.1:4000` under host networking, or at `http://worker:4000` on a user-defined bridge
-network. `infra/prod/docker-compose.ghcr.yml` is an **optional** convenience wrapper around the
-same two `docker run`s (pull-only, no build context) for operators who prefer compose; neither
-image requires it.
+`.env.worker` and `.env.web` are the two deployment checklists under `apps/*/` (§13.1) with every
+blank filled in; `apps/web/.env.production.example` ships `WORKER_URL=http://butler-worker:4000`,
+which is exactly the container name above. Only the web port is published — the worker's control
+plane stays private over the `butler` network (§11.7); add `-p 127.0.0.1:4000:4000` to the worker
+only to probe `/health` from the host. MongoDB is the operator's own replica set, reached through
+`MONGODB_URI`; no compose file here starts one.
+
+`infra/prod/docker-compose.ghcr.yml` is the **optional** pull-only wrapper around the same two
+containers (no `build:` key, no local dependency) for operators who prefer compose to hand-made
+networks, restarts and volume flags:
+````
+cp apps/worker/.env.production.example infra/prod/.env.worker   # then fill every blank
+cp apps/web/.env.production.example   infra/prod/.env.web       # then fill every blank
+BUTLER_GHCR_OWNER=<owner> docker compose -f infra/prod/docker-compose.ghcr.yml up -d
+````
+It pins `WORKER_URL=http://worker:4000` itself — the service name on its own bridge, which is what
+Compose's `environment` overriding the `env_file` entry is for — keeps the same `butler-wa:/data`
+volume, publishes only the web port, and starts the web service only once the worker image's own
+`/health` probe is passing. Neither image requires it.
 
 ---
 
@@ -1356,7 +1380,11 @@ variable, no path-style flag, no emulator branch and no environment-specific sto
   launcher treats a placeholder as missing.
 - **`apps/web/.env.production.example`** and **`apps/worker/.env.production.example`** — deployment
   checklists (names, comments, placeholders only) mirroring §6.9 and §7.7. They are never sourced by
-  the dev script and must not be committed with values.
+  the dev script and must not be committed with values. They *are* consumed verbatim as env files by
+  the images (`docker run --env-file`, and `env_file:` in `infra/prod/docker-compose.ghcr.yml`), and
+  Docker's env-file parser keeps a trailing comment **in the value** — `KEY=value  # note` sets
+  `KEY` to `"value  # note"` — so every comment sits on its own line above its key. The web example
+  therefore also fixes `WORKER_URL` to the container-network URL §12.3 documents, not to loopback.
 - Keys are validated in one place: a shared `REQUIRED_ENV` list asserted by `scripts/dev.test.ts`
   (§14.5) so a new variable cannot land in code without appearing in the examples.
 
