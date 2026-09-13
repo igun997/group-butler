@@ -4,6 +4,7 @@ import { COLLECTIONS } from "../../../server/collections";
 import { UnauthorizedError } from "../../../server/auth/owner";
 import { issueSession } from "../../../server/auth/session";
 import { closeDb, getDb } from "../../../server/mongo";
+import { createIndexes } from "../../../server/bootstrap";
 import { GET } from "./route";
 
 /** Same request-scoped cookie seam as the other route suites. */
@@ -58,6 +59,9 @@ beforeAll(async () => {
       timestamp: new Date("2026-09-13T09:00:00Z"),
     })),
   ]);
+  // The free-text branch runs on the production text index; the deployment
+  // creates it with `bootstrap`, so the route test must too.
+  await createIndexes(db);
 });
 
 beforeEach(() => {

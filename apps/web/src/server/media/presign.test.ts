@@ -1,5 +1,13 @@
 import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
-import { ForeignMediaKeyError, presignMediaUrl, r2Endpoint } from "./presign";
+import {
+  ForeignMediaKeyError,
+  MAX_PRESIGN_TTL_SECONDS,
+  R2ConfigurationError,
+  presignMediaUrl,
+  r2Endpoint,
+} from "./presign";
+
+const ownKey = "org/org_default/instance/inst_1/group/g/2026/09/m2.bin";
 
 /**
  * The endpoint is derived, never configured: the account host is the only R2
@@ -18,22 +26,22 @@ describe("r2Endpoint", () => {
 });
 
 describe("presignMediaUrl", () => {
-  beforeAll(() => {
+  function goodEnv(): void {
     vi.stubEnv("R2_ACCOUNT_ID", "acct123");
     vi.stubEnv("R2_BUCKET", "butler-test");
     vi.stubEnv("R2_ACCESS_KEY_ID", "AKIAEXAMPLEEXAMPLE00");
     vi.stubEnv("R2_SECRET_ACCESS_KEY", "test-secret-key");
     vi.stubEnv("R2_PRESIGN_TTL_SECONDS", "300");
-  });
+  }
+
+  beforeAll(goodEnv);
 
   afterAll(() => {
     vi.unstubAllEnvs();
   });
 
   test("mints a short-lived GET on the caller's own account endpoint", async () => {
-    const url = new URL(
-      await presignMediaUrl("org/org_default/instance/inst_1/group/g/2026/09/m2.bin", "org_default"),
-    );
+    const url = new URL(await presignMediaUrl(ownKey, "org_default"));
     // R2's standard form: the bucket is a subdomain of the account host.
     expect(url.origin).toBe("https://butler-test.acct123.r2.cloudflarestorage.com");
     expect(url.pathname).toBe("/org/org_default/instance/inst_1/group/g/2026/09/m2.bin");
@@ -43,17 +51,57 @@ describe("presignMediaUrl", () => {
 
   /**
    * The prefix guard is the IDOR boundary: a row that somehow names another
-   * tenant's object must never be signed, whatever the session believes.
+   * tenant's object must never be signed, and it must be refused before any
+   * configuration is read or any credential is touched.
    */
   test("refuses to sign a key outside the organisation prefix", async () => {
     await expect(
       presignMediaUrl("org/org_other/instance/inst_1/group/g/2026/09/m.bin", "org_default"),
     ).rejects.toBeInstanceOf(ForeignMediaKeyError);
+    // Even with a broken configuration, the tenant check decides first.
+    vi.stubEnv("R2_BUCKET", "");
+    await expect(
+      presignMediaUrl("org/org_other/instance/inst_1/group/g/2026/09/m.bin", "org_default"),
+    ).rejects.toBeInstanceOf(ForeignMediaKeyError);
+    goodEnv();
   });
 
   test("a prefix that only looks like the organisation does not pass", async () => {
     await expect(
       presignMediaUrl("org/org_default_evil/instance/inst_1/group/g/2026/09/m.bin", "org_default"),
     ).rejects.toThrow(/outside organisation prefix/);
+  });
+
+  /**
+   * Signing is the last step: every value the signature depends on is required
+   * and validated first, so a misconfigured deployment fails closed instead of
+   * minting a URL with an empty key or somebody's default bucket.
+   */
+  test("refuses to sign without a complete, non-empty R2 configuration", async () => {
+    for (const [name, value] of [
+      ["R2_ACCOUNT_ID", ""],
+      ["R2_ACCOUNT_ID", "   "],
+      ["R2_BUCKET", ""],
+      ["R2_ACCESS_KEY_ID", ""],
+      ["R2_SECRET_ACCESS_KEY", ""],
+    ] as const) {
+      vi.stubEnv(name, value);
+      await expect(presignMediaUrl(ownKey, "org_default")).rejects.toBeInstanceOf(R2ConfigurationError);
+      goodEnv();
+    }
+  });
+
+  test("refuses a TTL that is not an integer within the signed-URL maximum", async () => {
+    expect(MAX_PRESIGN_TTL_SECONDS).toBe(604800);
+    for (const bad of ["", "0", "-5", "abc", "1.5", String(MAX_PRESIGN_TTL_SECONDS + 1)]) {
+      vi.stubEnv("R2_PRESIGN_TTL_SECONDS", bad);
+      await expect(presignMediaUrl(ownKey, "org_default")).rejects.toBeInstanceOf(R2ConfigurationError);
+      goodEnv();
+    }
+
+    vi.stubEnv("R2_PRESIGN_TTL_SECONDS", String(MAX_PRESIGN_TTL_SECONDS));
+    const url = new URL(await presignMediaUrl(ownKey, "org_default"));
+    expect(url.searchParams.get("X-Amz-Expires")).toBe(String(MAX_PRESIGN_TTL_SECONDS));
+    goodEnv();
   });
 });

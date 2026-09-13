@@ -191,16 +191,11 @@ export function nextMessageCursor(rows: MessageRow[], limit: number): string | n
 }
 
 /**
- * R4: the dashboard's advanced search (§6.4) — one query over the folded search
- * text, the flattened raw tree and the media filename, narrowed by the §5.1
- * compound filters and walked by a keyset on `(timestamp, waMessageId)`.
- *
- * MongoDB refuses `$text` inside `$or`, so the free-text arm is the escaped,
- * case-insensitive regex over the same three fields the text index covers. That
- * keeps type-ahead (a substring, not a whole token) working while never letting
- * a query become a pattern.
+ * The tenant lookup, the §5.1 compound filters and the cursor predicate every
+ * branch of a search shares. Nothing here is optional: `organizationId` is the
+ * one term no caller can omit.
  */
-export async function searchMessages(db: Db, input: MessageSearchInput): Promise<MessageRow[]> {
+function messageFilter(input: MessageSearchInput): Filter<Document> {
   const filter: Filter<Document> = { organizationId: input.organizationId };
 
   if (input.instanceId) filter.instanceId = input.instanceId;
@@ -208,12 +203,6 @@ export async function searchMessages(db: Db, input: MessageSearchInput): Promise
   if (input.senderJid) filter.senderJid = input.senderJid;
   if (input.kind) filter.kind = input.kind;
   if (input.mediaStatus) filter["media.status"] = input.mediaStatus;
-
-  const term = (input.query ?? "").trim().slice(0, MAX_QUERY_LENGTH);
-  if (term !== "") {
-    const pattern = new RegExp(escapeRegExp(term), "i");
-    filter.$or = [{ textSearch: pattern }, { rawSearch: pattern }, { "media.fileName": pattern }];
-  }
 
   const range: { $gte?: Date; $lte?: Date } = {};
   if (input.from) range.$gte = input.from;
@@ -226,31 +215,95 @@ export async function searchMessages(db: Db, input: MessageSearchInput): Promise
       { $or: [{ timestamp: { $lt: timestamp } }, { timestamp, waMessageId: { $lt: waMessageId } }] },
     ];
   }
+  return filter;
+}
 
-  const docs = await db
-    .collection(COLLECTIONS.messages)
-    .find<MessageDoc>(filter, { projection: PROJECTION })
-    .sort(SORT)
-    .limit(clampMessageLimit(input.limit))
-    .toArray();
-  return docs.map(toRow);
+/**
+ * R4: the dashboard's advanced search (§6.4) — one query over the folded search
+ * text, the flattened raw tree and the media filename, narrowed by the §5.1
+ * compound filters and walked by a keyset on `(timestamp, waMessageId)`.
+ *
+ * A free-text term is answered by two index-backed branches, because MongoDB
+ * rejects `$text` inside `$or` (verified against the production index set):
+ *
+ * - the weighted `messages_text` index (`$text` over `text`, `rawSearch` and
+ *   `media.fileName`), which is the token/ranked search §6.4 specifies;
+ * - an anchored, escaped prefix over the case-folded `textSearch` field, backed
+ *   by `messages_typeahead`, which is what keeps type-ahead working before a
+ *   word is complete.
+ *
+ * The branches are unioned and de-duplicated here, then ordered and cut to the
+ * page. Fetching `limit` rows from each branch is enough: any row in the global
+ * top `limit` is within the top `limit` of every branch that contains it, so the
+ * keyset cursor stays exact and no branch ever scans the collection.
+ */
+export async function searchMessages(db: Db, input: MessageSearchInput): Promise<MessageRow[]> {
+  const limit = clampMessageLimit(input.limit);
+  const filter = messageFilter(input);
+  const messages = db.collection(COLLECTIONS.messages);
+
+  const term = (input.query ?? "").trim().slice(0, MAX_QUERY_LENGTH);
+  if (term === "") {
+    const docs = await messages
+      .find<MessageDoc>(filter, { projection: PROJECTION })
+      .sort(SORT)
+      .limit(limit)
+      .toArray();
+    return docs.map(toRow);
+  }
+
+  const typeahead = new RegExp(`^${escapeRegExp(term.toLowerCase())}`);
+  const [byText, byTypeahead] = await Promise.all([
+    messages
+      .find<MessageDoc>({ ...filter, $text: { $search: term } }, { projection: PROJECTION })
+      .sort(SORT)
+      .limit(limit)
+      .toArray(),
+    messages
+      .find<MessageDoc>({ ...filter, textSearch: typeahead }, { projection: PROJECTION })
+      .sort(SORT)
+      .limit(limit)
+      .toArray(),
+  ]);
+
+  const byIdentity = new Map<string, MessageRow>();
+  for (const doc of [...byText, ...byTypeahead]) {
+    const row = toRow(doc);
+    const identity = `${row.instanceId}\u0000${row.waMessageId}`;
+    if (!byIdentity.has(identity)) byIdentity.set(identity, row);
+  }
+  return [...byIdentity.values()].sort(compareRows).slice(0, limit);
+}
+
+/** Newest first; a absent timestamp sorts last, `waMessageId` breaks the tie. */
+function compareRows(left: MessageRow, right: MessageRow): number {
+  const leftAt = left.timestamp ?? "";
+  const rightAt = right.timestamp ?? "";
+  if (leftAt !== rightAt) return leftAt < rightAt ? 1 : -1;
+  if (left.waMessageId === right.waMessageId) return 0;
+  return left.waMessageId < right.waMessageId ? 1 : -1;
 }
 
 /**
  * The stored R2 key of one message, or `null` when there is no such message in
- * this organisation, or it has no media. The `organizationId` in the filter is
- * what makes `/api/media/[messageId]/url` IDOR-safe: the id in the URL selects
- * a row this session may read, never a row by raw id alone.
+ * this organisation, or it has no media.
+ *
+ * `waMessageId` is only unique within `(organizationId, instanceId)` — the
+ * `uniq_message` index says so — so the instance is part of the identity, not a
+ * filter: without it the same message id in another instance could select the
+ * wrong object. Both the organisation and the instance come from the route's
+ * verified inputs, which is what makes `/api/media/[messageId]/url` IDOR-safe.
  */
 export async function messageMediaKey(
   db: Db,
   organizationId: string,
+  instanceId: string,
   waMessageId: string,
 ): Promise<string | null> {
   const doc = await db
     .collection(COLLECTIONS.messages)
     .findOne<{ media?: { r2Key?: string } }>(
-      { organizationId, waMessageId },
+      { organizationId, instanceId, waMessageId },
       { projection: { _id: 0, "media.r2Key": 1 } },
     );
   const key = doc?.media?.r2Key;

@@ -13,8 +13,18 @@ vi.mock("next/headers", () => ({
 const ownerToken = () => issueSession({ email: "owner@local", organizationId: "org_default" });
 
 const ownKey = "org/org_default/instance/inst_1/group/1203630431_g.us/2026/09/own.bin";
+const dupKey1 = "org/org_default/instance/inst_1/group/g/2026/09/dup.bin";
+const dupKey2 = "org/org_default/instance/inst_2/group/g/2026/09/dup.bin";
 
 let replSet: MongoMemoryReplSet;
+
+function r2Env(): void {
+  vi.stubEnv("R2_ACCOUNT_ID", "acct123");
+  vi.stubEnv("R2_BUCKET", "butler-test");
+  vi.stubEnv("R2_ACCESS_KEY_ID", "AKIAEXAMPLEEXAMPLE00");
+  vi.stubEnv("R2_SECRET_ACCESS_KEY", "test-secret-key");
+  vi.stubEnv("R2_PRESIGN_TTL_SECONDS", "300");
+}
 
 beforeAll(async () => {
   replSet = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
@@ -22,11 +32,7 @@ beforeAll(async () => {
   vi.stubEnv("MONGODB_DB", "butler_media_route_test");
   vi.stubEnv("AUTH_SECRET", "test-secret-test-secret-test-secret");
   vi.stubEnv("ORGANIZATION_ID", "org_default");
-  vi.stubEnv("R2_ACCOUNT_ID", "acct123");
-  vi.stubEnv("R2_BUCKET", "butler-test");
-  vi.stubEnv("R2_ACCESS_KEY_ID", "AKIAEXAMPLEEXAMPLE00");
-  vi.stubEnv("R2_SECRET_ACCESS_KEY", "test-secret-key");
-  vi.stubEnv("R2_PRESIGN_TTL_SECONDS", "300");
+  r2Env();
 
   const db = await getDb();
   await db.collection(COLLECTIONS.messages).insertMany([
@@ -49,11 +55,16 @@ beforeAll(async () => {
       waMessageId: "other-tenant",
       media: { status: "stored", r2Key: "org/org_other/instance/inst_1/group/g/2026/09/x.bin" },
     },
+    // The same waMessageId in two instances: the URL must name which instance's
+    // object it means, or it can sign the other one.
+    { organizationId: "org_default", instanceId: "inst_1", waMessageId: "dup", media: { status: "stored", r2Key: dupKey1 } },
+    { organizationId: "org_default", instanceId: "inst_2", waMessageId: "dup", media: { status: "stored", r2Key: dupKey2 } },
   ]);
 });
 
 beforeEach(() => {
   session.token = ownerToken();
+  r2Env();
 });
 
 afterAll(async () => {
@@ -62,8 +73,8 @@ afterAll(async () => {
   vi.unstubAllEnvs();
 });
 
-function getUrl(messageId: string): Promise<Response> {
-  return GET(new Request(`http://localhost/api/media/${messageId}/url`), {
+function getUrl(messageId: string, query = "?instanceId=inst_1"): Promise<Response> {
+  return GET(new Request(`http://localhost/api/media/${messageId}/url${query}`), {
     params: Promise.resolve({ messageId }),
   });
 }
@@ -79,6 +90,23 @@ describe("GET /api/media/[messageId]/url", () => {
     expect(signed.origin).toBe("https://butler-test.acct123.r2.cloudflarestorage.com");
     expect(signed.pathname).toBe(`/${ownKey}`);
     expect(signed.searchParams.get("X-Amz-Expires")).toBe("300");
+  });
+
+  test("requires the instance the message belongs to", async () => {
+    const res = await getUrl("own", "");
+    expect(res.status).toBe(400);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(await res.json()).toEqual({ error: "instance_required" });
+  });
+
+  test("signs each instance's own object when a waMessageId is shared", async () => {
+    const first = await (await getUrl("dup", "?instanceId=inst_1")).json();
+    expect(new URL(first.url).pathname).toBe(`/${dupKey1}`);
+
+    const second = await (await getUrl("dup", "?instanceId=inst_2")).json();
+    expect(new URL(second.url).pathname).toBe(`/${dupKey2}`);
+
+    expect((await getUrl("dup", "?instanceId=inst_9")).status).toBe(404);
   });
 
   test("answers 404 when the message has no stored media", async () => {
@@ -102,6 +130,19 @@ describe("GET /api/media/[messageId]/url", () => {
   test("answers 404 for a message id that does not exist", async () => {
     const res = await getUrl("nobody");
     expect(res.status).toBe(404);
+  });
+
+  /**
+   * A missing bucket or credential is the server's problem, not the caller's:
+   * the answer is a safe 503 rather than a URL signed with an empty key.
+   */
+  test("answers 503 instead of signing when R2 is not configured", async () => {
+    vi.stubEnv("R2_BUCKET", "");
+    const res = await getUrl("own");
+    expect(res.status).toBe(503);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(await res.json()).toEqual({ error: "media_unavailable" });
+    r2Env();
   });
 
   test("answers 401 for a request with no session", async () => {

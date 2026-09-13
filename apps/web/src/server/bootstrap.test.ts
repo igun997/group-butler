@@ -56,7 +56,10 @@ describe("bootstrap", () => {
     expect(await indexNames(db, "messages")).toEqual([
       "group_stream",
       "media_status",
+      "messages_group_stream",
+      "messages_stream",
       "messages_text",
+      "messages_typeahead",
       "sender_stream",
       "uniq_message",
     ]);
@@ -74,6 +77,24 @@ describe("bootstrap", () => {
       organizationId: 1,
       groupJid: 1,
       createdAt: -1,
+    });
+    // The message stream's keyset order: an index that stops at `timestamp`
+    // leaves the `waMessageId` tie-break to a blocking sort.
+    expect(await indexKey(db, "messages", "messages_stream")).toEqual({
+      organizationId: 1,
+      timestamp: -1,
+      waMessageId: -1,
+    });
+    expect(await indexKey(db, "messages", "messages_group_stream")).toEqual({
+      organizationId: 1,
+      instanceId: 1,
+      groupJid: 1,
+      timestamp: -1,
+      waMessageId: -1,
+    });
+    expect(await indexKey(db, "messages", "messages_typeahead")).toEqual({
+      organizationId: 1,
+      textSearch: 1,
     });
     await client.close();
   });

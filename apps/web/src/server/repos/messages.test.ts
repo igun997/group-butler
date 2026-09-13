@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { COLLECTIONS } from "../collections";
 import { closeDb, getDb } from "../mongo";
+import { createIndexes } from "../bootstrap";
 import {
   InvalidMessageCursorError,
   MESSAGE_MAX_LIMIT,
@@ -109,6 +110,43 @@ const seed = [
     links: [],
     mentions: [],
   },
+  // The same `waMessageId` in two instances of one organisation: identity is
+  // `(organizationId, instanceId, waMessageId)`, so a lookup that omits the
+  // instance can select the wrong tenant's object.
+  {
+    organizationId: "org_default",
+    instanceId: "inst_1",
+    groupJid: "1203630431@g.us",
+    waMessageId: "shared",
+    senderJid: "628990000008@s.whatsapp.net",
+    pushName: "Shared",
+    fromMe: false,
+    kind: "image",
+    text: "",
+    textSearch: "",
+    rawSearch: "",
+    timestamp: new Date("2026-09-13T05:00:00Z"),
+    media: { status: "stored", r2Key: "org/org_default/instance/inst_1/group/g/2026/09/shared.bin" },
+    links: [],
+    mentions: [],
+  },
+  {
+    organizationId: "org_default",
+    instanceId: "inst_2",
+    groupJid: "1203630431@g.us",
+    waMessageId: "shared",
+    senderJid: "628990000009@s.whatsapp.net",
+    pushName: "Shared",
+    fromMe: false,
+    kind: "image",
+    text: "",
+    textSearch: "",
+    rawSearch: "",
+    timestamp: new Date("2026-09-13T05:00:00Z"),
+    media: { status: "stored", r2Key: "org/org_default/instance/inst_2/group/g/2026/09/shared.bin" },
+    links: [],
+    mentions: [],
+  },
   // A tie on `timestamp`: only the `waMessageId` half of the cursor keeps the
   // stream from repeating or skipping a row.
   ...[1, 2, 3].map((n) => ({
@@ -155,6 +193,10 @@ beforeAll(async () => {
   process.env.MONGODB_URI = mongo.getUri();
   process.env.MONGODB_DB = "butler_messages_test";
   await (await getDb()).collection(COLLECTIONS.messages).insertMany(seed);
+  // The production index set, not a test stand-in: the text branch needs the
+  // weighted `messages_text` index to run at all, and the cursor/sort contract
+  // is only meaningful against the indexes the deployment actually creates.
+  await createIndexes(await getDb());
 });
 
 afterAll(async () => {
@@ -243,6 +285,39 @@ describe("searchMessages", () => {
     expect(fourth).toEqual([]);
   });
 
+  test("pages a free-text query the same way, and returns a doubly-matched row once", async () => {
+    // `paginate` matches the text index and the type-ahead prefix at once; the
+    // two branches are unioned, so the row must not appear twice.
+    const page = await searchMessages(await getDb(), {
+      organizationId: "org_default",
+      groupJid: "pg@g.us",
+      query: "paginate",
+      limit: 5,
+    });
+    expect(page.map((m) => m.waMessageId)).toEqual(["p3", "p2", "p1"]);
+
+    const first = await searchMessages(await getDb(), {
+      organizationId: "org_default",
+      groupJid: "pg@g.us",
+      query: "paginate",
+      limit: 1,
+    });
+    expect(first.map((m) => m.waMessageId)).toEqual(["p3"]);
+    const second = await searchMessages(await getDb(), {
+      organizationId: "org_default",
+      groupJid: "pg@g.us",
+      query: "paginate",
+      limit: 1,
+      cursor: encodeMessageCursor(first[0]!),
+    });
+    expect(second.map((m) => m.waMessageId)).toEqual(["p2"]);
+  });
+
+  test("never doubles a row that both search branches match", async () => {
+    const rows = await searchMessages(await getDb(), { organizationId: "org_default", query: "deploy" });
+    expect(rows.filter((m) => m.waMessageId === "m1")).toHaveLength(1);
+  });
+
   test("refuses a cursor it did not mint instead of silently starting over", async () => {
     await expect(
       searchMessages(await getDb(), { organizationId: "org_default", query: "", cursor: "not-a-cursor" }),
@@ -278,14 +353,94 @@ describe("searchMessages", () => {
 
 describe("messageMediaKey", () => {
   test("returns the stored key only for a message of the caller's organisation", async () => {
-    expect(await messageMediaKey(await getDb(), "org_default", "m2")).toBe(
+    expect(await messageMediaKey(await getDb(), "org_default", "inst_1", "m2")).toBe(
       "org/org_default/instance/inst_1/group/1203630431_g.us/2026/09/m2.bin",
     );
-    expect(await messageMediaKey(await getDb(), "org_other", "m2")).toBeNull();
+    expect(await messageMediaKey(await getDb(), "org_other", "inst_1", "m2")).toBeNull();
   });
 
   test("is null for a message with no media and for one that does not exist", async () => {
-    expect(await messageMediaKey(await getDb(), "org_default", "m1")).toBeNull();
-    expect(await messageMediaKey(await getDb(), "org_default", "missing")).toBeNull();
+    expect(await messageMediaKey(await getDb(), "org_default", "inst_1", "m1")).toBeNull();
+    expect(await messageMediaKey(await getDb(), "org_default", "inst_1", "missing")).toBeNull();
+  });
+
+  test("resolves the same waMessageId to each instance's own object", async () => {
+    expect(await messageMediaKey(await getDb(), "org_default", "inst_1", "shared")).toBe(
+      "org/org_default/instance/inst_1/group/g/2026/09/shared.bin",
+    );
+    expect(await messageMediaKey(await getDb(), "org_default", "inst_2", "shared")).toBe(
+      "org/org_default/instance/inst_2/group/g/2026/09/shared.bin",
+    );
+    expect(await messageMediaKey(await getDb(), "org_default", "inst_9", "shared")).toBeNull();
+  });
+});
+
+/**
+ * The index contract behind the query the repository issues. Each case runs the
+ * shape of the production query against the production index set and reads the
+ * planner's answer, so a rename or a dropped key is a failing test rather than a
+ * silent collection scan.
+ */
+describe("message search index contract", () => {
+  test("free text is answered by the weighted messages_text index", async () => {
+    const explained = JSON.stringify(
+      await (await getDb())
+        .collection(COLLECTIONS.messages)
+        .find({ organizationId: "org_default", $text: { $search: "deploy" } })
+        .sort({ timestamp: -1, waMessageId: -1 })
+        .limit(5)
+        .explain("queryPlanner"),
+    );
+    expect(explained).toContain("messages_text");
+    expect(explained).toContain("TEXT_MATCH");
+  });
+
+  test("the tenant-filtered cursor stream is an index scan with no blocking sort", async () => {
+    const messages = (await getDb()).collection(COLLECTIONS.messages);
+    const stream = JSON.stringify(
+      await messages
+        .find({ organizationId: "org_default" })
+        .sort({ timestamp: -1, waMessageId: -1 })
+        .limit(5)
+        .hint("messages_stream")
+        .explain("queryPlanner"),
+    );
+    expect(stream).toContain("messages_stream");
+    expect(stream).not.toContain('"stage":"SORT"');
+
+    const group = JSON.stringify(
+      await messages
+        .find({ organizationId: "org_default", instanceId: "inst_pg", groupJid: "pg@g.us" })
+        .sort({ timestamp: -1, waMessageId: -1 })
+        .limit(5)
+        .hint("messages_group_stream")
+        .explain("queryPlanner"),
+    );
+    expect(group).toContain("messages_group_stream");
+    expect(group).not.toContain('"stage":"SORT"');
+  });
+
+  test("type-ahead is answered by the tenant-scoped textSearch index", async () => {
+    const explained = JSON.stringify(
+      await (await getDb())
+        .collection(COLLECTIONS.messages)
+        .find({ organizationId: "org_default", textSearch: /^deploy/ })
+        .hint("messages_typeahead")
+        .explain("queryPlanner"),
+    );
+    expect(explained).toContain("messages_typeahead");
+    expect(explained).toContain("IXSCAN");
+  });
+
+  test("the production index set carries the cursor and tenant keys", async () => {
+    const names = (await (await getDb()).collection(COLLECTIONS.messages).indexes()).map((index) => index.name ?? "");
+    expect(names).toEqual(
+      expect.arrayContaining([
+        "messages_text",
+        "messages_stream",
+        "messages_group_stream",
+        "messages_typeahead",
+      ]),
+    );
   });
 });

@@ -42,6 +42,19 @@ export const INDEXES: Record<string, IndexDescription[]> = {
     { name: "group_stream", key: { organizationId: 1, instanceId: 1, groupJid: 1, timestamp: -1 } },
     { name: "media_status", key: { organizationId: 1, "media.status": 1, timestamp: -1 } },
     { name: "sender_stream", key: { organizationId: 1, senderJid: 1, timestamp: -1 } },
+    // The cross-instance stream's keyset order (`/api/messages`): tenant
+    // equality, then the exact `(timestamp, waMessageId)` descending order the
+    // cursor walks, so a page never needs a blocking sort.
+    { name: "messages_stream", key: { organizationId: 1, timestamp: -1, waMessageId: -1 } },
+    // The per-group stream's keyset order (`/api/groups/[id]/messages`): the
+    // three equality terms first, then the same descending pair.
+    {
+      name: "messages_group_stream",
+      key: { organizationId: 1, instanceId: 1, groupJid: 1, timestamp: -1, waMessageId: -1 },
+    },
+    // Type-ahead: an anchored prefix over the case-folded `textSearch` is a
+    // tenant-scoped range scan on this index rather than a collection scan.
+    { name: "messages_typeahead", key: { organizationId: 1, textSearch: 1 } },
     {
       name: "messages_text",
       key: { text: "text", rawSearch: "text", "media.fileName": "text" },
