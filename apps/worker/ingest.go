@@ -91,6 +91,18 @@ func (q *ingestQueue) Dropped() int64 {
 	return q.dropped.Load()
 }
 
+// Depth is the number of messages buffered but not yet written, Capacity its
+// bound, and Stopped whether the consumer has closed to producers. They are the
+// `/health` queue report (§6.5).
+func (q *ingestQueue) Depth() int    { return len(q.ch) }
+func (q *ingestQueue) Capacity() int { return cap(q.ch) }
+
+func (q *ingestQueue) Stopped() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.stopped
+}
+
 // Run drains the queue into the store until ctx is cancelled, then closes the
 // queue and flushes what it holds. From the moment ctx is done, every accepted
 // message is either written or counted as dropped — none is left in a buffer

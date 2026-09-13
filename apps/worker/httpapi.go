@@ -26,7 +26,42 @@ type api struct {
 	secret     string
 	prune      bool
 	staleAfter time.Duration
+
+	// Health dependencies. `ping` is the database reachability check and
+	// `queue`/`persist` are the two bounded queues whose state the probe reports
+	// (§6.5).
+	ping    func(ctx context.Context) error
+	queue   *ingestQueue
+	persist *persistQueue
 }
+
+// healthResponse is the §6.5 liveness payload: `ok` is the aggregate a load
+// balancer acts on, and the parts say which dependency degraded.
+type healthResponse struct {
+	OK      bool          `json:"ok"`
+	Mongo   string        `json:"mongo"`
+	Queue   queueHealth   `json:"queue"`
+	Persist persistHealth `json:"persist"`
+}
+
+type queueHealth struct {
+	Depth    int    `json:"depth"`
+	Capacity int    `json:"capacity"`
+	Dropped  int64  `json:"dropped"`
+	Stopped  bool   `json:"stopped"`
+	Error    string `json:"error,omitempty"`
+}
+
+type persistHealth struct {
+	Depth   int    `json:"depth"`
+	Dropped int64  `json:"dropped"`
+	Failed  int64  `json:"failed"`
+	Error   string `json:"error,omitempty"`
+}
+
+// healthTimeout bounds the probe: a hung database must fail the check, not hang
+// the load balancer.
+const healthTimeout = 2 * time.Second
 
 // groupListRow is one row of `GET /instances/{id}/groups` in the §6.6.6 shape.
 // The dashboard needs the ID and the current name (R11); everything else is the
@@ -74,8 +109,44 @@ func (a *api) routes() http.Handler {
 	return mux
 }
 
-func (a *api) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+// handleHealth is the §6.5 probe: `/health` stays open for container probes and
+// reports the database and the two bounded queues. `ok` is false — with 503 —
+// when a dependency the worker cannot function without has failed, so a load
+// balancer stops routing here instead of sending work into a stalled worker.
+func (a *api) handleHealth(w http.ResponseWriter, r *http.Request) {
+	body := healthResponse{OK: true, Mongo: "ok"}
+	if a.queue != nil {
+		body.Queue = queueHealth{
+			Depth:    a.queue.Depth(),
+			Capacity: a.queue.Capacity(),
+			Dropped:  a.queue.Dropped(),
+			Stopped:  a.queue.Stopped(),
+		}
+		if body.Queue.Stopped {
+			body.OK = false
+			body.Queue.Error = "ingest consumer stopped"
+		}
+	}
+	if a.persist != nil {
+		body.Persist = persistHealth{
+			Depth:   a.persist.Depth(),
+			Dropped: a.persist.Dropped(),
+			Failed:  a.persist.Failed(),
+		}
+	}
+	if a.ping != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), healthTimeout)
+		defer cancel()
+		if err := a.ping(ctx); err != nil {
+			body.OK = false
+			body.Mongo = "error"
+		}
+	}
+	status := http.StatusOK
+	if !body.OK {
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, body)
 }
 
 // client resolves the live whatsmeow client for an instance. A nil resolver

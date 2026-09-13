@@ -269,6 +269,9 @@ type manager struct {
 	// database (§6.2).
 	persist *persistQueue
 
+	// ping is the `/health` database reachability check (§6.5).
+	ping func(ctx context.Context) error
+
 	// newClient is the whatsmeow seam: the production value builds a real
 	// client, tests inject a fake so lifecycle and pairing are provable without
 	// a socket or a live account.
@@ -402,6 +405,9 @@ func (m *manager) api() *api {
 		secret:     m.secret,
 		prune:      m.cfg.GroupSyncPrune,
 		staleAfter: m.cfg.GroupStaleAfter,
+		ping:       m.ping,
+		queue:      m.ingest,
+		persist:    m.persist,
 	}
 }
 
