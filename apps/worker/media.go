@@ -11,9 +11,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"strings"
 	"time"
 
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 )
 
@@ -84,14 +86,26 @@ type MediaDescriptor struct {
 	MessageID    string
 	GroupJID     string
 	ViewOnce     bool
+
+	// Node is the protobuf media node the authenticated download request is
+	// built from: it carries the direct path, media key and hashes WhatsApp
+	// encrypts the attachment with. The pipeline passes it through untouched and
+	// never reads it; a descriptor that was not built from a message has none.
+	Node whatsmeow.DownloadableMessage
 }
 
-// mediaDownloader fetches the bytes of one attachment. The whatsmeow-backed
-// implementation streams the ciphertext under MEDIA_MAX_BYTES and with
-// MEDIA_DOWNLOAD_TIMEOUT before handing back a buffer; tests substitute a fake
-// so the state machine runs with no network (§6.3.2).
+// mediaDownloader streams one attachment. Nothing here materialises the whole
+// thing: the pipeline copies the stream itself under MEDIA_MAX_BYTES and aborts
+// at the cap, and the production implementation (whatsmeowDownloader) writes
+// the ciphertext into a capped scratch file, so neither side can hold an
+// attachment larger than the cap (§6.3.2).
+//
+// The returned reader belongs to the caller, which must close it: closing is
+// what releases a downloader's scratch space. The MIME is deliberately not part
+// of this contract — the descriptor already carries what WhatsApp declared, and
+// the pipeline trusts only the bytes.
 type mediaDownloader interface {
-	Download(ctx context.Context, desc MediaDescriptor) ([]byte, string, error)
+	Download(ctx context.Context, desc MediaDescriptor) (io.ReadCloser, error)
 }
 
 // mediaUploader stores one object and reports the locator the dashboard shows.
@@ -165,8 +179,10 @@ func newMediaPipeline(limits *mediaLimits, downloader mediaDownloader, uploader 
 
 // download fetches one attachment under the whole §6.3.2 policy: a
 // MEDIA_CONCURRENCY slot, a MEDIA_DOWNLOAD_TIMEOUT deadline, and MEDIA_MAX_BYTES
-// on what comes back. Every download the worker performs goes through here, so
-// no path can fetch an attachment outside the configured bounds.
+// enforced *during* the copy. Every download the worker performs goes through
+// here, so no path can fetch an attachment outside the configured bounds, and
+// the most this can ever hold is MEDIA_MAX_BYTES plus the byte that proves the
+// stream went past it.
 func (p *mediaPipeline) download(ctx context.Context, desc MediaDescriptor) ([]byte, error) {
 	release, err := p.limits.acquire(ctx)
 	if err != nil {
@@ -177,19 +193,20 @@ func (p *mediaPipeline) download(ctx context.Context, desc MediaDescriptor) ([]b
 	ctx, cancel := context.WithTimeout(ctx, p.limits.timeout)
 	defer cancel()
 
-	// The downloader's MIME hint is deliberately ignored: the stored mime, the
-	// key's extension and media.kind all come from the bytes we hold, never from
-	// what a sender claimed (§11.4).
-	data, _, err := p.downloader.Download(ctx, desc)
+	stream, err := p.downloader.Download(ctx, desc)
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(data)) > p.limits.maxBytes {
-		// A downloader that streams to a temp file aborts under the same cap
-		// (copyCapped); this is the bound on whatever one hands back instead.
-		return nil, fmt.Errorf("%w: %d bytes", errMediaTooLarge, len(data))
+	if stream == nil {
+		return nil, errors.New("media downloader returned no stream")
 	}
-	return data, nil
+	defer func() { _ = stream.Close() }()
+
+	var buf bytes.Buffer
+	if _, err := copyCapped(&buf, stream, p.limits.maxBytes); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // Store performs one attempt at one attachment and reports the resulting media
@@ -361,14 +378,42 @@ func classifyDownloadFailure(err error) (MediaStatus, string) {
 }
 
 // permanentDownloadReason names the failures no retry can change; it returns ""
-// for a transient one.
+// for a transient one. The whatsmeow sentinels are matched as values rather than
+// by message text, so the mapping cannot drift when the library rewords one.
 func permanentDownloadReason(err error) string {
-	if errors.Is(err, errMediaTooLarge) {
+	switch {
+	case errors.Is(err, errMediaTooLarge):
 		return reasonTooLarge
+	case errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403),
+		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404),
+		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410),
+		errors.Is(err, whatsmeow.ErrMediaNotAvailableOnPhone):
+		// The media host no longer has the object: expired, revoked, or a
+		// view-once that was consumed somewhere else.
+		return reasonExpired
+	case errors.Is(err, whatsmeow.ErrNothingDownloadableFound),
+		errors.Is(err, whatsmeow.ErrNoURLPresent),
+		errors.Is(err, whatsmeow.ErrUnknownMediaType):
+		// The node itself carries nothing fetchable.
+		return reasonUnsupportedType
+	case errors.Is(err, whatsmeow.ErrInvalidMediaHMAC),
+		errors.Is(err, whatsmeow.ErrInvalidMediaEncSHA256),
+		errors.Is(err, whatsmeow.ErrInvalidMediaSHA256),
+		errors.Is(err, whatsmeow.ErrFileLengthMismatch),
+		errors.Is(err, whatsmeow.ErrTooShortFile):
+		// Bytes arrived but do not match the hashes the message declared.
+		return reasonDownloadFailed
 	}
 	if isTransientMediaError(err) {
 		return ""
 	}
+	var httpErr whatsmeow.DownloadHTTPError
+	if errors.As(err, &httpErr) {
+		// Any other status the media host answered with.
+		return reasonExpired
+	}
+	// Whatever downloader is in use (a test, or a wrapper that re-words a
+	// refusal) still has to land inside the §5.1 vocabulary.
 	msg := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(msg, "view once"), strings.Contains(msg, "viewonce"):
@@ -390,6 +435,11 @@ func isTransientMediaError(err error) bool {
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled),
 		errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, io.EOF):
 		return true
+	}
+	var httpErr whatsmeow.DownloadHTTPError
+	if errors.As(err, &httpErr) {
+		// Back-pressure from the media host, not a verdict about the object.
+		return httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode >= 500
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) {
@@ -701,26 +751,32 @@ func describeMedia(msg *waE2E.Message) (MediaDescriptor, bool) {
 	switch mediaKind {
 	case KindPtv:
 		if m := inner.GetPtvMessage(); m != nil {
+			desc.Node = m
 			desc.Mime, desc.Size, desc.ViewOnce = m.GetMimetype(), int64(m.GetFileLength()), desc.ViewOnce || m.GetViewOnce()
 		}
 	case KindVideo:
 		if m := inner.GetVideoMessage(); m != nil {
+			desc.Node = m
 			desc.Mime, desc.Size, desc.ViewOnce = m.GetMimetype(), int64(m.GetFileLength()), desc.ViewOnce || m.GetViewOnce()
 		}
 	case KindImage:
 		if m := inner.GetImageMessage(); m != nil {
+			desc.Node = m
 			desc.Mime, desc.Size, desc.ViewOnce = m.GetMimetype(), int64(m.GetFileLength()), desc.ViewOnce || m.GetViewOnce()
 		}
 	case KindAudio:
 		if m := inner.GetAudioMessage(); m != nil {
+			desc.Node = m
 			desc.Mime, desc.Size = m.GetMimetype(), int64(m.GetFileLength())
 		}
 	case KindDocument:
 		if m := inner.GetDocumentMessage(); m != nil {
+			desc.Node = m
 			desc.Mime, desc.FileName, desc.Size = m.GetMimetype(), m.GetFileName(), int64(m.GetFileLength())
 		}
 	case KindSticker:
 		if m := inner.GetStickerMessage(); m != nil {
+			desc.Node = m
 			desc.Mime, desc.Size = m.GetMimetype(), int64(m.GetFileLength())
 		}
 	}

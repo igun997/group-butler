@@ -6,26 +6,55 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"google.golang.org/protobuf/proto"
 )
 
 type fakeDownloader struct {
 	data []byte
-	typ  string
 	err  error
 }
 
-func (f fakeDownloader) Download(ctx context.Context, msg MediaDescriptor) ([]byte, string, error) {
+func (f fakeDownloader) Download(ctx context.Context, msg MediaDescriptor) (io.ReadCloser, error) {
 	if f.err != nil {
-		return nil, "", f.err
+		return nil, f.err
 	}
-	return f.data, f.typ, nil
+	return io.NopCloser(bytes.NewReader(f.data)), nil
+}
+
+// streamDownloader hands back whatever stream a test built, including one that
+// never ends.
+type streamDownloader struct{ stream io.ReadCloser }
+
+func (d streamDownloader) Download(context.Context, MediaDescriptor) (io.ReadCloser, error) {
+	return d.stream, nil
+}
+
+// countingStream never ends and reports how much was read from it: with it a
+// test proves the pipeline aborted at MEDIA_MAX_BYTES instead of draining (and
+// allocating) the whole attachment.
+type countingStream struct {
+	read   int
+	closed bool
+}
+
+func (s *countingStream) Read(p []byte) (int, error) {
+	clear(p)
+	s.read += len(p)
+	return len(p), nil
+}
+
+func (s *countingStream) Close() error {
+	s.closed = true
+	return nil
 }
 
 // uploadCall is one recorded upload, so a test can tell the media object from
@@ -79,7 +108,7 @@ var mediaNow = time.Date(2026, 9, 13, 0, 0, 0, 0, time.UTC)
 func TestStoreMedia_StoredWhenReadable(t *testing.T) {
 	png := []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 'I', 'H', 'D', 'R', 0, 0, 0, 4, 0, 0, 0, 3}
 	up := &fakeUploader{}
-	pipe := newMediaPipeline(testMediaLimits(), fakeDownloader{data: png, typ: "image/png"}, up, "org_default", "inst_1", mediaNow)
+	pipe := newMediaPipeline(testMediaLimits(), fakeDownloader{data: png}, up, "org_default", "inst_1", mediaNow)
 	got := pipe.Store(context.Background(), MediaDescriptor{
 		DeclaredType: "image", Kind: "image", Mime: "image/png", MessageID: "3EB0A1", GroupJID: "120363043123456789@g.us",
 	})
@@ -145,9 +174,9 @@ func TestMediaDescriptorFromMessage(t *testing.T) {
 // the pipeline must not fetch at all.
 type countingDownloader struct{ calls *int }
 
-func (c countingDownloader) Download(context.Context, MediaDescriptor) ([]byte, string, error) {
+func (c countingDownloader) Download(context.Context, MediaDescriptor) (io.ReadCloser, error) {
 	*c.calls++
-	return nil, "", errors.New("a descriptor that must not be fetched was fetched")
+	return nil, errors.New("a descriptor that must not be fetched was fetched")
 }
 
 func TestStoreMedia_ViewOnceIsUnavailableWithoutFetching(t *testing.T) {
@@ -287,9 +316,9 @@ func TestStoreMedia_KindFollowsTheBytesNotTheDescriptor(t *testing.T) {
 // the pipeline imposed can end the call.
 type blockingDownloader struct{}
 
-func (blockingDownloader) Download(ctx context.Context, _ MediaDescriptor) ([]byte, string, error) {
+func (blockingDownloader) Download(ctx context.Context, _ MediaDescriptor) (io.ReadCloser, error) {
 	<-ctx.Done()
-	return nil, "", ctx.Err()
+	return nil, ctx.Err()
 }
 
 func TestStoreMedia_CapsAnOversizedDownloaderResponse(t *testing.T) {
@@ -308,6 +337,29 @@ func TestStoreMedia_CapsAnOversizedDownloaderResponse(t *testing.T) {
 	}
 	if up.calls != 0 {
 		t.Error("an attachment past the cap was uploaded anyway")
+	}
+}
+
+func TestStoreMedia_StopsReadingAStreamPastTheCap(t *testing.T) {
+	limits := newMediaLimits(Config{MediaMaxBytes: 8, MediaDownloadTimeout: time.Second, MediaConcurrency: 1})
+	stream := &countingStream{}
+	up := &fakeUploader{}
+	pipe := newMediaPipeline(limits, streamDownloader{stream: stream}, up, "org_default", "inst_1", mediaNow)
+
+	got := pipe.Store(context.Background(), MediaDescriptor{
+		Kind: KindDocument, DeclaredType: KindDocument, MessageID: "3EB0F2", GroupJID: "120363043123456789@g.us",
+	})
+	if got.Status != MediaUnavailable || got.Reason != "too_large" {
+		t.Errorf("media = %+v, want unavailable/too_large", got)
+	}
+	if stream.read > 9 {
+		t.Errorf("read %d bytes from an endless stream under an 8-byte cap: the copy must abort at the cap rather than consume the attachment (§6.3.2)", stream.read)
+	}
+	if !stream.closed {
+		t.Error("the stream was not closed: a downloader releases its scratch space on Close")
+	}
+	if up.calls != 0 {
+		t.Error("an attachment past the cap was uploaded")
 	}
 }
 
@@ -389,7 +441,7 @@ func newConcurrencyProbe(limit int) *concurrencyProbe {
 	return &concurrencyProbe{limit: limit, done: make(chan struct{}), reached: make(chan struct{})}
 }
 
-func (c *concurrencyProbe) Download(_ context.Context, _ MediaDescriptor) ([]byte, string, error) {
+func (c *concurrencyProbe) Download(_ context.Context, _ MediaDescriptor) (io.ReadCloser, error) {
 	c.mu.Lock()
 	c.inFlight++
 	if c.inFlight > c.max {
@@ -405,7 +457,7 @@ func (c *concurrencyProbe) Download(_ context.Context, _ MediaDescriptor) ([]byt
 	c.mu.Lock()
 	c.inFlight--
 	c.mu.Unlock()
-	return pngHeader(1, 1), "image/png", nil
+	return io.NopCloser(bytes.NewReader(pngHeader(1, 1))), nil
 }
 
 func (c *concurrencyProbe) waitFor(n int, timeout time.Duration) bool {
@@ -525,6 +577,18 @@ func TestClassifyDownloadFailure(t *testing.T) {
 		{"reset stream", errors.New("read tcp: connection reset by peer"), MediaFailed, ""},
 		{"throttled", errors.New("429 Too Many Requests: slow down"), MediaFailed, ""},
 		{"cancelled shutdown", context.Canceled, MediaFailed, ""},
+		{"media gone (410)", whatsmeow.ErrMediaDownloadFailedWith410, MediaUnavailable, "expired"},
+		{"media forbidden (403)", whatsmeow.ErrMediaDownloadFailedWith403, MediaUnavailable, "expired"},
+		{"media missing (404)", whatsmeow.ErrMediaDownloadFailedWith404, MediaUnavailable, "expired"},
+		{"no longer on the phone", whatsmeow.ErrMediaNotAvailableOnPhone, MediaUnavailable, "expired"},
+		{"nothing downloadable", whatsmeow.ErrNothingDownloadableFound, MediaUnavailable, "unsupported_type"},
+		{"no url present", whatsmeow.ErrNoURLPresent, MediaUnavailable, "unsupported_type"},
+		{"unknown media type", whatsmeow.ErrUnknownMediaType, MediaUnavailable, "unsupported_type"},
+		{"corrupt hmac", whatsmeow.ErrInvalidMediaHMAC, MediaUnavailable, "download_failed"},
+		{"plaintext hash mismatch", whatsmeow.ErrInvalidMediaSHA256, MediaUnavailable, "download_failed"},
+		{"truncated payload", whatsmeow.ErrTooShortFile, MediaUnavailable, "download_failed"},
+		{"host having a bad day (503)", whatsmeow.DownloadHTTPError{Response: &http.Response{StatusCode: http.StatusServiceUnavailable}}, MediaFailed, ""},
+		{"host throttling (429)", whatsmeow.DownloadHTTPError{Response: &http.Response{StatusCode: http.StatusTooManyRequests}}, MediaFailed, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -651,31 +715,36 @@ func TestCopyCappedAbortsPastTheLimit(t *testing.T) {
 }
 
 func TestDescribeMediaMapsEveryDownloadableVariant(t *testing.T) {
-	viewOnce := &waE2E.Message{ViewOnceMessage: &waE2E.FutureProofMessage{Message: &waE2E.Message{
-		ImageMessage: &waE2E.ImageMessage{Mimetype: proto.String("image/jpeg"), FileLength: proto.Uint64(7)},
-	}}}
+	// Each node is built once so the descriptor can be expected to carry that
+	// exact node: the authenticated download request is built from it.
+	image := &waE2E.ImageMessage{Mimetype: proto.String("image/jpeg"), FileLength: proto.Uint64(7)}
+	ptv := &waE2E.VideoMessage{Mimetype: proto.String("video/mp4"), FileLength: proto.Uint64(8)}
+	voice := &waE2E.AudioMessage{Mimetype: proto.String("audio/ogg; codecs=opus"), FileLength: proto.Uint64(9)}
+	document := &waE2E.DocumentMessage{
+		Mimetype: proto.String("application/pdf"), FileName: proto.String("invoice.pdf"), FileLength: proto.Uint64(10),
+	}
+	sticker := &waE2E.StickerMessage{Mimetype: proto.String("image/webp"), FileLength: proto.Uint64(11)}
+	wrapped := &waE2E.ImageMessage{Mimetype: proto.String("image/jpeg"), FileLength: proto.Uint64(7)}
+
 	cases := []struct {
 		name string
 		msg  *waE2E.Message
 		want MediaDescriptor
 	}{
-		{"image", &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
-			Mimetype: proto.String("image/jpeg"), FileLength: proto.Uint64(7),
-		}}, MediaDescriptor{Kind: KindImage, DeclaredType: KindImage, Mime: "image/jpeg", Size: 7}},
-		{"video note", &waE2E.Message{PtvMessage: &waE2E.VideoMessage{
-			Mimetype: proto.String("video/mp4"), FileLength: proto.Uint64(8),
-		}}, MediaDescriptor{Kind: KindPtv, DeclaredType: KindPtv, Mime: "video/mp4", Size: 8}},
-		{"voice note", &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
-			Mimetype: proto.String("audio/ogg; codecs=opus"), FileLength: proto.Uint64(9),
-		}}, MediaDescriptor{Kind: KindAudio, DeclaredType: KindAudio, Mime: "audio/ogg; codecs=opus", Size: 9}},
-		{"document", &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
-			Mimetype: proto.String("application/pdf"), FileName: proto.String("invoice.pdf"), FileLength: proto.Uint64(10),
-		}}, MediaDescriptor{Kind: KindDocument, DeclaredType: KindDocument, Mime: "application/pdf", FileName: "invoice.pdf", Size: 10}},
-		{"sticker", &waE2E.Message{StickerMessage: &waE2E.StickerMessage{
-			Mimetype: proto.String("image/webp"), FileLength: proto.Uint64(11),
-		}}, MediaDescriptor{Kind: KindSticker, DeclaredType: KindSticker, Mime: "image/webp", Size: 11}},
-		{"view-once wrapper", viewOnce, MediaDescriptor{
-			Kind: KindImage, DeclaredType: declaredViewOnce, Mime: "image/jpeg", Size: 7, ViewOnce: true,
+		{"image", &waE2E.Message{ImageMessage: image},
+			MediaDescriptor{Kind: KindImage, DeclaredType: KindImage, Mime: "image/jpeg", Size: 7, Node: image}},
+		{"video note", &waE2E.Message{PtvMessage: ptv},
+			MediaDescriptor{Kind: KindPtv, DeclaredType: KindPtv, Mime: "video/mp4", Size: 8, Node: ptv}},
+		{"voice note", &waE2E.Message{AudioMessage: voice},
+			MediaDescriptor{Kind: KindAudio, DeclaredType: KindAudio, Mime: "audio/ogg; codecs=opus", Size: 9, Node: voice}},
+		{"document", &waE2E.Message{DocumentMessage: document},
+			MediaDescriptor{Kind: KindDocument, DeclaredType: KindDocument, Mime: "application/pdf", FileName: "invoice.pdf", Size: 10, Node: document}},
+		{"sticker", &waE2E.Message{StickerMessage: sticker},
+			MediaDescriptor{Kind: KindSticker, DeclaredType: KindSticker, Mime: "image/webp", Size: 11, Node: sticker}},
+		{"view-once wrapper", &waE2E.Message{ViewOnceMessage: &waE2E.FutureProofMessage{
+			Message: &waE2E.Message{ImageMessage: wrapped},
+		}}, MediaDescriptor{
+			Kind: KindImage, DeclaredType: declaredViewOnce, Mime: "image/jpeg", Size: 7, ViewOnce: true, Node: wrapped,
 		}},
 	}
 	for _, tc := range cases {
@@ -686,6 +755,9 @@ func TestDescribeMediaMapsEveryDownloadableVariant(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Errorf("describeMedia = %+v, want %+v", got, tc.want)
+			}
+			if got.Node == nil {
+				t.Error("the descriptor carries no node: nothing could build the authenticated download request")
 			}
 		})
 	}
