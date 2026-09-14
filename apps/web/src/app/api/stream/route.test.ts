@@ -440,6 +440,26 @@ describe("GET /api/stream polling fallback", () => {
     spy.mockRestore();
   });
 
+  test("answers 503 stream_unavailable when the resume-cursor read fails", async () => {
+    const db = await getDb();
+    const realCollection = db.collection.bind(db);
+    // The replica set is fine; only the cursor row cannot be read.
+    const spy = vi.spyOn(db, "collection").mockImplementation(((name: string) =>
+      new Proxy(realCollection(name as never) as object, {
+        get: (target, property, receiver) =>
+          property === "findOne" ? () => Promise.reject(new Error("cursor read failed")) : Reflect.get(target, property, receiver),
+      })) as never);
+
+    try {
+      const response = await GET(new Request("http://localhost/api/stream"));
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toEqual({ error: "stream_unavailable" });
+      expect(response.headers.get("cache-control")).toBe("no-store");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   test("answers 503 stream_unavailable when Mongo is unreachable", async () => {
     await closeDb();
     vi.stubEnv("MONGODB_URI", "mongodb://127.0.0.1:1/nope?serverSelectionTimeoutMS=250");

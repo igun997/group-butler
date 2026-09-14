@@ -254,7 +254,7 @@ describe("ResourceGate surfaces (R-L1, R-E1, R-V3)", () => {
     const load = vi.fn(() => new Promise<string[]>((resolve) => setTimeout(() => resolve([]), 60_000)));
     const resource = makeResource("gate-cold", load);
     render(
-      <ResourceGate resource={resource} scope={GLOBAL} emptyReason="no-data">
+      <ResourceGate resource={resource} scope={GLOBAL} label="Rows" emptyReason="no-data">
         {() => <p>loaded rows</p>}
       </ResourceGate>,
     );
@@ -299,21 +299,6 @@ describe("ResourceGate surfaces (R-L1, R-E1, R-V3)", () => {
     expect(document.querySelectorAll('[role="status"]')).toHaveLength(1);
   });
 
-  test("a cold read with no label still carries one status, unnamed", async () => {
-    useTierTimers();
-    const load = vi.fn(() => new Promise<string[]>((resolve) => setTimeout(() => resolve([]), 60_000)));
-    const resource = makeResource("gate-status-bare", load);
-    render(
-      <ResourceGate resource={resource} scope={GLOBAL}>
-        {() => <p>loaded rows</p>}
-      </ResourceGate>,
-    );
-
-    const status = document.querySelectorAll('[role="status"]');
-    expect(status).toHaveLength(1);
-    expect(status[0]?.textContent).toBe("Loading");
-  });
-
   test("a settled read carries no loading status at all", async () => {
     const resource = makeResource("gate-no-status", () => Promise.resolve(["row"]));
     render(
@@ -339,7 +324,7 @@ describe("ResourceGate surfaces (R-L1, R-E1, R-V3)", () => {
       },
     );
     render(
-      <ResourceGate resource={resource} scope={GLOBAL} emptyReason="filtered">
+      <ResourceGate resource={resource} scope={GLOBAL} label="Rows" emptyReason="filtered">
         {() => <p>loaded rows</p>}
       </ResourceGate>,
     );
@@ -365,7 +350,7 @@ describe("ResourceGate surfaces (R-L1, R-E1, R-V3)", () => {
       },
     });
     render(
-      <ResourceGate resource={resource} scope={GLOBAL} emptyReason="unconfigured">
+      <ResourceGate resource={resource} scope={GLOBAL} label="Rows" emptyReason="unconfigured">
         {() => <p>loaded rows</p>}
       </ResourceGate>,
     );
@@ -379,7 +364,7 @@ describe("ResourceGate surfaces (R-L1, R-E1, R-V3)", () => {
   test("an empty copy with no action renders no control at all", async () => {
     const resource = makeResource<string[]>("gate-empty-none", () => Promise.resolve([]));
     render(
-      <ResourceGate resource={resource} scope={GLOBAL} emptyReason="no-data">
+      <ResourceGate resource={resource} scope={GLOBAL} label="Rows" emptyReason="no-data">
         {() => <p>loaded rows</p>}
       </ResourceGate>,
     );
@@ -398,7 +383,7 @@ describe("ResourceGate surfaces (R-L1, R-E1, R-V3)", () => {
   test("a settled read with no rows shows the declared reason's copy, not a bare line", async () => {
     const resource = makeResource("gate-empty", () => Promise.resolve([]));
     render(
-      <ResourceGate resource={resource} scope={GLOBAL} emptyReason="filtered">
+      <ResourceGate resource={resource} scope={GLOBAL} label="Rows" emptyReason="filtered">
         {() => <p>loaded rows</p>}
       </ResourceGate>,
     );
@@ -412,7 +397,7 @@ describe("ResourceGate surfaces (R-L1, R-E1, R-V3)", () => {
     const load = vi.fn().mockRejectedValueOnce(new Error("mongo unreachable")).mockResolvedValueOnce(["recovered"]);
     const resource = makeResource<string[]>("gate-error", load);
     render(
-      <ResourceGate resource={resource} scope={GLOBAL}>
+      <ResourceGate resource={resource} scope={GLOBAL} label="Rows">
         {(view) => <p>{(view.data ?? []).join(",")}</p>}
       </ResourceGate>,
     );
@@ -430,7 +415,7 @@ describe("ResourceGate surfaces (R-L1, R-E1, R-V3)", () => {
   test("a resource with no sse or poll still settles on live without touching the stream", async () => {
     const resource = makeResource("gate-static", () => Promise.resolve(["row"]));
     render(
-      <ResourceGate resource={resource} scope={GLOBAL}>
+      <ResourceGate resource={resource} scope={GLOBAL} label="Rows">
         {(view) => <p>{`${view.tier}:${(view.data ?? []).join(",")}`}</p>}
       </ResourceGate>,
     );
@@ -459,6 +444,27 @@ describe("resource cache identity and invalidation", () => {
     // The refetch is warm: the old rows stay on screen while it runs.
     expect(result.current.data).toEqual(["row"]);
     expect(result.current.showSkeleton).toBe(false);
+  });
+
+  test("the revalidation an invalidation starts writes its changed result back", async () => {
+    const load = vi
+      .fn()
+      .mockResolvedValueOnce(["before the mutation"])
+      .mockResolvedValueOnce(["after the mutation"]);
+    const resource = makeResource("dependent-changed", load, { invalidateOn: ["groups.mutate"] });
+    const { result } = renderHook(() => useResource(resource, { scope: GLOBAL }));
+    await waitFor(() => expect(result.current.data).toEqual(["before the mutation"]));
+
+    // Clearing the `stale` flag happens while this fetch is in flight; it must
+    // not invalidate the write the fetch is about to make.
+    await act(async () => {
+      resourceCache.invalidate(["groups.mutate"]);
+    });
+
+    await waitFor(() => expect(result.current.data).toEqual(["after the mutation"]));
+    expect(result.current.tier).toBe("live");
+    expect(result.current.showSkeleton).toBe(false);
+    expect(load).toHaveBeenCalledTimes(2);
   });
 
   test("a patch that returns the same reference costs no render and no copy", () => {

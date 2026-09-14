@@ -325,7 +325,7 @@ describe("SSE to poll parity (R-V3)", () => {
       },
     ]);
     return (
-      <ResourceGate resource={resource} scope={GLOBAL} emptyReason="no-data">
+      <ResourceGate resource={resource} scope={GLOBAL} label="Rows" emptyReason="no-data">
         {(view) => <ul data-testid="rows">{(view.data ?? []).map((row) => <li key={row}>{row}</li>)}</ul>}
       </ResourceGate>
     );

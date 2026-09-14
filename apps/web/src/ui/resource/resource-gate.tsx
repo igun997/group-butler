@@ -17,8 +17,9 @@ import { useResource, type ResourceView } from "./use-resource";
  * transport MUST leave the DOM byte-identical (`R-V3`); only the header's live
  * indicator may say that the stream is polling.
  *
- * A cold read carries exactly one accessible status — a labelled `role="status"`
- * naming the region — while the skeleton it reserves space with stays
+ * A cold read carries exactly one labelled accessible status — a
+ * `role="status"` naming the region, which is why `label` is required — while
+ * the skeleton it reserves space with stays
  * `aria-hidden`, so a screen reader is told *that* the panel is loading without
  * being read a shape (`R-L1`, `R-L4`). The status is the state, never the
  * transport, so it survives a degrade unchanged.
@@ -30,8 +31,12 @@ export interface ResourceGateProps<D, P = unknown> {
   params?: P;
   /** The reason to show when the read settled with nothing; omit if any value counts. */
   emptyReason?: EmptyReason;
-  /** What this region is, for the one loading announcement (`R-L1`). */
-  label?: string;
+  /**
+   * What this region is — the panel's own title. It is required, not optional:
+   * R-L1's cold announcement is "Loading <panel title>" once per region, and an
+   * unnamed "Loading" is not that announcement.
+   */
+  label: string;
   children: (view: ResourceView<D>) => ReactNode;
 }
 
@@ -127,7 +132,7 @@ export function ResourceGate<D, P = unknown>({
       {view.showWarmBar ? <div className="resource-gate__bar" aria-hidden="true" /> : null}
       {state === "cold" ? (
         <p className="visually-hidden" role="status">
-          {label === undefined ? "Loading" : `Loading ${label}`}
+          {`Loading ${label}`}
         </p>
       ) : null}
       {surface}

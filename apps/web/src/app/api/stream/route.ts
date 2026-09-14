@@ -286,6 +286,17 @@ function serializeFrame(id: string | null, frame: StreamFrame): string {
  * whose last event id is gone — so the connection catches up on the gap instead
  * of starting mid-change and dropping it.
  */
+/**
+ * The one answer for "this deployment cannot serve a live stream right now".
+ * Every path that cannot open the channel — Mongo unreachable, no replica set,
+ * a cursor read that fails — says the same thing, with the same `no-store`, so
+ * a failure is never a framework error page and the client's degrade path has
+ * exactly one shape to read.
+ */
+function streamUnavailable(): Response {
+  return Response.json({ error: "stream_unavailable" }, { status: 503, headers: { "cache-control": "no-store" } });
+}
+
 async function readStreamCursor(db: Db, organizationId: string): Promise<unknown> {
   const cursor = await db
     .collection<StreamCursorDoc>(COLLECTIONS.streamCursors)
@@ -342,11 +353,9 @@ export async function GET(request: Request): Promise<Response> {
   } catch {
     // Mongo is unreachable: there is no stream to serve, and holding a
     // connection open would only look healthy while delivering nothing.
-    return Response.json({ error: "stream_unavailable" }, { status: 503, headers: { "cache-control": "no-store" } });
+    return streamUnavailable();
   }
-  if (!support.supported) {
-    return Response.json({ error: "stream_unavailable" }, { status: 503, headers: { "cache-control": "no-store" } });
-  }
+  if (!support.supported) return streamUnavailable();
 
   // Resume precedence: the client's own token first — `Last-Event-ID` is what an
   // `EventSource` sends by itself, and `?resume=` is what the coordinator adds
@@ -357,7 +366,17 @@ export async function GET(request: Request): Promise<Response> {
   const clientToken = decodeResumeToken(
     request.headers.get("last-event-id") ?? new URL(request.url).searchParams.get("resume"),
   );
-  const resume = clientToken ?? (await readStreamCursor(db, organizationId));
+  let persisted: unknown;
+  if (clientToken === undefined) {
+    try {
+      persisted = await readStreamCursor(db, organizationId);
+    } catch {
+      // The cursor read is part of opening the channel: a failure here is the
+      // same unavailable stream, not a 500 for the operator to decode.
+      return streamUnavailable();
+    }
+  }
+  const resume = clientToken ?? persisted;
 
   const encoder = new TextEncoder();
   const body = new ReadableStream<Uint8Array>({

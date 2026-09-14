@@ -27,7 +27,12 @@ export interface CacheEntry<D = unknown> {
   readonly error: unknown;
   /** Set by `invalidate()`; a mounted resource revalidates and clears it. */
   readonly stale: boolean;
-  /** Changes on every real write, so one render sees one consistent snapshot. */
+  /**
+   * The entry's data generation: it moves whenever the entry's *content*
+   * changes (a load begins or settles, or a live patch lands). Bookkeeping —
+   * the `stale` flag — deliberately does not move it, so clearing that flag
+   * cannot invalidate a revalidation that is already in flight.
+   */
   readonly version: number;
 }
 
@@ -86,12 +91,26 @@ export function createResourceCache(): ResourceCache {
     for (const listener of [...listeners]) listener();
   };
 
-  /** Replace an entry in place (immutably) and bump the shared generation. */
+  const commit = (entry: MutableEntry, patch: Partial<CacheEntry>, next: number): void => {
+    entries.set(entry.key, { ...entry, ...patch, version: next } as MutableEntry);
+    notify();
+  };
+
+  /** Replace an entry's content, starting a new data generation. */
   const put = (entry: MutableEntry, patch: Partial<CacheEntry>): number => {
     version += 1;
-    entries.set(entry.key, { ...entry, ...patch, version } as MutableEntry);
-    notify();
+    commit(entry, patch, version);
     return version;
+  };
+
+  /**
+   * Change bookkeeping only. `stale` is a scheduling flag, not data, so it must
+   * not move the generation: a revalidation that begins *after* an invalidation
+   * has to be able to write its result back, and the flag is cleared while that
+   * fetch is still in flight.
+   */
+  const flag = (entry: MutableEntry, patch: Partial<CacheEntry>): void => {
+    commit(entry, patch, entry.version);
   };
 
   /** The entry a write owns, or `null` when a newer write has superseded it. */
@@ -166,14 +185,14 @@ export function createResourceCache(): ResourceCache {
       }
       for (const key of touched) {
         const entry = entries.get(key);
-        if (entry && !entry.stale) put(entry, { stale: true });
+        if (entry && !entry.stale) flag(entry, { stale: true });
       }
       return [...touched];
     },
 
     markFresh(key: string) {
       const entry = entries.get(key);
-      if (entry?.stale) put(entry, { stale: false });
+      if (entry?.stale) flag(entry, { stale: false });
     },
 
     clear() {
