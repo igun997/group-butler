@@ -1,12 +1,15 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
+import Link from "next/link";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { SmartPhone01Icon } from "@hugeicons/core-free-icons";
-import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
+import { Button } from "@/components/ui/button";
+import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { Item, ItemActions, ItemContent, ItemDescription, ItemTitle } from "@/components/ui/item";
 import { InstanceStatusBadge } from "@/components/shell/status-badge";
 import { requireOwner } from "@/server/auth/require";
-import { formatStamp, loadHealth, loadInstances } from "@/server/console";
+import { loadHealth, loadInstances } from "@/server/console";
+import { formatStamp } from "@/lib/instances";
 
 export const metadata: Metadata = { title: "Instances" };
 
@@ -28,11 +31,16 @@ export default async function InstancesPage() {
 
   return (
     <div className="mx-auto flex w-full max-w-5xl flex-col gap-6">
-      <header className="flex flex-col gap-1">
+      <header className="flex flex-col gap-3">
         <h1 className="font-heading text-2xl font-semibold tracking-tight">Instances</h1>
         <p className="max-w-[65ch] text-sm text-muted-foreground">
           Each instance is one linked WhatsApp account.
         </p>
+        <div>
+          <Button render={<Link href="/instances/new" />} className="max-md:h-11">
+            Link an account
+          </Button>
+        </div>
       </header>
 
       {workerDown ? (
@@ -52,16 +60,20 @@ export default async function InstancesPage() {
             </EmptyMedia>
             <EmptyTitle>No instance is linked yet</EmptyTitle>
             <EmptyDescription>
-              Create and pair an account through the worker&apos;s control API. Once it is stored,
-              its groups, captured messages and send approvals show up here.
+              An instance appears here once a WhatsApp account is linked and the worker pairs it.
             </EmptyDescription>
+            <EmptyContent>
+              <Button render={<Link href="/instances/new" />} variant="outline" className="max-md:h-11">
+                Link an account
+              </Button>
+            </EmptyContent>
           </EmptyHeader>
         </Empty>
       ) : (
         <ul className="flex flex-col gap-2">
           {instances.data.map((instance) => (
             <li key={instance.id}>
-              <Item variant="outline">
+              <Item variant="outline" render={<Link href={`/instances/${instance.id}`} />}>
                 <ItemContent>
                   <ItemTitle>{instance.label}</ItemTitle>
                   <ItemDescription className="flex flex-wrap items-center gap-x-2 gap-y-1">

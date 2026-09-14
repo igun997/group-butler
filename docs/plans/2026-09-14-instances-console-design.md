@@ -58,7 +58,12 @@ form), `/instances/[id]` (the workspace).
    and the identity facts when connected.
 4. The scope editor lists exactly the instance's known groups with the whitelisted ones checked, and
    "Save scope" is disabled until the selection changes.
-5. An unknown or foreign instance is a 404 (`notFound()`), never a shell with empty fields.
+5. An unknown or foreign instance renders the console's own not-found page **inside the shell**, with a
+   way back to the list, and never a shell with empty fields. Measured, not assumed: the status line
+   stays `200`, in `next dev` and in a production build, because Next has already streamed the shell
+   by the time the page resolves; the body is the not-found page. A true 404 would need the
+   ownership check in middleware, which means a Mongo read on every request for a status code, so
+   the in-shell page is the trade taken.
 6. `/instances` links each row into its workspace and keeps the honest empty state.
 7. The create form's failures map to the field or the page: `label_conflict` on the label,
    `invalid_request` on the field it names, `worker_unreachable` as a page notice with a retry.
@@ -83,3 +88,24 @@ pattern `apps/web/vitest.config.ts` already documents), so a screen's states are
 DOM. Pairing and failure mapping are pure functions with their own unit tests. Client interactions
 (submit, save, poll, confirm, remove) are verified by clicking through the running console, since
 this repo has no jsdom or testing-library dependency and adding one is not part of this slice.
+
+## What the verification covered
+
+Against a running instance of this build (`next dev` and a production `next start`), with the worker
+**down** at the time:
+
+| Checked | Result |
+| --- | --- |
+| The list's link action and row links | "Link an account" present; rows link to `/instances/<id>` |
+| Form refusal mapping | `worker_unreachable` produced the form notice and the retry hint, no field error |
+| Workspace with the worker down | stored label, status badge, group counts, scope picker and both actions render; the pairing panel says it cannot be read |
+| Scope round trip | toggle on → "1 of 1 groups", Save enabled; save → refresh → Save disabled; toggled back and saved again to restore |
+| The write itself | `instances.config.groupJidWhitelist` back to `[]`, the group's mirror flag `false`, two `instance.whitelist.updated` audit rows with before/after |
+| Manual sync, worker down | the route's phrase ("the WhatsApp service did not answer") as a notice |
+| Removal, both steps | step two names what is unlinked and what is kept; Cancel returns to step one with the instance untouched |
+| Unknown instance | the in-shell not-found page with a way back |
+
+**Not yet observed, because the worker is down**: create → the workspace redirect, a live QR or phone
+code in the panel, the pairing-code request, and a successful removal. The code paths exist and the
+route tests cover the handlers; the console's rendering of the payload is covered by the panel's
+tests. Run those four clicks once `apps/worker` is up.

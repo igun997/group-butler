@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
@@ -5,6 +6,12 @@ export default defineConfig({
   // tsconfig keeps `jsx: preserve` for Next, so the transform has to be stated
   // here. Vite 8 transforms with oxc, not esbuild.
   oxc: { jsx: { runtime: "automatic", importSource: "react" } },
+  resolve: {
+    // The same mapping `tsconfig.json` gives the app, so a test resolves `@/…`
+    // exactly as the code under test does. Vitest reads `paths` from tsconfig
+    // only through a plugin, and this is one alias.
+    alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
+  },
   test: {
     environment: "node",
     // MongoMemoryReplSet creates an external mongod per file. Parallel startup

@@ -7,7 +7,8 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/
 import { Item, ItemActions, ItemContent, ItemDescription, ItemTitle } from "@/components/ui/item";
 import { DependencyBadge, InstanceStatusBadge } from "@/components/shell/status-badge";
 import { requireOwner } from "@/server/auth/require";
-import { attentionNeeded, formatStamp, loadHealth, loadInstances, statusCounts } from "@/server/console";
+import { attentionNeeded, loadHealth, loadInstances, statusCounts } from "@/server/console";
+import { formatStamp } from "@/lib/instances";
 
 export const metadata: Metadata = { title: "Overview" };
 

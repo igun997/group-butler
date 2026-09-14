@@ -41,9 +41,3 @@ export function statusCounts(instances: InstanceRow[]): { connected: number; ina
   const connected = instances.filter((instance) => instance.status === "connected").length;
   return { connected, inactive: instances.length - connected };
 }
-
-/** Stamps are rendered in UTC so the server and the browser cannot disagree. */
-export function formatStamp(iso: string | null): string {
-  if (!iso) return "never";
-  return `${iso.slice(0, 16).replace("T", " ")} UTC`;
-}
