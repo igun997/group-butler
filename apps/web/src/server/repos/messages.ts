@@ -77,7 +77,7 @@ interface MessageCursorKey {
 }
 
 /** A stored `messages` document, read only through the projection below. */
-type MessageDoc = {
+export type MessageDoc = {
   waMessageId?: string;
   instanceId?: string;
   groupJid?: string;
@@ -141,7 +141,7 @@ export function clampMessageLimit(value: number | undefined): number {
   return Math.min(Math.max(Math.floor(value), 1), MESSAGE_MAX_LIMIT);
 }
 
-function toRow(doc: MessageDoc): MessageRow {
+export function toMessageRow(doc: MessageDoc): MessageRow {
   const media = doc.media ?? {};
   return {
     waMessageId: doc.waMessageId ?? "",
@@ -279,7 +279,7 @@ export async function searchMessages(db: Db, input: MessageSearchInput): Promise
       .sort(SORT)
       .limit(limit)
       .toArray();
-    return docs.map(toRow);
+    return docs.map(toMessageRow);
   }
 
   const typeahead = new RegExp(`^${escapeRegExp(term.toLowerCase())}`);
@@ -298,7 +298,7 @@ export async function searchMessages(db: Db, input: MessageSearchInput): Promise
 
   const byIdentity = new Map<string, MessageRow>();
   for (const doc of [...byText, ...byTypeahead]) {
-    const row = toRow(doc);
+    const row = toMessageRow(doc);
     const identity = `${row.instanceId}\u0000${row.waMessageId}`;
     if (!byIdentity.has(identity)) byIdentity.set(identity, row);
   }

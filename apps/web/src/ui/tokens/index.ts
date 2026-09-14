@@ -40,6 +40,15 @@ export const ROW_HEIGHT = { comfortable: 40, compact: 32, header: 36 } as const;
 export const SHELL = { header: 48, spine: 40, sidebar: 240, rail: 48 } as const;
 
 /**
+ * The resource surfaces (§4.1 R-L3): the warm bar's thickness and sweep period.
+ * They are tokens rather than literals in `globals.css` for the same reason
+ * every other length is — the stylesheet consumes names, not values — and the
+ * cycle lives here rather than in `MOTION` because feedback motion is capped at
+ * 300 ms and a progress indication is not feedback motion.
+ */
+export const RESOURCE = { barHeight: 2, barCycleMs: 1200 } as const;
+
+/**
  * The interactive floor (§4.7 R-M4), in px: the WCAG 2.2 minimum a control may
  * occupy. It is a token rather than a padding choice because it is a rule about
  * the target, and every control that is not deliberately larger uses it.

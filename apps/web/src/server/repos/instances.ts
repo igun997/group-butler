@@ -21,7 +21,7 @@ export interface InstanceRow {
 }
 
 /** A stored `instances` document: the worker's `runtime.*` and the BFF's `config.*`. */
-type InstanceDoc = {
+export type InstanceDoc = {
   _id: string;
   organizationId: string;
   label?: string;
@@ -55,6 +55,20 @@ function groupSyncOf(runtime: InstanceDoc["runtime"]): InstanceGroupSync {
   };
 }
 
+/**
+ * One stored instance as the dashboard's row. Exported because the SSE route
+ * patches an instance with exactly this shape, so the live frame and the read
+ * can never drift apart.
+ */
+export function toInstanceRow(doc: InstanceDoc): InstanceRow {
+  return {
+    id: doc._id,
+    label: doc.label ?? "",
+    status: doc.runtime?.status ?? "disconnected",
+    groupSync: groupSyncOf(doc.runtime),
+  };
+}
+
 /** Every instance of one organisation, oldest label first. */
 export async function listInstances(db: Db, organizationId: string): Promise<InstanceRow[]> {
   const docs = await db
@@ -62,12 +76,7 @@ export async function listInstances(db: Db, organizationId: string): Promise<Ins
     .find({ organizationId })
     .sort({ label: 1 })
     .toArray();
-  return docs.map((doc) => ({
-    id: doc._id,
-    label: doc.label ?? "",
-    status: doc.runtime?.status ?? "disconnected",
-    groupSync: groupSyncOf(doc.runtime),
-  }));
+  return docs.map(toInstanceRow);
 }
 
 /**

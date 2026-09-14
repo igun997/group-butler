@@ -7,6 +7,7 @@ import {
   MOTION,
   PALETTE,
   RADIUS,
+  RESOURCE,
   ROW_HEIGHT,
   SHEET,
   SHELL,
@@ -127,6 +128,11 @@ describe("token layer (spec §3.2)", () => {
     }
     expect(light.get("--focus-ring-width")).toBe(`${FOCUS.width}px`);
     expect(light.get("--focus-ring-offset")).toBe(`${FOCUS.offset}px`);
+
+    // The resource surfaces' warm bar (R-L3) is a named value like everything
+    // else `globals.css` consumes.
+    expect(light.get("--resource-bar-height")).toBe(`${RESOURCE.barHeight}px`);
+    expect(light.get("--resource-bar-cycle")).toBe(`${RESOURCE.barCycleMs}ms`);
 
     // The interactive floor, the modal surfaces, and the scrim are tokens too:
     // a control, a palette, and a sheet consume the same values, not their own.

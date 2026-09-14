@@ -148,6 +148,14 @@
   --breakpoint-md: 767px;
   --breakpoint-sm: 640px;
 
+  /*
+   * The resource surfaces (P3, R-L3). The warm bar's thickness and its sweep
+   * period: 1200 ms is deliberately outside `MOTION.duration` (feedback motion
+   * is capped at 300 ms), because a progress indication is not feedback motion.
+   */
+  --resource-bar-height: 2px;
+  --resource-bar-cycle: 1200ms;
+
   /* The labelled type ramp of §3.2, step for step. */
   --type-caption-size: 12px;
   --type-caption-line: 16px;

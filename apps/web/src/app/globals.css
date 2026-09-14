@@ -866,3 +866,117 @@ body > main [role="alert"]:empty {
 .state-badge__glyph {
   display: inline-flex;
 }
+
+/* ---------------------------------------------------------------------------
+ * P3 — the resource surfaces: skeleton, warm bar, empty and error (R-L1–R-L3,
+ * R-L4, R-V3)
+ *
+ * `ResourceGate` is the only component that renders any of these, so this is
+ * the only place their geometry lives. The skeleton is the descriptor's own
+ * first-paint plan and never animates (`MOTION` is feedback-only); the warm bar
+ * is the one motion here, and it is `aria-hidden` and stops under
+ * `prefers-reduced-motion`. Nothing in this section is selected by transport —
+ * a degraded stream MUST leave the DOM byte-identical (R-V3).
+ * ------------------------------------------------------------------------- */
+.resource-gate {
+  position: relative;
+  min-width: 0;
+}
+
+.resource-gate[aria-busy="true"] {
+  cursor: progress;
+}
+
+/*
+ * R-L1 `warm`: the previous rows stay readable at reduced emphasis while the
+ * refetch runs; the bar below is the only new ink on screen.
+ */
+.resource-gate[data-state="warm"] > :not(.resource-gate__bar) {
+  opacity: 0.6;
+}
+
+/* The 2 px indeterminate bar (R-L3): aria-hidden, in flow at the panel's top. */
+.resource-gate__bar {
+  position: absolute;
+  inset-block-start: 0;
+  inset-inline: 0;
+  height: var(--resource-bar-height);
+  overflow: hidden;
+  background: var(--muted);
+}
+
+/*
+ * A full-width segment that sweeps left to right: `100%` translates it clear of
+ * either edge and `scaleX(0.4)` shows two fifths of the track at a time. Only
+ * the token supplies a length, so the rule stays inside the token layer's
+ * vocabulary like every rule above it.
+ */
+.resource-gate__bar::after {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  inline-size: 100%;
+  transform-origin: left;
+  background: var(--primary);
+  animation: resource-warm-bar var(--resource-bar-cycle) var(--motion-curve-standard) infinite;
+}
+
+@keyframes resource-warm-bar {
+  from {
+    transform: translateX(-100%) scaleX(0.4);
+  }
+
+  to {
+    transform: translateX(100%) scaleX(0.4);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .resource-gate__bar::after {
+    animation: none;
+    transform: scaleX(0.4);
+  }
+}
+
+/* R-L4: the descriptor's geometry, reserving the space the data will occupy. */
+.resource-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+/* The empty and error surfaces (R-E1, R-X2): plain content in the panel's own
+   region, with the way out as the only control. */
+.resource-surface {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-4);
+}
+
+.resource-surface__title {
+  margin: 0;
+  font-size: var(--type-subtitle-size);
+  line-height: var(--type-subtitle-line);
+  font-weight: var(--type-subtitle-weight);
+}
+
+.resource-surface__body {
+  margin: 0;
+  max-width: var(--surface-max-width);
+  color: var(--muted-foreground);
+  font-size: var(--type-body-size);
+  line-height: var(--type-body-line);
+}
+
+.resource-surface__action {
+  min-height: var(--target-min);
+  padding: var(--space-1) var(--space-3);
+  font: inherit;
+  color: var(--primary-foreground);
+  background: var(--primary);
+  border: var(--border-width) solid var(--primary);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
