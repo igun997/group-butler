@@ -44,6 +44,7 @@ export function ConfirmDialog({ request }: ConfirmDialogProps) {
   const dialog = useRef<HTMLDialogElement>(null);
   const cancelButton = useRef<HTMLButtonElement>(null);
   const answered = useRef(false);
+  const inFlight = useRef(false);
   const [pending, setPending] = useState(false);
   const [failure, setFailure] = useState<MappedError | undefined>(undefined);
   const titleId = useId();
@@ -82,6 +83,12 @@ export function ConfirmDialog({ request }: ConfirmDialogProps) {
   );
 
   const agree = useCallback(async () => {
+    // R-A8: acquired synchronously, before `run` and before `setPending`. React
+    // only disables the control when it renders, so a second activation in the
+    // same task — a double click, a held Enter — would otherwise issue the
+    // destructive operation twice. The ref is the boundary `pending` cannot be.
+    if (inFlight.current) return;
+    inFlight.current = true;
     setPending(true);
     setFailure(undefined);
     const mapped = await request.run();
@@ -89,12 +96,25 @@ export function ConfirmDialog({ request }: ConfirmDialogProps) {
       finish(true);
       return;
     }
+    // The attempt is over, so the operator may confirm again (R-X4): the guard
+    // is released only here, once this attempt has an outcome.
+    inFlight.current = false;
     // R-X2: a dialog MUST NOT dismiss on failure, so the evidence stays here
     // and the confirm control is the re-confirmation R-X4 asks for. Focus goes
     // back to the control it started on, in the effect above.
     setFailure(mapped);
     setPending(false);
   }, [request, finish]);
+
+  /**
+   * Leaving. A running operation is not abandoned for the same reason it is not
+   * repeated: the dialog owns it until it settles, and its outcome is the only
+   * honest answer.
+   */
+  const cancel = useCallback(() => {
+    if (inFlight.current) return;
+    finish(false);
+  }, [finish]);
 
   return (
     <dialog
@@ -107,10 +127,10 @@ export function ConfirmDialog({ request }: ConfirmDialogProps) {
       onCancel={(event) => {
         if (pending) event.preventDefault();
       }}
-      onClose={() => finish(false)}
+      onClose={cancel}
       onKeyDown={(event) => trapTabKey(dialog.current, event)}
       onClick={(event: MouseEvent<HTMLDialogElement>) => {
-        if (event.target === dialog.current) finish(false);
+        if (event.target === dialog.current) cancel();
       }}
     >
       <h2 id={titleId} className="confirm-dialog__title">
@@ -131,7 +151,7 @@ export function ConfirmDialog({ request }: ConfirmDialogProps) {
           ref={cancelButton}
           type="button"
           className="confirm-dialog__cancel"
-          onClick={() => finish(false)}
+          onClick={cancel}
           disabled={pending}
         >
           Cancel

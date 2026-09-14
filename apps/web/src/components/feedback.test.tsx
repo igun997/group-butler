@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { confirmationStore, emptyPlan, mapError, signalOf, toastQueue, TOAST_DURATION } from "../ui/feedback";
+import { confirmationStore, emptyPlan, mapError, signalOf, toastQueue, TOAST_DURATION, type MappedError } from "../ui/feedback";
 import { resourceCache, ResourceGate } from "../ui/resource";
 import type { EmptyPlan, ResourceDescriptor, Scope, UIError } from "../ui/registry";
 import { AppShell } from "./app-shell";
@@ -463,6 +463,49 @@ describe("the confirmation dialog (R-A8, R-X2, R-L9)", () => {
     await expect(answered).resolves.toBe(false);
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(document.activeElement).toBe(invoker);
+  });
+
+  test("a rapid second activation cannot run the destructive operation twice (R-A8)", async () => {
+    const settle: { finish: (failure?: MappedError) => void } = { finish: () => {} };
+    const run = vi.fn(
+      () =>
+        new Promise<MappedError | undefined>((resolve) => {
+          settle.finish = (failure) => resolve(failure);
+        }),
+    );
+    render(<ConfirmationHost />);
+
+    let answered: Promise<boolean> | undefined;
+    act(() => {
+      answered = confirmationStore.ask(PLAN, run);
+    });
+
+    // Two activations in one task, before React commits the pending state — the
+    // window a double click or a held Enter opens.
+    const confirm = screen.getByRole("button", { name: "Delete" });
+    act(() => {
+      confirm.click();
+      confirm.click();
+    });
+    expect(run).toHaveBeenCalledTimes(1);
+
+    // The attempt's failure ends it, and one later retry is allowed — once.
+    await act(async () => {
+      settle.finish(mapError({ code: "instance_cleanup_failed" }, "action"));
+    });
+    expect(screen.getByText(/could not be removed/i)).toBeDefined();
+
+    act(() => {
+      screen.getByRole("button", { name: "Delete" }).click();
+      screen.getByRole("button", { name: "Delete" }).click();
+    });
+    expect(run).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      settle.finish(undefined);
+    });
+    await expect(answered).resolves.toBe(true);
+    expect(screen.queryByText("Delete this instance?")).toBeNull();
   });
 
   test("queues a second question behind the first, one modal at a time", async () => {
