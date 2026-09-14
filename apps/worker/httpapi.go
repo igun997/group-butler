@@ -115,10 +115,28 @@ type syncResponse struct {
 func (a *api) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", a.handleHealth)
+	// The scheduled loops are operational detail, so they sit behind the same
+	// bearer token as the instance surface rather than beside the open probe.
+	mux.HandleFunc("/scheduler", a.auth(a.handleScheduler))
 	instances := a.auth(a.handleInstanceSubresource)
 	mux.HandleFunc("/instances", instances)
 	mux.HandleFunc("/instances/", instances)
 	return mux
+}
+
+// handleScheduler reports what this worker's timers are doing: each loop's
+// cadence and the outcome of its last pass. `/health` answers whether the worker
+// is usable; this answers what it is up to.
+func (a *api) handleScheduler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "GET only")
+		return
+	}
+	if a.manager == nil {
+		writeError(w, http.StatusNotFound, "not_found", "no scheduled loops to report")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"loops": a.manager.loops.snapshot()})
 }
 
 // handleHealth is the §6.5 probe: `/health` stays open for container probes and

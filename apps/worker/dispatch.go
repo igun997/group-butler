@@ -52,6 +52,7 @@ func newSendDispatcher(db *mongo.Database, cfg Config) *sendDispatcher {
 // run claims requests at startup as well as on each tick, so a request approved
 // while the worker was down is not delayed by one whole dispatch interval.
 func (d *sendDispatcher) run(ctx context.Context, mgr *manager) {
+	mgr.loops.declare(loopSendDispatch, d.interval)
 	d.dispatchDue(ctx, mgr)
 	ticks, stop := d.newTicker(d.interval)
 	defer stop()
@@ -60,20 +61,23 @@ func (d *sendDispatcher) run(ctx context.Context, mgr *manager) {
 		case <-ctx.Done():
 			return
 		case <-ticks:
-			d.dispatchDue(ctx, mgr)
+			mgr.loops.pass(loopSendDispatch, time.Now(), d.dispatchDue(ctx, mgr))
 		}
 	}
 }
 
-func (d *sendDispatcher) dispatchDue(ctx context.Context, mgr *manager) {
+// dispatchDue claims and delivers every due request. A claim failure is returned
+// so the loop's pass reports it: an individual delivery failure is already the
+// request's own business, but being unable to read the queue is not.
+func (d *sendDispatcher) dispatchDue(ctx context.Context, mgr *manager) error {
 	for {
 		request, err := d.claim(ctx, time.Now().UTC())
 		if errors.Is(err, mongo.ErrNoDocuments) {
-			return
+			return nil
 		}
 		if err != nil {
 			logf("send dispatch claim: %v", err)
-			return
+			return err
 		}
 		if err := d.deliver(ctx, mgr, request); err != nil {
 			logf("send dispatch %s: %v", request.ID, err)

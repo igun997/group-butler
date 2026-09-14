@@ -395,3 +395,51 @@ func TestGroupByJID_OfflineInstanceServesStoredRow(t *testing.T) {
 		t.Fatalf("status = %d, want the persisted row even with no live client", rec.Code)
 	}
 }
+
+// ---- GET /scheduler: what the loops are doing (§6.5 reports queues, not cadences) ----
+
+func TestSchedulerEndpointReportsEachLoop(t *testing.T) {
+	mgr := testManager(newFakeInstanceRepo(), newFakePairingStore(), &fakeDeviceStore{}, newFakeClient())
+	defer mgr.shutdown(context.Background())
+	at := time.Date(2026, 9, 14, 10, 0, 0, 0, time.UTC)
+	mgr.loops.declare("group-sync", 30*time.Minute)
+	mgr.loops.declare("media-janitor", 5*time.Minute)
+	mgr.loops.pass("group-sync", at, errors.New("iq timeout"))
+
+	rec := callJSON(t, mgr.api(), http.MethodGet, "/scheduler", "dev-secret", "")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Loops []loopReport `json:"loops"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode %s: %v", rec.Body.String(), err)
+	}
+	if len(body.Loops) != 2 {
+		t.Fatalf("loops = %d, want the two declared", len(body.Loops))
+	}
+	first := body.Loops[0]
+	if first.Name != "group-sync" || first.Runs != 1 || first.LastError != "iq timeout" {
+		t.Fatalf("first loop = %+v, want the failed pass it recorded", first)
+	}
+	if first.LastRunAt == nil || !first.LastRunAt.Equal(at) {
+		t.Fatalf("last run = %v, want %v", first.LastRunAt, at)
+	}
+	if second := body.Loops[1]; second.IntervalMs != (5*time.Minute).Milliseconds() || second.LastRunAt != nil {
+		t.Fatalf("second loop = %+v, want its interval and no run yet", second)
+	}
+}
+
+func TestSchedulerEndpointRequiresTheToken(t *testing.T) {
+	mgr := testManager(newFakeInstanceRepo(), newFakePairingStore(), &fakeDeviceStore{}, newFakeClient())
+	defer mgr.shutdown(context.Background())
+	mgr.loops.declare("group-sync", 30*time.Minute)
+
+	rec := callJSON(t, mgr.api(), http.MethodGet, "/scheduler", "not-the-secret", "")
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 without the control-plane token", rec.Code)
+	}
+}

@@ -283,6 +283,10 @@ type manager struct {
 	// logout can never be overtaken by the connect that preceded it.
 	lifecycle *lifecycleQueue
 
+	// loops is where the scheduled loops record their last pass, so the console
+	// can show a cadence this worker owns rather than only its queues (§6.5).
+	loops *loopRegistry
+
 	// ping is the `/health` database reachability check (§6.5).
 	ping func(ctx context.Context) error
 
@@ -320,6 +324,7 @@ func newManager(cfg Config, groups groupStoreAPI, instances instanceRepo, pairin
 		devices:   devices,
 		persist:   newPersistQueue(cfg.EventQueueSize, cfg.EventWorkers),
 		lifecycle: newLifecycleQueue(),
+		loops:     newLoopRegistry(),
 		newClient: func(device *store.Device, log waLog.Logger) whatsmeowClient {
 			return whatsmeowNewClient(device, log)
 		},

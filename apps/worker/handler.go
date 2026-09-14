@@ -859,27 +859,29 @@ func (m *manager) runMediaJanitor(ctx context.Context) {
 	ticks, stop := m.newTicker(m.cfg.MediaJanitorEvery)
 	defer stop()
 	logf("media janitor started (every %s)", m.cfg.MediaJanitorEvery)
+	m.loops.declare(loopMediaJanitor, m.cfg.MediaJanitorEvery)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticks:
-			m.janitorSweep(ctx)
+			m.loops.pass(loopMediaJanitor, time.Now(), m.janitorSweep(ctx))
 		}
 	}
 }
 
 // janitorSweep queues one retry per candidate whose instance has a live client.
 // An attachment whose owner is disconnected is left pending: it is recoverable
-// by definition, and marking it exhausted would lie about what happened.
-func (m *manager) janitorSweep(ctx context.Context) {
+// by definition, and marking it exhausted would lie about what happened. A store
+// failure is returned so the loop's pass reports it rather than looking clean.
+func (m *manager) janitorSweep(ctx context.Context) error {
 	if m.media == nil {
-		return
+		return nil
 	}
 	candidates, err := m.media.store.pendingMedia(ctx, m.orgID, m.cfg.MediaMaxAttempts)
 	if err != nil {
 		logf("media janitor: %v", err)
-		return
+		return err
 	}
 	queued := 0
 	for _, candidate := range candidates {
@@ -905,6 +907,7 @@ func (m *manager) janitorSweep(ctx context.Context) {
 	if len(candidates) > 0 {
 		logf("media janitor: queued %d of %d pending attachment(s) for retry", queued, len(candidates))
 	}
+	return nil
 }
 
 // descriptorFromStored rebuilds the downloadable descriptor for a stored message

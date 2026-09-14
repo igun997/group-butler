@@ -554,22 +554,23 @@ func (m *manager) syncGroupsOnConnect(s *session) {
 // runGroupSyncOnce performs one full sync for one session under its own
 // deadline. It is shared by the connect-time sync and the GROUP_SYNC_INTERVAL
 // scheduler, so both paths reconcile identically.
-func (m *manager) runGroupSyncOnce(ctx context.Context, s *session, source SyncSource) {
+func (m *manager) runGroupSyncOnce(ctx context.Context, s *session, source SyncSource) error {
 	s.mu.Lock()
 	client := s.client
 	s.mu.Unlock()
 	if client == nil {
-		return
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, groupSyncTimeout)
 	defer cancel()
 	summary, err := runGroupSync(ctx, client, m.groups, m.orgID, s.id, source, m.cfg.GroupSyncPrune)
 	if err != nil {
 		logf("instance %s: group sync (%s): %v", s.id, source, err)
-		return
+		return err
 	}
 	logf("instance %s: group sync (%s): %d group(s), %d added, %d marked left",
 		s.id, source, summary.Total, summary.Added, summary.MarkedLeft)
+	return nil
 }
 
 // runGroupSyncScheduler performs the periodic full reconcile (§6.6.2) until its
@@ -579,26 +580,32 @@ func (m *manager) runGroupSyncScheduler(ctx context.Context) {
 	ticks, stop := m.newTicker(m.cfg.GroupSyncInterval)
 	defer stop()
 	logf("group sync scheduler started (every %s)", m.cfg.GroupSyncInterval)
+	m.loops.declare(loopGroupSync, m.cfg.GroupSyncInterval)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticks:
-			m.syncAllConnected(ctx)
+			m.loops.pass(loopGroupSync, time.Now(), m.syncAllConnected(ctx))
 		}
 	}
 }
 
 // syncAllConnected runs one timer-driven sync for every instance with a live
 // client. An offline instance has nothing to ask, so it is skipped rather than
-// recorded as a failed sync.
-func (m *manager) syncAllConnected(ctx context.Context) {
+// recorded as a failed sync. The first failure is returned so the loop can report
+// it: a pass that hid a refused sync would look like a healthy one.
+func (m *manager) syncAllConnected(ctx context.Context) error {
+	var firstErr error
 	for _, s := range m.listActive() {
 		if m.groupClient(s.id) == nil {
 			continue
 		}
-		m.runGroupSyncOnce(ctx, s, SyncOnTimer)
+		if err := m.runGroupSyncOnce(ctx, s, SyncOnTimer); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
+	return firstErr
 }
 
 const groupSyncTimeout = time.Minute
