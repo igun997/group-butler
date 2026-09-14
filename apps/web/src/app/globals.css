@@ -993,7 +993,10 @@ body > main [role="alert"]:empty {
  * nothing to remove here (R-A9), and no status is carried by a stripe, a border
  * edge, or an inset shadow (R-A4).
  * ------------------------------------------------------------------------- */
-.error-state__code-row {
+/* The raw code of an unrecognised failure — the error state's chip and the
+   toast's are the same chip (R-X1). `user-select: all` makes it one selection,
+   so the code is copyable without a control that could fail. */
+.code-chip-row {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
@@ -1001,18 +1004,13 @@ body > main [role="alert"]:empty {
   margin: 0;
 }
 
-.error-state__code-label {
+.code-chip-label {
   color: var(--muted-foreground);
   font-size: var(--type-caption-size);
   line-height: var(--type-caption-line);
 }
 
-/*
- * The raw code of an unrecognised failure, and the only place a code is shown.
- * `user-select: all` makes the chip one selection, so the code is copyable
- * without a control that could fail (R-X1).
- */
-.error-state__code {
+.code-chip {
   padding: 0 var(--space-1);
   font-family: var(--font-mono);
   font-size: var(--type-caption-size);
@@ -1095,4 +1093,67 @@ body > main [role="alert"]:empty {
   border: var(--border-width) solid var(--border);
   border-radius: var(--radius-control);
   cursor: pointer;
+}
+
+/* ---------------------------------------------------------------------------
+ * P4 — the confirmation dialog (R-A8, R-X2, R-L9)
+ *
+ * The native `dialog` supplies the modal layer, the focus trap and the return
+ * of focus; this is only its geometry. The destructive control is toned as
+ * destructive and paired with a label, never a colour alone (R-A3).
+ * ------------------------------------------------------------------------- */
+.confirm-dialog {
+  width: min(var(--surface-max-width), calc(100vw - var(--space-8)));
+  padding: var(--space-4);
+  color: var(--popover-foreground);
+  background: var(--popover);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-dialog);
+  box-shadow: var(--elevation-28);
+}
+
+.confirm-dialog::backdrop {
+  background: var(--scrim);
+}
+
+.confirm-dialog__title {
+  margin: 0 0 var(--space-2);
+  font-size: var(--type-subtitle-size);
+  line-height: var(--type-subtitle-line);
+  font-weight: var(--type-subtitle-weight);
+}
+
+.confirm-dialog__body {
+  margin: 0 0 var(--space-4);
+  color: var(--muted-foreground);
+  font-size: var(--type-body-size);
+  line-height: var(--type-body-line);
+}
+
+.confirm-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.confirm-dialog__cancel,
+.confirm-dialog__confirm {
+  min-height: var(--target-min);
+  padding: var(--space-1) var(--space-3);
+  font: inherit;
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+
+.confirm-dialog__cancel {
+  color: var(--foreground);
+  background: var(--background);
+}
+
+/* R-A8: the destructive control is named by its label as well as its tone. */
+.confirm-dialog__confirm {
+  color: var(--destructive-foreground);
+  background: var(--destructive);
+  border-color: var(--destructive);
 }

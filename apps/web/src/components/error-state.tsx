@@ -1,4 +1,4 @@
-import type { MappedError } from "../ui/feedback";
+import type { PresentableError } from "../ui/feedback";
 
 /**
  * The error state (docs/ui-decision.md §4.5 R-X1–R-X4).
@@ -17,7 +17,7 @@ import type { MappedError } from "../ui/feedback";
  * help (R-X4).
  */
 export interface ErrorStateProps {
-  error: MappedError;
+  error: PresentableError;
   /**
    * Re-runs exactly the call that failed (R-X4). Omit where the operation is
    * not idempotent: then only a declared recovery, if any, is rendered.
@@ -34,9 +34,9 @@ export function ErrorState({ error, onRetry }: ErrorStateProps) {
       <h2 className="resource-surface__title">{error.title}</h2>
       {error.body === undefined ? null : <p className="resource-surface__body">{error.body}</p>}
       {error.copyableCode === undefined ? null : (
-        <p className="error-state__code-row">
-          <span className="error-state__code-label">Error code</span>
-          <code className="error-state__code">{error.copyableCode}</code>
+        <p className="code-chip-row">
+          <span className="code-chip-label">Error code</span>
+          <code className="code-chip">{error.copyableCode}</code>
         </p>
       )}
       {recovery?.kind === "navigate" && recovery.href !== undefined ? (

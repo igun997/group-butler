@@ -1,10 +1,19 @@
 "use client";
 
 import { type MouseEvent, type ReactNode, useCallback, useId, useRef, useState } from "react";
+import { useToastOverlay } from "../ui/feedback";
 import { CommandPalette, type PaletteCommand } from "./command-palette";
+import { ConfirmationHost } from "./confirm-dialog";
 import { trapTabKey } from "./focus-trap";
 import { signOutAndRedirect } from "./sign-out";
 import { Toaster } from "./toaster";
+
+/**
+ * R-M5's owner name for the small-viewport navigation sheet: while it is open
+ * the notification stack moves to the top edge, and it says so under this name
+ * so another layer opening later cannot speak for it.
+ */
+const NAV_SHEET_OVERLAY = "nav-sheet";
 
 /**
  * One destination in the registry navigation (docs/ui-decision.md §2.2
@@ -98,6 +107,9 @@ export function AppShell({
     if (trigger && trigger.getClientRects().length > 0) trigger.focus();
     else heading.current?.focus();
   }, []);
+
+  // R-M5: the sheet owns the bottom edge for as long as it is open.
+  useToastOverlay(NAV_SHEET_OVERLAY, navOpen);
 
   const runSignOut = useCallback(async () => {
     setSigningOut(true);
@@ -208,6 +220,7 @@ export function AppShell({
       </dialog>
 
       <Toaster />
+      <ConfirmationHost />
     </div>
   );
 }

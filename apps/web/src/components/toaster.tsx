@@ -111,6 +111,14 @@ function Toast({ record }: { record: ToastRecord }) {
         {record.count > 1 ? <span className="toast__count">{`×${record.count}`}</span> : null}
       </p>
       {record.body === undefined ? null : <p className="toast__body">{record.body}</p>}
+      {record.copyableCode === undefined ? null : (
+        // R-X1: an unrecognised code is shown as itself, in the one place a
+        // failure's details may appear — never read into the sentence.
+        <p className="code-chip-row">
+          <span className="code-chip-label">Error code</span>
+          <code className="code-chip">{record.copyableCode}</code>
+        </p>
+      )}
       {control === undefined ? (
         // A toast that does not dismiss itself keeps one way out; the ones that
         // do carry no control at all (R-T1, R-T4).

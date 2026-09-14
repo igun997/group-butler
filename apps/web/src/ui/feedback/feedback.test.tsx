@@ -222,12 +222,12 @@ describe("the toast queue (R-T1..R-T4)", () => {
   test("a rejected operation settles into the mapped failure, not its success copy (R-X1, R-X2)", async () => {
     const queue = createToastQueue();
     queue.push({
-      dedupeKey: "sync:inst_offline",
+      dedupeKey: "sync:inst_1",
       class: "success",
       role: "status",
       duration: TOAST_DURATION.success,
       title: "Groups synced",
-      promise: Promise.reject({ code: "instance_offline" }),
+      promise: Promise.reject({ code: "group_sync_failed" }),
     });
 
     await vi.waitFor(() => expect(queue.records()[0]!.state).toBe("settled"));
@@ -235,7 +235,73 @@ describe("the toast queue (R-T1..R-T4)", () => {
     expect(record.class).toBe("errorRecoverable");
     expect(record.role).toBe("alert");
     expect(record.title).not.toBe("Groups synced");
-    expect(record.title).toMatch(/live WhatsApp session/i);
+    expect(record.title).toMatch(/group sync failed/i);
+  });
+
+  test("a failure whose surface is not the toast withdraws the record (R-X2, R-X3)", async () => {
+    vi.useFakeTimers();
+    try {
+      const queue = createToastQueue();
+      for (const code of ["instance_offline", "ai_no_whitelist", "foreign_media"]) {
+        queue.push({
+          dedupeKey: `run:${code}`,
+          class: "success",
+          role: "status",
+          duration: TOAST_DURATION.success,
+          title: "Working",
+          promise: Promise.reject({ code }),
+        });
+        expect(queue.records()).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(queue.records(), `${code} must not be reported by a toast`).toHaveLength(0);
+      }
+
+      // The one code whose failure the spec says gets both carries on.
+      queue.push({
+        dedupeKey: "sign-in:rate",
+        class: "success",
+        role: "status",
+        duration: TOAST_DURATION.success,
+        title: "Signing in",
+        promise: Promise.reject({ code: "rate_limited" }),
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(queue.records()[0]!.title).toMatch(/too many sign-in attempts/i);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("an unrecognised failure keeps its raw code on the toast it owns (R-X1)", async () => {
+    const queue = createToastQueue();
+    queue.push({
+      dedupeKey: "sync:inst_1",
+      class: "success",
+      role: "status",
+      duration: TOAST_DURATION.success,
+      title: "Groups synced",
+      promise: Promise.reject({ code: "some_future_code" }),
+    });
+
+    await vi.waitFor(() => expect(queue.records()[0]!.copyableCode).toBe("some_future_code"));
+    expect(queue.records()[0]!.title).toMatch(/unexpected/i);
+  });
+
+  test("the bottom edge is owned, not set (R-M5)", () => {
+    const queue = createToastQueue();
+    queue.setOverlay("nav-sheet", true);
+    queue.setOverlay("composer", true);
+    expect(queue.overlayOpen()).toBe(true);
+
+    // The sheet closing must not speak for the composer that is still open.
+    queue.setOverlay("nav-sheet", false);
+    expect(queue.overlayOpen()).toBe(true);
+
+    queue.setOverlay("composer", false);
+    expect(queue.overlayOpen()).toBe(false);
+
+    queue.setOverlay("nav-sheet", false);
+    expect(queue.overlayOpen()).toBe(false);
   });
 });
 
@@ -271,7 +337,46 @@ describe("useAction — the only toast emitter (R-T2, R-T5, R-A8)", () => {
       promise: Promise.reject({ code: "group_sync_failed" }),
     });
     expect(failed.ok).toBe(false);
+    expect(failed.error?.title).toMatch(/group sync failed/i);
     expect(push).toHaveBeenCalledTimes(2);
+  });
+
+  test("a failure with a home of its own is withdrawn from the queue and returned (R-X2, R-X3)", async () => {
+    // The real queue, not a spy: the point is that no record survives to
+    // report a failure whose surface is somewhere else.
+    const queue = createToastQueue();
+    const action = useAction({ push: queue.push });
+
+    for (const code of ["ai_no_whitelist", "foreign_media", "not_whitelisted"]) {
+      const outcome = await action.run({ action: "ask", label: "Asking the assistant", promise: Promise.reject({ code }) });
+      expect(outcome.ok, code).toBe(false);
+      expect(outcome.error?.surface, code).toBe("inline");
+      expect(outcome.error?.toast, code).toBe("never");
+      expect(queue.records(), code).toEqual([]);
+    }
+
+    const ambiguous = await action.run({
+      action: "send.approve",
+      label: "Send approved",
+      promise: Promise.reject({ errorClass: "ambiguous" }),
+    });
+    expect(ambiguous.error?.surface).toBe("inline");
+    expect(ambiguous.error?.title).toMatch(/delivery is unknown/i);
+    expect(queue.records()).toEqual([]);
+
+    const auth = await action.run({
+      action: "send.approve",
+      label: "Send approved",
+      promise: Promise.reject({ errorClass: "auth" }),
+    });
+    expect(auth.error?.surface).toBe("banner");
+    expect(auth.error?.toast).toBe("never");
+    expect(queue.records()).toEqual([]);
+
+    // A failure the toast owns still lands, so the withdrawal is not silence.
+    await action.run({ action: "sync", label: "Groups synced", promise: Promise.reject({ code: "group_sync_failed" }) });
+    expect(queue.records()).toHaveLength(1);
+    expect(queue.records()[0]!.title).toMatch(/group sync failed/i);
   });
 
   test("a background event never reaches the queue, whatever a caller passes (R-T5)", async () => {
@@ -289,21 +394,64 @@ describe("useAction — the only toast emitter (R-T2, R-T5, R-A8)", () => {
     expect(push).not.toHaveBeenCalled();
   });
 
-  test("a destructive action emits nothing until its dialog has confirmed (R-A8)", async () => {
+  test("a destructive action runs only once the confirmation channel says yes (R-A8)", async () => {
     const push = vi.fn();
     const operation = vi.fn(() => Promise.resolve("gone"));
-    const action = useAction({ push });
-    const confirm = { title: "Delete this instance?", body: "Its stored groups and messages stay.", confirmLabel: "Delete" };
+    const plan = { title: "Delete this instance?", body: "Its stored groups and messages stay.", confirmLabel: "Delete" };
+    const asked: string[] = [];
+    const action = useAction({
+      push,
+      confirm: async (askedPlan, run) => {
+        asked.push(askedPlan.title);
+        return (await run()) === undefined;
+      },
+    });
 
-    const refused = await action.run({ action: "instance.delete", targetId: "inst_1", label: "Instance deleted", confirm, promise: operation });
-    expect(refused.ok).toBe(false);
+    const agreed = await action.run({ action: "instance.delete", targetId: "inst_1", label: "Instance deleted", confirm: plan, promise: operation });
+    expect(asked).toEqual(["Delete this instance?"]);
+    expect(operation).toHaveBeenCalledTimes(1);
+    expect(agreed).toEqual({ ok: true, data: "gone" });
+    // The dialog owned the pending state and the outcome; one record reports it.
+    expect(push).toHaveBeenCalledTimes(1);
+  });
+
+  test("declining the confirmation runs nothing and says so (R-A8)", async () => {
+    const push = vi.fn();
+    const operation = vi.fn(() => Promise.resolve("gone"));
+    const action = useAction({ push, confirm: async () => false });
+
+    const outcome = await action.run({
+      action: "instance.delete",
+      targetId: "inst_1",
+      label: "Instance deleted",
+      confirm: { title: "Delete this instance?", body: "Its stored groups stay.", confirmLabel: "Delete" },
+      promise: operation,
+    });
+
+    expect(outcome).toEqual({ ok: false, declined: true });
     expect(operation).not.toHaveBeenCalled();
     expect(push).not.toHaveBeenCalled();
+  });
 
-    const confirmed = await action.run({ action: "instance.delete", targetId: "inst_1", label: "Instance deleted", confirm, confirmed: true, promise: operation });
-    expect(confirmed).toEqual({ ok: true, data: "gone" });
-    expect(operation).toHaveBeenCalledTimes(1);
-    expect(push).toHaveBeenCalledTimes(1);
+  test("a confirmation that fails answers with the mapped failure and no toast (R-X2)", async () => {
+    const push = vi.fn();
+    const action = useAction({
+      push,
+      confirm: async (_plan, run) => (await run()) === undefined,
+    });
+
+    const outcome = await action.run({
+      action: "instance.delete",
+      targetId: "inst_1",
+      label: "Instance deleted",
+      confirm: { title: "Delete this instance?", body: "Its stored groups stay.", confirmLabel: "Delete" },
+      promise: Promise.reject({ code: "instance_cleanup_failed" }),
+    });
+
+    // The dialog keeps this on screen (R-X2), so the toast does not repeat it.
+    expect(outcome.ok).toBe(false);
+    expect(outcome.error?.title).toMatch(/could not be removed/i);
+    expect(push).not.toHaveBeenCalled();
   });
 });
 
@@ -349,6 +497,29 @@ describe("the error map (R-X1, R-X3, R-X4)", () => {
     }
   });
 
+  test("a read is inline in its own panel and is never a toast (R-X2, R-T5)", () => {
+    for (const code of knownCodes) {
+      const mapped = mapError({ code });
+      expect(mapped.surface, `${code} belongs in its panel`).toBe("inline");
+      expect(mapped.toast, `${code} must not be toasted from a load`).toBe("never");
+    }
+  });
+
+  test("an action failure takes the surface its signal names (R-X2, R-X3)", () => {
+    // R-X3's two rows that must never be a toast: the send card keeps the
+    // delivery warning, and the instance banner keeps the one cause of a re-pair.
+    expect(mapError({ errorClass: "ambiguous" }, "action")).toMatchObject({ surface: "inline", toast: "never" });
+    expect(mapError({ errorClass: "auth" }, "action")).toMatchObject({ surface: "banner", toast: "never" });
+    expect(mapError({ errorClass: "transport" }, "action")).toMatchObject({ surface: "inline", toast: "never" });
+    expect(mapError({ code: "ai_no_whitelist" }, "action")).toMatchObject({ surface: "inline", toast: "never" });
+    expect(mapError({ code: "foreign_media" }, "action")).toMatchObject({ surface: "inline", toast: "never" });
+    expect(mapError({ runtimeStatus: "logged_out" }, "action")).toMatchObject({ surface: "banner", toast: "never" });
+    // The one failure the spec says gets both is the only one that accompanies.
+    expect(mapError({ code: "rate_limited" }, "action")).toMatchObject({ surface: "inline", toast: "also" });
+    // A failure with no home of its own is announced, which is R-X2's default.
+    expect(mapError({ code: "group_sync_failed" }, "action")).toMatchObject({ surface: "toast", toast: "owns" });
+  });
+
   test("an unknown code falls back and keeps the raw code copyable (R-X1)", () => {
     const mapped = mapError({ code: "some_future_code" });
 
@@ -366,7 +537,7 @@ describe("the error map (R-X1, R-X3, R-X4)", () => {
     expect(ambiguous.body).toMatch(/will not be retried/i);
     expect(ambiguous.retryable).toBe(false);
 
-    const auth = mapError({ errorClass: "auth" });
+    const auth = mapError({ errorClass: "auth" }, "action");
     expect(auth.surface).toBe("banner");
     expect(auth.body).toMatch(/re-pair/i);
 
@@ -374,8 +545,8 @@ describe("the error map (R-X1, R-X3, R-X4)", () => {
     expect(mapError({ errorClass: "rejected" }).surface).toBe("inline");
   });
 
-  test("a logged-out runtime is a banner whose reads stay readable (R-X3)", () => {
-    const mapped = mapError({ runtimeStatus: "logged_out" });
+  test("a logged-out runtime raises the instance banner whose reads stay readable (R-X3)", () => {
+    const mapped = mapError({ runtimeStatus: "logged_out" }, "action");
 
     expect(mapped.surface).toBe("banner");
     expect(mapped.body).toMatch(/readable/i);

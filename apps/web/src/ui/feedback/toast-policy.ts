@@ -197,6 +197,8 @@ export interface ToastInput {
    */
   pendingLabel?: string;
   body?: string;
+  /** The raw code of an unrecognised failure, rendered as the copyable chip (R-X1). */
+  copyableCode?: string;
   action?: ToastAction;
   /**
    * The operation this toast reports. With a promise the record starts
@@ -218,6 +220,7 @@ export interface ToastRecord {
   readonly title: string;
   readonly pendingLabel?: string;
   readonly body?: string;
+  readonly copyableCode?: string;
   readonly action?: ToastAction;
   readonly state: "pending" | "settled";
   readonly count: number;
@@ -233,9 +236,15 @@ export interface ToastQueue {
   records(): readonly ToastRecord[];
   /** The excess, held until a slot frees. */
   waiting(): readonly ToastRecord[];
-  /** R-M5: true while a composer or a sheet owns the bottom edge. */
+  /** R-M5: true while any composer or sheet owns the bottom edge. */
   overlayOpen(): boolean;
-  setOverlay(open: boolean): void;
+  /**
+   * R-M5, owned rather than set: each composer or sheet registers itself under
+   * its own name and releases it on close, so the edge only returns to the
+   * bottom when the last of them has let go. A plain boolean would let whichever
+   * layer closed last speak for the ones still open.
+   */
+  setOverlay(owner: string, open: boolean): void;
   subscribe(listener: () => void): () => void;
   /** Test seam only: the product never empties the queue. */
   __reset(): void;
@@ -250,6 +259,7 @@ interface ToastEntry {
   title: string;
   pendingLabel?: string;
   body?: string;
+  copyableCode?: string;
   action?: ToastAction;
   promise?: Promise<unknown>;
   signal?: FailureSignal;
@@ -277,6 +287,7 @@ function asRecord(entry: ToastEntry): ToastRecord {
     title: entry.title,
     pendingLabel: entry.pendingLabel,
     body: entry.body,
+    copyableCode: entry.copyableCode,
     action: entry.action,
     state: entry.state,
     count: entry.count,
@@ -289,7 +300,7 @@ export function createToastQueue(): ToastQueue {
   let entries: ToastEntry[] = [];
   let visible: readonly ToastRecord[] = EMPTY_RECORDS;
   let waiting: readonly ToastRecord[] = EMPTY_RECORDS;
-  let overlay = false;
+  const overlays = new Set<string>();
   let minted = 0;
   const listeners = new Set<() => void>();
 
@@ -329,19 +340,27 @@ export function createToastQueue(): ToastQueue {
 
   /**
    * R-T2's settle: the record the operator is already reading becomes the
-   * outcome. A failure takes its copy, class, and duration from the error map,
-   * and loses a retry the map says is not safe (R-X3, R-X4).
+   * outcome. A failure whose mapped surface is not the toast withdraws the
+   * record instead — the caller renders the surface the error declares, and
+   * this toast must never stand in for it (R-X2, R-X3). One that stays takes
+   * its copy, class, and duration from the error map, and loses a retry the map
+   * says is not safe (R-X4).
    */
   function settle(entry: ToastEntry, failure: MappedError | undefined): void {
-    entry.state = "settled";
     if (failure !== undefined) {
+      if (failure.toast === "never") {
+        dismiss(entry.id);
+        return;
+      }
       entry.class = failure.retryable ? "errorRecoverable" : "errorBlocking";
       entry.role = "alert";
       entry.duration = TOAST_DURATION[entry.class];
       entry.title = failure.title;
       entry.body = failure.body;
+      entry.copyableCode = failure.copyableCode;
       if (!failure.retryable && entry.action?.kind === "retry") entry.action = undefined;
     }
+    entry.state = "settled";
     commit();
   }
 
@@ -353,7 +372,11 @@ export function createToastQueue(): ToastQueue {
         if (entry.generation === generation) settle(entry, undefined);
       },
       (reason: unknown) => {
-        if (entry.generation === generation) settle(entry, mapError({ ...entry.signal, ...signalOf(reason) }));
+        // The queue is the action path, so a rejection is an action failure:
+        // the map decides from that which surface owns it (R-X2).
+        if (entry.generation === generation) {
+          settle(entry, mapError({ ...entry.signal, ...signalOf(reason) }, "action"));
+        }
       },
     );
   }
@@ -381,6 +404,7 @@ export function createToastQueue(): ToastQueue {
       repeat.title = toast.title;
       repeat.pendingLabel = toast.pendingLabel;
       repeat.body = toast.body;
+      repeat.copyableCode = toast.copyableCode;
       repeat.action = toast.action;
       repeat.signal = toast.signal;
       repeat.promise = toast.promise;
@@ -401,6 +425,7 @@ export function createToastQueue(): ToastQueue {
       title: toast.title,
       pendingLabel: toast.pendingLabel,
       body: toast.body,
+      copyableCode: toast.copyableCode,
       action: toast.action,
       promise: toast.promise,
       signal: toast.signal,
@@ -441,10 +466,11 @@ export function createToastQueue(): ToastQueue {
     resume,
     records: () => visible,
     waiting: () => waiting,
-    overlayOpen: () => overlay,
-    setOverlay(open: boolean) {
-      if (overlay === open) return;
-      overlay = open;
+    overlayOpen: () => overlays.size > 0,
+    setOverlay(owner: string, open: boolean) {
+      if (overlays.has(owner) === open) return;
+      if (open) overlays.add(owner);
+      else overlays.delete(owner);
       commit();
     },
     subscribe(listener: () => void) {
@@ -456,7 +482,7 @@ export function createToastQueue(): ToastQueue {
     __reset() {
       for (const entry of entries) disarm(entry);
       entries = [];
-      overlay = false;
+      overlays.clear();
       commit();
     },
   };

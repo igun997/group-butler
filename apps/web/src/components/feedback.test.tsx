@@ -1,9 +1,11 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { emptyPlan, mapError, signalOf, toastQueue, TOAST_DURATION } from "../ui/feedback";
+import { confirmationStore, emptyPlan, mapError, signalOf, toastQueue, TOAST_DURATION } from "../ui/feedback";
 import { resourceCache, ResourceGate } from "../ui/resource";
 import type { EmptyPlan, ResourceDescriptor, Scope, UIError } from "../ui/registry";
+import { AppShell } from "./app-shell";
+import { ConfirmationHost } from "./confirm-dialog";
 import { EmptyState } from "./empty-state";
 import { ErrorState } from "./error-state";
 import { Toaster } from "./toaster";
@@ -42,9 +44,35 @@ function makeResource<D>(
   };
 }
 
+/**
+ * jsdom ships the `dialog` element without its methods, which is why the shell's
+ * own suites render it to static markup and leave the modal behaviour to a
+ * browser. These tests drive the interaction, so the two methods are defined
+ * with the spec's observable effect — the `open` state and the `close` event —
+ * and nothing else. The elements they stand in for (the focus trap, `Esc`, the
+ * browser's own focus restoration) are verified in a real browser.
+ */
+function installDialogMethods(): void {
+  const prototype = window.HTMLDialogElement.prototype;
+  if (prototype.showModal !== undefined) return;
+  prototype.showModal = function showModal(this: HTMLDialogElement) {
+    this.open = true;
+  };
+  prototype.show = function show(this: HTMLDialogElement) {
+    this.open = true;
+  };
+  prototype.close = function close(this: HTMLDialogElement) {
+    if (!this.open) return;
+    this.open = false;
+    this.dispatchEvent(new Event("close"));
+  };
+}
+
 beforeEach(() => {
+  installDialogMethods();
   resourceCache.clear();
   toastQueue.__reset();
+  confirmationStore.__reset();
 });
 
 afterEach(() => {
@@ -289,6 +317,23 @@ describe("Toaster (R-T1..R-T4)", () => {
     expect(screen.getByTestId("live-polite").textContent).toContain("Groups synced");
   });
 
+  test("an unrecognised failure carries its raw code as the copyable chip (R-X1)", () => {
+    render(<Toaster />);
+    act(() => {
+      toastQueue.push({
+        dedupeKey: "run:inst_1",
+        class: "errorBlocking",
+        role: "alert",
+        duration: null,
+        title: "Something unexpected happened",
+        body: "The dashboard does not recognise this failure.",
+        copyableCode: "some_future_code",
+      });
+    });
+
+    expect(screen.getByTestId("toast").querySelector("code")?.textContent).toBe("some_future_code");
+  });
+
   test("a blocking error keeps a manual dismiss as its one control (R-T1, R-T4)", () => {
     render(<Toaster />);
     act(() => {
@@ -299,5 +344,185 @@ describe("Toaster (R-T1..R-T4)", () => {
       screen.getByRole("button", { name: "Dismiss" }).click();
     });
     expect(screen.queryByTestId("toast")).toBeNull();
+  });
+});
+
+/**
+ * The confirmation interaction (docs/ui-decision.md §4.6 R-A8, §4.5 R-X2, §4.1
+ * R-L9). These are behaviour tests, not markup tests: what matters is that the
+ * operation cannot run without the operator's agreement, that the dialog owns
+ * the pending state while it does, and that a failure stays on screen.
+ */
+describe("the confirmation dialog (R-A8, R-X2, R-L9)", () => {
+  const PLAN = { title: "Delete this instance?", body: "Its stored groups and messages stay.", confirmLabel: "Delete" };
+
+  test("puts the plan to the operator and runs nothing until they agree", async () => {
+    const run = vi.fn(async () => undefined);
+    render(<ConfirmationHost />);
+
+    let answered: Promise<boolean> | undefined;
+    act(() => {
+      answered = confirmationStore.ask(PLAN, run);
+    });
+
+    expect(screen.getByRole("dialog")).toBeDefined();
+    expect(screen.getByText("Delete this instance?")).toBeDefined();
+    expect(screen.getByText("Its stored groups and messages stay.")).toBeDefined();
+    expect(run).not.toHaveBeenCalled();
+    // The least destructive control takes focus, so a stray Enter cannot
+    // destroy anything.
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Cancel" }));
+
+    await act(async () => {
+      screen.getByRole("button", { name: "Delete" }).click();
+    });
+
+    expect(run).toHaveBeenCalledTimes(1);
+    await expect(answered).resolves.toBe(true);
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  test("a cancelled confirmation runs nothing and answers false", async () => {
+    const run = vi.fn(async () => undefined);
+    render(<ConfirmationHost />);
+
+    let answered: Promise<boolean> | undefined;
+    act(() => {
+      answered = confirmationStore.ask(PLAN, run);
+    });
+    await act(async () => {
+      screen.getByRole("button", { name: "Cancel" }).click();
+    });
+
+    expect(run).not.toHaveBeenCalled();
+    await expect(answered).resolves.toBe(false);
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  test("holds the confirm control in pending while the operation runs (R-L9)", async () => {
+    const settle: { finish: () => void } = { finish: () => {} };
+    const run = vi.fn(
+      () =>
+        new Promise<undefined>((resolve) => {
+          settle.finish = () => resolve(undefined);
+        }),
+    );
+    render(<ConfirmationHost />);
+
+    act(() => {
+      void confirmationStore.ask(PLAN, run);
+    });
+    act(() => {
+      screen.getByRole("button", { name: "Delete" }).click();
+    });
+
+    const confirm = screen.getByRole("button", { name: /delete/i });
+    expect(confirm.getAttribute("aria-busy")).toBe("true");
+    expect(confirm.textContent).toContain("…");
+    expect(screen.getByRole("button", { name: "Cancel" })).toHaveProperty("disabled", true);
+
+    await act(async () => {
+      settle.finish();
+    });
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  test("keeps a failed operation on screen with the mapped failure, and restores focus (R-X2, R-X4, R-A1)", async () => {
+    const failure = mapError({ code: "instance_cleanup_failed" }, "action");
+    render(
+      <>
+        <button type="button">Delete instance</button>
+        <ConfirmationHost />
+      </>,
+    );
+    const invoker = screen.getByRole("button", { name: "Delete instance" });
+    invoker.focus();
+
+    let answered: Promise<boolean> | undefined;
+    act(() => {
+      answered = confirmationStore.ask(PLAN, async () => failure);
+    });
+    await act(async () => {
+      screen.getByRole("button", { name: "Delete" }).click();
+    });
+
+    // R-X2: the dialog MUST NOT dismiss on failure — the evidence stays here.
+    expect(screen.getByRole("dialog")).toBeDefined();
+    expect(screen.getByText(/could not be removed/i)).toBeDefined();
+    // R-X4: for a transition the recovery is the confirmation itself, so the
+    // failure offers no retry of its own.
+    expect(screen.queryByRole("button", { name: /try again/i })).toBeNull();
+    // The failed attempt left the confirm control usable again, and the
+    // operator's focus is back on the control it started on.
+    expect(screen.getByRole("button", { name: "Delete" })).toHaveProperty("disabled", false);
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Cancel" }));
+
+    await act(async () => {
+      screen.getByRole("button", { name: "Cancel" }).click();
+    });
+    await expect(answered).resolves.toBe(false);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(invoker);
+  });
+
+  test("queues a second question behind the first, one modal at a time", async () => {
+    render(<ConfirmationHost />);
+    const first = vi.fn(async () => undefined);
+    const second = vi.fn(async () => undefined);
+
+    act(() => {
+      void confirmationStore.ask(PLAN, first);
+      void confirmationStore.ask({ ...PLAN, title: "Delete this group?" }, second);
+    });
+
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    expect(screen.getByText("Delete this instance?")).toBeDefined();
+
+    await act(async () => {
+      screen.getByRole("button", { name: "Delete" }).click();
+    });
+    expect(second).not.toHaveBeenCalled();
+    expect(screen.getByText("Delete this group?")).toBeDefined();
+  });
+});
+
+/**
+ * R-M5 through the shell: the small-viewport navigation sheet is a real owner of
+ * the bottom edge, and the notification stack moves to the top while it is open.
+ */
+describe("R-M5 ownership in the shell", () => {
+  test("an open navigation sheet moves the stack to the top edge", async () => {
+    render(
+      <AppShell title="Overview" scopeLabel="All instances">
+        <p>panel</p>
+      </AppShell>,
+    );
+
+    expect(document.querySelector(".toast-region")?.getAttribute("data-edge")).toBe("bottom-right");
+
+    await act(async () => {
+      screen.getByRole("button", { name: "Navigation" }).click();
+    });
+    expect(document.querySelector(".toast-region")?.getAttribute("data-edge")).toBe("top");
+
+    await act(async () => {
+      screen.getByRole("button", { name: "Close navigation" }).click();
+    });
+    expect(document.querySelector(".toast-region")?.getAttribute("data-edge")).toBe("bottom-right");
+    expect(toastQueue.overlayOpen()).toBe(false);
+  });
+
+  test("mounts the one confirmation host with the shell", async () => {
+    render(
+      <AppShell title="Overview" scopeLabel="All instances">
+        <p>panel</p>
+      </AppShell>,
+    );
+
+    expect(screen.queryByText("Delete this instance?")).toBeNull();
+    act(() => {
+      void confirmationStore.ask({ title: "Delete this instance?", body: "Its stored groups stay.", confirmLabel: "Delete" }, async () => undefined);
+    });
+    expect(screen.getByText("Delete this instance?")).toBeDefined();
   });
 });
