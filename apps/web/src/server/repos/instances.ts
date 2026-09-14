@@ -25,6 +25,12 @@ export type InstanceDoc = {
   _id: string;
   organizationId: string;
   label?: string;
+  /**
+   * Set by the worker when an instance is removed (`manager.go`), which keeps the
+   * row because the captured history and the audit trail still point at it. Every
+   * read here filters on it, so "removed" means removed to the console too.
+   */
+  deletedAt?: Date | null;
   runtime?: {
     status?: string;
     groupSync?: {
@@ -69,19 +75,19 @@ export function toInstanceRow(doc: InstanceDoc): InstanceRow {
   };
 }
 
-/** Every instance of one organisation, oldest label first. */
+/** Every live instance of one organisation, oldest label first. */
 export async function listInstances(db: Db, organizationId: string): Promise<InstanceRow[]> {
   const docs = await db
     .collection<InstanceDoc>(COLLECTIONS.instances)
-    .find({ organizationId })
+    .find({ organizationId, deletedAt: null })
     .sort({ label: 1 })
     .toArray();
   return docs.map(toInstanceRow);
 }
 
 /**
- * One instance's runtime summary, or `null` when the instance is unknown — a
- * missing row is a fact, not an error (§7.5).
+ * One instance's runtime summary, or `null` when the instance is unknown or
+ * removed — a missing row is a fact, not an error (§7.5).
  */
 export async function getInstanceRuntime(
   db: Db,
@@ -90,19 +96,20 @@ export async function getInstanceRuntime(
 ): Promise<{ status: string; groupSync: InstanceGroupSync } | null> {
   const doc = await db
     .collection<InstanceDoc>(COLLECTIONS.instances)
-    .findOne({ _id: instanceId, organizationId });
+    .findOne({ _id: instanceId, organizationId, deletedAt: null });
   if (!doc) return null;
   return { status: doc.runtime?.status ?? "disconnected", groupSync: groupSyncOf(doc.runtime) };
 }
 
 /**
- * Whether this instance is the organisation's. It is the tenant boundary the
+ * Whether this live instance is the organisation's. It is the tenant boundary the
  * instance-scoped proxy routes check before they let an id in a path reach the
- * worker as a control command (§7.3).
+ * worker as a control command (§7.3), and a removed instance is not one the
+ * console will act on.
  */
 export async function instanceInOrg(db: Db, organizationId: string, instanceId: string): Promise<boolean> {
   const found = await db
     .collection<InstanceDoc>(COLLECTIONS.instances)
-    .countDocuments({ _id: instanceId, organizationId }, { limit: 1 });
+    .countDocuments({ _id: instanceId, organizationId, deletedAt: null }, { limit: 1 });
   return found > 0;
 }
