@@ -1,5 +1,10 @@
 import { UnauthorizedError, requireOwner } from "../../../../../server/auth/owner";
-import { ForeignMediaKeyError, R2ConfigurationError, presignMediaUrl } from "../../../../../server/media/presign";
+import {
+  ForeignMediaKeyError,
+  R2ConfigurationError,
+  presignMediaUrl,
+  type PresignedMedia,
+} from "../../../../../server/media/presign";
 import { getDb } from "../../../../../server/mongo";
 import { messageMediaKey } from "../../../../../server/repos/messages";
 
@@ -41,9 +46,9 @@ export async function GET(
     return Response.json({ error: "not_found" }, { status: 404, headers: { "cache-control": "no-store" } });
   }
 
-  let url: string;
+  let signed: PresignedMedia;
   try {
-    url = await presignMediaUrl(r2Key, organizationId);
+    signed = await presignMediaUrl(r2Key, organizationId);
   } catch (error) {
     // A key that names another tenant is indistinguishable from a missing
     // object; a broken R2 configuration is the server's problem and is
@@ -60,5 +65,8 @@ export async function GET(
     throw error;
   }
 
-  return Response.json({ url }, { headers: { "cache-control": "no-store" } });
+  return Response.json(
+    { url: signed.url, expiresInSeconds: signed.expiresInSeconds },
+    { headers: { "cache-control": "no-store" } },
+  );
 }

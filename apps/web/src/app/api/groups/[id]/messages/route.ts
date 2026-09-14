@@ -10,7 +10,9 @@ import type { MessageRow } from "../../../../../server/repos/messages";
 
 /**
  * §7.3 (R4): one group's message stream, newest first, walked by the opaque
- * `(timestamp, waMessageId)` cursor the previous page returned.
+ * `(timestamp, waMessageId)` cursor the previous page returned and narrowed by
+ * the §5.1 filters the stream's address carries (`q` over the folded text,
+ * `kinds`, the media state).
  *
  * The organisation comes from the verified owner session, the instance from the
  * query and the group from the path, so three values have to agree before a row
@@ -41,6 +43,10 @@ export async function GET(
   const limit = clampMessageLimit(
     search.get("limit") === null ? undefined : Number(search.get("limit")),
   );
+  const kinds = (search.get("kinds") ?? "")
+    .split(",")
+    .map((kind) => kind.trim())
+    .filter((kind) => kind !== "");
 
   let messages: MessageRow[];
   try {
@@ -48,7 +54,11 @@ export async function GET(
       organizationId,
       instanceId,
       groupJid: id,
-      query: "",
+      // §5.1's compound filters, as the stream's own address carries them: the
+      // text query, the kinds and the media state all narrow this one group.
+      query: search.get("q") ?? "",
+      kinds: kinds.length === 0 ? undefined : kinds,
+      mediaStatus: search.get("media") ?? undefined,
       limit,
       cursor: search.get("cursor") ?? undefined,
     });

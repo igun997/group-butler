@@ -924,6 +924,7 @@ func mediaFields(m Media) bson.D {
 		{Key: "media.width", Value: m.Width},
 		{Key: "media.height", Value: m.Height},
 		{Key: "media.durationSec", Value: m.DurationSec},
+		{Key: "media.text", Value: m.Text},
 		{Key: "media.r2Key", Value: m.R2Key},
 		{Key: "media.publicUrl", Value: m.PublicURL},
 		{Key: "media.reason", Value: m.Reason},

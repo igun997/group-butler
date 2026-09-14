@@ -2,7 +2,7 @@ import { z } from "zod";
 import { clientKey } from "../../../../server/auth/client";
 import { UnauthorizedError, requireOwner } from "../../../../server/auth/owner";
 import { getDb } from "../../../../server/mongo";
-import { updateGroupConfig } from "../../../../server/repos/groups";
+import { readGroupDetail, updateGroupConfig } from "../../../../server/repos/groups";
 
 /**
  * §7.3 `PATCH /api/groups/[id]`: the group's BFF-owned configuration. `[id]` is
@@ -40,6 +40,46 @@ const PatchSchema = z
   .refine((patch) => patch.assigned !== undefined || patch.whitelisted !== undefined, {
     message: "assigned or whitelisted is required",
   });
+
+/**
+ * §7.3 `GET /api/groups/[id]`: one group, as the `group` workspace reads it —
+ * its current name and provenance, the capped rename ring, its config flags and
+ * its counts (draft §7.5).
+ *
+ * The tenant comes from the verified session and the instance from the query,
+ * because §5.1's `uniq_group` makes a JID unique only within
+ * `(organizationId, instanceId)`: the same group can be joined by two linked
+ * accounts, and the two rows are two different views of it. An instance the
+ * session's organisation does not own, and a group that is not in it, are the
+ * same 404 — this route cannot be used to enumerate another tenant's groups.
+ */
+export async function GET(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> },
+): Promise<Response> {
+  const noStore = { "cache-control": "no-store" } as const;
+
+  let organizationId: string;
+  try {
+    ({ organizationId } = await requireOwner());
+  } catch (error) {
+    if (!(error instanceof UnauthorizedError)) throw error;
+    return Response.json({ error: "unauthorized" }, { status: 401, headers: noStore });
+  }
+
+  const instanceId = new URL(request.url).searchParams.get("instance");
+  if (!instanceId) {
+    return Response.json({ error: "instance_required" }, { status: 400, headers: noStore });
+  }
+
+  const { id } = await params;
+  const detail = await readGroupDetail(await getDb(), organizationId, instanceId, id);
+  if (!detail) {
+    return Response.json({ error: "not_found" }, { status: 404, headers: noStore });
+  }
+
+  return Response.json({ group: detail.group, instanceLabel: detail.instanceLabel }, { headers: noStore });
+}
 
 export async function PATCH(
   request: Request,

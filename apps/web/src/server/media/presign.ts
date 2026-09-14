@@ -95,13 +95,24 @@ function getClient(config: R2Config): S3Client {
  * default: a key is signed only when it sits under `org/<session org>/`, so a
  * row pointing at another tenant's object can never be handed back as a URL.
  * The tenant check comes first; only then is configuration read and validated.
+ *
+ * The lifetime is returned with the URL rather than left to be guessed from the
+ * signature: §2.2 invariant 8 says a URL is never reused past expiry, which the
+ * surface holding it can only honour if it knows how long it has — and the
+ * signed URL's own `X-Amz-Date` is the signer's clock, not the browser's.
  */
-export async function presignMediaUrl(key: string, organizationId: string): Promise<string> {
+export interface PresignedMedia {
+  url: string;
+  expiresInSeconds: number;
+}
+
+export async function presignMediaUrl(key: string, organizationId: string): Promise<PresignedMedia> {
   if (!key.startsWith(`org/${organizationId}/`)) throw new ForeignMediaKeyError();
   const config = r2Config();
-  return getSignedUrl(
+  const url = await getSignedUrl(
     getClient(config),
     new GetObjectCommand({ Bucket: config.bucket, Key: key }),
     { expiresIn: config.ttlSeconds },
   );
+  return { url, expiresInSeconds: config.ttlSeconds };
 }

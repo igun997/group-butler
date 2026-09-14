@@ -8,6 +8,7 @@ import {
   MESSAGE_MAX_LIMIT,
   encodeMessageCursor,
   messageMediaKey,
+  messageRawTree,
   nextMessageCursor,
   searchMessages,
 } from "./messages";
@@ -55,7 +56,13 @@ const seed = [
       mime: "application/pdf",
       fileName: "invoice-2026.pdf",
       r2Key: "org/org_default/instance/inst_1/group/1203630431_g.us/2026/09/m2.bin",
+      // R3/§6.3.4: bytes held but not consumable — the reason the dashboard says
+      // instead of showing an empty slot.
+      reason: "unsupported_type",
     },
+    // The protobuf tree, truncated exactly as §6.4 stores it: never fetched by a
+    // page, and read only by the raw viewer's own request.
+    raw: { message: { conversation: "deploy is green", imageMessage: { mimetype: "image/png" } }, truncated: true, bytes: 812 },
     links: [],
     mentions: [],
   },
@@ -376,8 +383,71 @@ describe("searchMessages", () => {
         r2Key: "org/org_default/instance/inst_1/group/1203630431_g.us/2026/09/m2.bin",
         mime: "application/pdf",
         fileName: "invoice-2026.pdf",
+        reason: "unsupported_type",
       },
     });
+  });
+
+  test("reads a media row with no recorded reason as no reason at all", async () => {
+    const [row] = await searchMessages(await getDb(), {
+      organizationId: "org_default",
+      instanceId: "inst_1",
+      groupJid: "1203630431@g.us",
+      query: "deploy",
+      kinds: ["text"],
+    });
+    expect(row?.media).toEqual({
+      status: "none",
+      declaredType: null,
+      r2Key: null,
+      mime: null,
+      fileName: null,
+      reason: null,
+    });
+  });
+
+  test("narrows a page to several kinds at once, and to one", async () => {
+    const both = await searchMessages(await getDb(), {
+      organizationId: "org_default",
+      groupJid: "1203630431@g.us",
+      query: "",
+      kinds: ["document", "image"],
+    });
+    expect(both.map((m) => m.waMessageId).sort()).toEqual(["m2", "shared", "shared"]);
+
+    const one = await searchMessages(await getDb(), {
+      organizationId: "org_default",
+      groupJid: "1203630431@g.us",
+      query: "",
+      kinds: ["document"],
+    });
+    expect(one.map((m) => m.waMessageId)).toEqual(["m2"]);
+
+    // An empty list is not a filter: it selects nothing to exclude, so the page
+    // is the unfiltered one rather than an empty answer.
+    const unfiltered = await searchMessages(await getDb(), {
+      organizationId: "org_default",
+      groupJid: "pg@g.us",
+      query: "",
+      kinds: [],
+    });
+    expect(unfiltered).toHaveLength(3);
+  });
+});
+
+describe("messageRawTree", () => {
+  test("returns the stored tree, its truncation flag and its size", async () => {
+    expect(await messageRawTree(await getDb(), "org_default", "inst_1", "m2")).toEqual({
+      message: { conversation: "deploy is green", imageMessage: { mimetype: "image/png" } },
+      truncated: true,
+      bytes: 812,
+    });
+  });
+
+  test("is null for another organisation, another instance, and a message with no tree", async () => {
+    expect(await messageRawTree(await getDb(), "org_other", "inst_1", "m2")).toBeNull();
+    expect(await messageRawTree(await getDb(), "org_default", "inst_2", "m2")).toBeNull();
+    expect(await messageRawTree(await getDb(), "org_default", "inst_1", "m1")).toBeNull();
   });
 });
 

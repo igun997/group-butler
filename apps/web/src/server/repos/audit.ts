@@ -12,9 +12,15 @@ export type AuthAuditReason = "invalid_credentials" | "malformed_request" | "rat
  * (§7.2 step 5: "a whitelist edit writes an `auditLog` row with before/after"),
  * which is why the two surfaces that can change AI scope share one action name.
  */
-export type AuditAction = AuthAuditAction | "instance.whitelist.updated";
+export type AuditAction =
+  | AuthAuditAction
+  | "instance.whitelist.updated"
+  | "send.created"
+  | "send.approved"
+  | "send.rejected"
+  | "send.cancelled";
 
-export type AuditTargetType = "owner" | "instance" | "group";
+export type AuditTargetType = "owner" | "instance" | "group" | "send";
 
 export interface AuthAuditEvent {
   organizationId: string;

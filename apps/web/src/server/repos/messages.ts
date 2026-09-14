@@ -12,6 +12,14 @@ export interface MessageMediaRow {
   r2Key: string | null;
   mime: string | null;
   fileName: string | null;
+  /**
+   * Why an attachment could not be read (`view_once`, `expired`, `no_keys`,
+   * `download_failed`, `unsupported_type`, `too_large`), or `null` when it could
+   * (draft §5.1). It is what R-E4 renders beside the declared type, so the
+   * operator can tell "we hold it but cannot read it" from "WhatsApp never gave
+   * it to us" without opening anything.
+   */
+  reason: string | null;
 }
 
 /** One R4 search hit on the wire: identity, ordering key, body and attachment. */
@@ -39,7 +47,12 @@ export interface MessageSearchInput {
   instanceId?: string;
   groupJid?: string;
   senderJid?: string;
-  kind?: string;
+  /**
+   * The §5.1 message kinds a page is narrowed to, if any. Absent or empty is
+   * "every kind": a filter that excludes nothing is not a filter, so an empty
+   * list is the unfiltered page rather than an empty one.
+   */
+  kinds?: readonly string[];
   mediaStatus?: string;
   from?: Date;
   to?: Date;
@@ -93,7 +106,10 @@ export type MessageDoc = {
     r2Key?: string;
     mime?: string;
     fileName?: string;
+    reason?: string;
   };
+  /** The worker's truncated protobuf tree (§6.4); read only by `messageRawTree`. */
+  raw?: { message?: unknown; truncated?: boolean; bytes?: number };
 };
 
 /**
@@ -125,6 +141,7 @@ const PROJECTION = {
   "media.r2Key": 1,
   "media.mime": 1,
   "media.fileName": 1,
+  "media.reason": 1,
 } as const;
 
 /** A user query is text, never a pattern; every metacharacter is quoted. */
@@ -162,6 +179,7 @@ export function toMessageRow(doc: MessageDoc): MessageRow {
       r2Key: media.r2Key ?? null,
       mime: media.mime ?? null,
       fileName: media.fileName ?? null,
+      reason: media.reason ?? null,
     },
   };
 }
@@ -220,7 +238,7 @@ function messageFilter(input: MessageSearchInput): Filter<Document> {
   if (input.instanceId) filter.instanceId = input.instanceId;
   if (input.groupJid) filter.groupJid = input.groupJid;
   if (input.senderJid) filter.senderJid = input.senderJid;
-  if (input.kind) filter.kind = input.kind;
+  if (input.kinds && input.kinds.length > 0) filter.kind = { $in: [...input.kinds] };
   if (input.mediaStatus) filter["media.status"] = input.mediaStatus;
 
   const range: { $gte?: Date; $lte?: Date } = {};
@@ -339,4 +357,46 @@ export async function messageMediaKey(
     );
   const key = doc?.media?.r2Key;
   return typeof key === "string" && key !== "" ? key : null;
+}
+
+/** One message's stored protobuf tree, as the raw viewer shows it (§6.4, §11.5). */
+export interface MessageRawTree {
+  /** `raw.message`, exactly as stored: a map of the parsed tree, never interpreted. */
+  message: unknown;
+  /** `raw.truncated`: whether the worker capped the tree at `RAW_JSON_MAX_BYTES`. */
+  truncated: boolean;
+  /** `raw.bytes`: the encoded size before the cap. */
+  bytes: number;
+}
+
+/**
+ * One message's stored raw tree, or `null` when this organisation and instance
+ * have no such message, or it carries no tree.
+ *
+ * It is a separate read on purpose. A page never carries `raw.message`
+ * (`PROJECTION` says why), yet §11.5 promises the operator can open it, so the
+ * tree is fetched by the one request that asks for it. Like the media key, the
+ * identity is `(organizationId, instanceId, waMessageId)`: `uniq_message` only
+ * makes a message id unique within an instance, so the instance is part of the
+ * address rather than a filter, and a tree can never be read across tenants.
+ */
+export async function messageRawTree(
+  db: Db,
+  organizationId: string,
+  instanceId: string,
+  waMessageId: string,
+): Promise<MessageRawTree | null> {
+  const doc = await db
+    .collection<MessageDoc>(COLLECTIONS.messages)
+    .findOne(
+      { organizationId, instanceId, waMessageId },
+      { projection: { _id: 0, "raw.message": 1, "raw.truncated": 1, "raw.bytes": 1 } },
+    );
+  const raw = doc?.raw;
+  if (!raw || raw.message === undefined || raw.message === null) return null;
+  return {
+    message: raw.message,
+    truncated: raw.truncated === true,
+    bytes: typeof raw.bytes === "number" && Number.isFinite(raw.bytes) ? raw.bytes : 0,
+  };
 }

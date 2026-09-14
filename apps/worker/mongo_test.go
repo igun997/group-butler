@@ -22,27 +22,29 @@ func testMongoURI(t *testing.T) string {
 	return env("TEST_MONGODB_URI", "mongodb://127.0.0.1:27017/?replicaSet=rs0")
 }
 
-func TestIndexForMessagesAndGroupsAreUnique(t *testing.T) {
+func TestWorkerIndexesCoverIngestAndDispatch(t *testing.T) {
 	indexes := ingestIndexes()
 	cases := []struct {
-		coll string
-		name string
-		keys []string
+		coll   string
+		name   string
+		keys   []string
+		unique bool
 	}{
-		{coll: collMessages, name: "uniq_message", keys: []string{"organizationId", "instanceId", "waMessageId"}},
-		{coll: collGroups, name: "uniq_group", keys: []string{"organizationId", "instanceId", "groupJid"}},
+		{coll: collMessages, name: "uniq_message", keys: []string{"organizationId", "instanceId", "waMessageId"}, unique: true},
+		{coll: collGroups, name: "uniq_group", keys: []string{"organizationId", "instanceId", "groupJid"}, unique: true},
+		{coll: collSendRequests, name: "send_due", keys: []string{"status", "scheduledFor"}, unique: false},
 	}
 	if len(indexes) != len(cases) {
-		t.Fatalf("worker ingest subset covers %d collections, want %d", len(indexes), len(cases))
+		t.Fatalf("worker index set covers %d collections, want %d", len(indexes), len(cases))
 	}
 	for _, tc := range cases {
 		t.Run(tc.coll, func(t *testing.T) {
 			specs := indexes[tc.coll]
 			if len(specs) != 1 {
-				t.Fatalf("expected exactly one %s index in the worker subset, got %d", tc.coll, len(specs))
+				t.Fatalf("expected exactly one %s index in the worker set, got %d", tc.coll, len(specs))
 			}
-			if !specs[0].Unique {
-				t.Errorf("%s index must be unique: %s is the redelivery key", tc.coll, tc.name)
+			if specs[0].Unique != tc.unique {
+				t.Errorf("%s unique = %t, want %t", tc.coll, specs[0].Unique, tc.unique)
 			}
 			if specs[0].Name != tc.name {
 				t.Errorf("%s index name = %q, want %q", tc.coll, specs[0].Name, tc.name)

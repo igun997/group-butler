@@ -183,6 +183,44 @@ export async function listAllGroups(db: Db, organizationId: string): Promise<Ins
   }));
 }
 
+/**
+ * One group as the `group` workspace reads it: the §7.5 row plus the instance it
+ * belongs to, named the way the estate names it.
+ *
+ * The instance is part of the address, not a filter: `uniq_group` makes a JID
+ * unique within `(organizationId, instanceId)`, and two linked accounts can both
+ * be in the same group, so a lookup that omitted the instance could answer with
+ * the other one's row. Everything a `group` view shows comes from here — the
+ * name and its provenance, the rename ring, the config flags and the counts —
+ * which is why the read exists rather than the view re-deriving it from a list.
+ */
+export interface GroupDetail {
+  group: GroupRow;
+  /** The instance's label, or its id when the instance row is gone — never blank. */
+  instanceLabel: string;
+}
+
+export async function readGroupDetail(
+  db: Db,
+  organizationId: string,
+  instanceId: string,
+  groupJid: string,
+): Promise<GroupDetail | null> {
+  const doc = await db
+    .collection<GroupDoc>(COLLECTIONS.groups)
+    .findOne({ organizationId, instanceId, groupJid });
+  if (!doc) return null;
+  return { group: toRow(doc), instanceLabel: await instanceLabel(db, organizationId, instanceId) };
+}
+
+/** One instance's label, or its id when the document has none or is gone. */
+export async function instanceLabel(db: Db, organizationId: string, instanceId: string): Promise<string> {
+  const doc = await db
+    .collection<InstanceDoc>(COLLECTIONS.instances)
+    .findOne({ _id: instanceId, organizationId }, { projection: { label: 1 } });
+  return doc?.label || instanceId;
+}
+
 async function instanceLabels(db: Db, organizationId: string): Promise<Record<string, string>> {
   const docs = await db
     .collection<InstanceDoc>(COLLECTIONS.instances)

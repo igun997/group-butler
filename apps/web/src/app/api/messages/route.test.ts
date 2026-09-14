@@ -58,6 +58,23 @@ beforeAll(async () => {
       rawSearch: "ticket queue",
       timestamp: new Date("2026-09-13T09:00:00Z"),
     })),
+    {
+      ...base,
+      organizationId: "org_default",
+      waMessageId: "d1",
+      kind: "document",
+      text: "",
+      textSearch: "",
+      rawSearch: "invoice-2026.pdf",
+      timestamp: new Date("2026-09-13T08:00:00Z"),
+      media: {
+        status: "unparsed",
+        declaredType: "document",
+        mime: "application/pdf",
+        fileName: "invoice-2026.pdf",
+        reason: "unsupported_type",
+      },
+    },
   ]);
   // The free-text branch runs on the production text index; the deployment
   // creates it with `bootstrap`, so the route test must too.
@@ -119,6 +136,34 @@ describe("GET /api/messages", () => {
     const res = await search("?q=deploy");
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ error: "unauthorized" });
+  });
+
+  test("narrows a page by the date range the address carries", async () => {
+    const inside = await (
+      await search("?q=ticket&from=2026-09-13T08:30:00Z&to=2026-09-13T09:30:00Z")
+    ).json();
+    expect(inside.messages.map((m: { waMessageId: string }) => m.waMessageId)).toEqual(["t3", "t2", "t1"]);
+
+    const after = await (await search("?q=ticket&from=2026-09-13T09:30:00Z")).json();
+    expect(after.messages).toEqual([]);
+
+    // A range that is not an instant is not a filter: the view renders a
+    // working default rather than failing on a stale bookmark (§2.3).
+    const unreadable = await (await search("?q=ticket&from=whenever")).json();
+    expect(unreadable.messages).toHaveLength(3);
+  });
+
+  test("narrows a page by kind and carries the reason an attachment could not be read", async () => {
+    const documents = await (await search("?kind=document")).json();
+    expect(documents.messages.map((m: { waMessageId: string }) => m.waMessageId)).toEqual(["d1"]);
+    expect(documents.messages[0].media).toMatchObject({
+      status: "unparsed",
+      declaredType: "document",
+      reason: "unsupported_type",
+    });
+
+    const texts = await (await search("?kind=text&q=deploy")).json();
+    expect(texts.messages.map((m: { waMessageId: string }) => m.waMessageId)).toEqual(["r1"]);
   });
 
   test("lets an unexpected failure surface instead of masking it as 401", async () => {

@@ -107,6 +107,8 @@ func run() error {
 	// loop (MEDIA_JANITOR_INTERVAL) own their own cadence.
 	start(func() { mgr.runGroupSyncScheduler(ctx) })
 	start(func() { mgr.runMediaJanitor(ctx) })
+	dispatcher := newSendDispatcher(db, cfg)
+	start(func() { dispatcher.run(ctx, mgr) })
 
 	// Reconcile persisted status against the auth store before reconnecting:
 	// a transition lost with the previous process is repaired here.

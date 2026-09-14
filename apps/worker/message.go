@@ -107,6 +107,7 @@ type Media struct {
 	Width        int
 	Height       int
 	DurationSec  float64
+	Text         string
 	R2Key        string
 	PublicURL    string
 	Reason       string

@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -245,6 +246,10 @@ func (p *mediaPipeline) Store(ctx context.Context, desc MediaDescriptor) Media {
 	}
 
 	mime, readable := sniffMedia(data)
+	text := documentText(data)
+	if !readable && text != "" && declaredTextDocument(desc.Mime) {
+		mime, readable = "text/plain", true
+	}
 	if !readable {
 		return p.persist(ctx, unparsedMedia(media, data), desc, data, unparsedExt)
 	}
@@ -259,8 +264,30 @@ func (p *mediaPipeline) Store(ctx context.Context, desc MediaDescriptor) Media {
 	media.SHA256 = sha256Hex(data)
 	media.Width, media.Height = imageDimensions(data)
 	media.DurationSec = mediaDurationSeconds(data)
+	media.Text = text
 
 	return p.persist(ctx, media, desc, data, extensionForMime(mime, desc.FileName))
+}
+
+// documentText accepts only valid UTF-8 and trims it to the searchable budget.
+// Invalid or empty bytes remain stored as unparsed media rather than being
+// guessed as prose.
+func documentText(data []byte) string {
+	if !utf8.Valid(data) {
+		return ""
+	}
+	const max = 64 * 1024
+	if len(data) > max {
+		data = data[:max]
+		for len(data) > 0 && !utf8.Valid(data) {
+			data = data[:len(data)-1]
+		}
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func declaredTextDocument(mime string) bool {
+	return strings.HasPrefix(mime, "text/") || mime == "application/json" || mime == "application/csv"
 }
 
 // unparsedMedia is the R3 record: the bytes are held, the container is not

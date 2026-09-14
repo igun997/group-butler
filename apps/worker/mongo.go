@@ -75,6 +75,11 @@ func ingestIndexes() map[string][]indexSpec {
 			Unique: true,
 			Name:   "uniq_group",
 		}},
+		collSendRequests: {{
+			Keys:   []string{"status", "scheduledFor"},
+			Unique: false,
+			Name:   "send_due",
+		}},
 	}
 }
 

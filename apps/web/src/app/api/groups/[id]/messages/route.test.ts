@@ -3,6 +3,7 @@ import { MongoMemoryReplSet } from "mongodb-memory-server";
 import { COLLECTIONS } from "../../../../../server/collections";
 import { issueSession } from "../../../../../server/auth/session";
 import { closeDb, getDb } from "../../../../../server/mongo";
+import { createIndexes } from "../../../../../server/bootstrap";
 import { GET } from "./route";
 
 const session = vi.hoisted(() => ({ token: "" as string }));
@@ -39,7 +40,22 @@ beforeAll(async () => {
     { ...base, organizationId: "org_default", groupJid: "target@g.us", waMessageId: "g2", text: "two", textSearch: "two", timestamp: new Date("2026-09-13T11:00:00Z") },
     { ...base, organizationId: "org_default", groupJid: "other@g.us", waMessageId: "g3", text: "three", textSearch: "three", timestamp: new Date("2026-09-13T12:00:00Z") },
     { ...base, organizationId: "org_other", groupJid: "target@g.us", waMessageId: "g4", text: "four", textSearch: "four", timestamp: new Date("2026-09-13T13:00:00Z") },
+    {
+      ...base,
+      organizationId: "org_default",
+      groupJid: "target@g.us",
+      waMessageId: "g5",
+      kind: "document",
+      text: "",
+      textSearch: "",
+      rawSearch: "invoice-2026.pdf",
+      timestamp: new Date("2026-09-13T09:00:00Z"),
+      media: { status: "unparsed", declaredType: "document", reason: "no_keys" },
+    },
   ]);
+  // The free-text branch of a filtered stream runs on the production text
+  // index, which the deployment creates with `bootstrap`.
+  await createIndexes(db);
 });
 
 beforeEach(() => {
@@ -66,7 +82,25 @@ describe("GET /api/groups/[id]/messages", () => {
     expect(res.headers.get("cache-control")).toBe("no-store");
     const body = await res.json();
     expect(body.groupJid).toBe("target@g.us");
-    expect(body.messages.map((m: { waMessageId: string }) => m.waMessageId)).toEqual(["g2", "g1"]);
+    expect(body.messages.map((m: { waMessageId: string }) => m.waMessageId)).toEqual(["g2", "g1", "g5"]);
+  });
+
+  test("searches inside one group and narrows it by kind and by media state", async () => {
+    const found = await (await getGroupMessages("target@g.us", "?instanceId=inst_1&q=two")).json();
+    expect(found.messages.map((m: { waMessageId: string }) => m.waMessageId)).toEqual(["g2"]);
+
+    const kinds = await (
+      await getGroupMessages("target@g.us", "?instanceId=inst_1&kinds=document,image")
+    ).json();
+    expect(kinds.messages.map((m: { waMessageId: string }) => m.waMessageId)).toEqual(["g5"]);
+
+    const unreadable = await (await getGroupMessages("target@g.us", "?instanceId=inst_1&media=unparsed")).json();
+    expect(unreadable.messages.map((m: { waMessageId: string }) => m.waMessageId)).toEqual(["g5"]);
+    expect(unreadable.messages[0].media.reason).toBe("no_keys");
+
+    // Blank filter values are not filters: the stream is the group's page.
+    const blank = await (await getGroupMessages("target@g.us", "?instanceId=inst_1&q=&kinds=,&media=")).json();
+    expect(blank.messages.map((m: { waMessageId: string }) => m.waMessageId)).toEqual(["g2", "g1", "g5"]);
   });
 
   test("requires the instance the group belongs to", async () => {

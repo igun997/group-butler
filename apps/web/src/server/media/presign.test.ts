@@ -41,12 +41,16 @@ describe("presignMediaUrl", () => {
   });
 
   test("mints a short-lived GET on the caller's own account endpoint", async () => {
-    const url = new URL(await presignMediaUrl(ownKey, "org_default"));
+    const { url: signed, expiresInSeconds } = await presignMediaUrl(ownKey, "org_default");
+    const url = new URL(signed);
     // R2's standard form: the bucket is a subdomain of the account host.
     expect(url.origin).toBe("https://butler-test.acct123.r2.cloudflarestorage.com");
     expect(url.pathname).toBe("/org/org_default/instance/inst_1/group/g/2026/09/m2.bin");
     expect(url.searchParams.get("X-Amz-Expires")).toBe("300");
     expect(url.searchParams.get("X-Amz-Signature")).toBeTruthy();
+    // Invariant 8: a URL is never reused past expiry, so the caller is told how
+    // long it has from the same value the signature was made with.
+    expect(expiresInSeconds).toBe(300);
   });
 
   /**
@@ -100,8 +104,9 @@ describe("presignMediaUrl", () => {
     }
 
     vi.stubEnv("R2_PRESIGN_TTL_SECONDS", String(MAX_PRESIGN_TTL_SECONDS));
-    const url = new URL(await presignMediaUrl(ownKey, "org_default"));
-    expect(url.searchParams.get("X-Amz-Expires")).toBe(String(MAX_PRESIGN_TTL_SECONDS));
+    const { url: signed, expiresInSeconds } = await presignMediaUrl(ownKey, "org_default");
+    expect(new URL(signed).searchParams.get("X-Amz-Expires")).toBe(String(MAX_PRESIGN_TTL_SECONDS));
+    expect(expiresInSeconds).toBe(MAX_PRESIGN_TTL_SECONDS);
     goodEnv();
   });
 });

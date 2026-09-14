@@ -4,7 +4,7 @@ import { COLLECTIONS } from "../../../../server/collections";
 import { issueSession } from "../../../../server/auth/session";
 import { closeDb, getDb } from "../../../../server/mongo";
 import { insertGroup, insertInstance } from "../../../../server/repos/test-helpers";
-import { PATCH } from "./route";
+import { PATCH, GET } from "./route";
 
 /**
  * Same request-scoped cookie seam as the group read-model route tests.
@@ -87,6 +87,95 @@ async function stored(organizationId: string, instanceId: string, groupJid: stri
     db.collection(COLLECTIONS.groups).findOne({ organizationId, instanceId, groupJid }),
   );
 }
+
+/** The one group read: the session's organisation, the query's instance, the path's JID. */
+function get(groupJid: string, query: string): Promise<Response> {
+  return GET(new Request(`http://localhost/api/groups/${encodeURIComponent(groupJid)}${query}`), {
+    params: Promise.resolve({ id: groupJid }),
+  });
+}
+
+describe("GET /api/groups/[id]", () => {
+  test("reads one group with its provenance, its rename ring and its instance", async () => {
+    await insertInstance("org_default", "inst_1", "Ops Team bot");
+    await insertGroup({
+      organizationId: "org_default",
+      instanceId: "inst_1",
+      groupJid: JID,
+      subject: "Ops Team",
+      subjectSource: "event",
+      subjectUpdatedAt: new Date("2026-09-13T08:12:00Z"),
+      subjectSetBy: "4915112345678",
+      subjectHistory: [{ name: "Ops", at: new Date("2026-09-01T08:00:00Z"), by: "4915112345678" }],
+    });
+
+    const res = await get(JID, "?instance=inst_1");
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(await res.json()).toEqual({
+      group: {
+        groupJid: JID,
+        name: "Ops Team",
+        nameSource: "event",
+        nameSetAt: "2026-09-13T08:12:00.000Z",
+        nameSetBy: "4915112345678",
+        participantCount: 12,
+        state: "active",
+        assigned: false,
+        whitelisted: false,
+        lastActivityAt: null,
+        messageCount: 0,
+        subjectHistoryCount: 1,
+        subjectHistory: [{ name: "Ops", at: "2026-09-01T08:00:00.000Z", by: "4915112345678" }],
+      },
+      instanceLabel: "Ops Team bot",
+    });
+  });
+
+  test("requires the instance the group belongs to", async () => {
+    await insertGroup({
+      organizationId: "org_default",
+      instanceId: "inst_1",
+      groupJid: JID,
+      subject: "Ops Team",
+      subjectSource: "sync",
+    });
+
+    const res = await get(JID, "");
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "instance_required" });
+  });
+
+  test("answers 404 for another organisation's group and for an instance it does not own", async () => {
+    await insertGroup({
+      organizationId: "org_other",
+      instanceId: "inst_9",
+      groupJid: JID,
+      subject: "Someone else's group",
+      subjectSource: "sync",
+    });
+    await insertGroup({
+      organizationId: "org_default",
+      instanceId: "inst_1",
+      groupJid: JID,
+      subject: "Ops Team",
+      subjectSource: "sync",
+    });
+
+    expect((await get(JID, "?instance=inst_9")).status).toBe(404);
+    expect((await get("120363043999999999@g.us", "?instance=inst_1")).status).toBe(404);
+    expect(await (await get(JID, "?instance=inst_2")).json()).toEqual({ error: "not_found" });
+  });
+
+  test("answers 401 for a request with no session", async () => {
+    session.token = "";
+    const res = await get(JID, "?instance=inst_1");
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "unauthorized" });
+  });
+});
 
 describe("PATCH /api/groups/[id]", () => {
   test("assigns a group and answers the updated row", async () => {

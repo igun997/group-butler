@@ -85,11 +85,14 @@ describe("GET /api/media/[messageId]/url", () => {
 
     expect(res.status).toBe(200);
     expect(res.headers.get("cache-control")).toBe("no-store");
-    const { url } = await res.json();
+    const { url, expiresInSeconds } = await res.json();
     const signed = new URL(url);
     expect(signed.origin).toBe("https://butler-test.acct123.r2.cloudflarestorage.com");
     expect(signed.pathname).toBe(`/${ownKey}`);
     expect(signed.searchParams.get("X-Amz-Expires")).toBe("300");
+    // The surface holding the URL runs a timer off this, so it is the same
+    // lifetime the signature carries and not a second guess at it.
+    expect(expiresInSeconds).toBe(300);
   });
 
   test("requires the instance the message belongs to", async () => {

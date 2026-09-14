@@ -126,6 +126,19 @@ func TestStoreMedia_StoredWhenReadable(t *testing.T) {
 	}
 }
 
+func TestStoreMedia_ExtractsUTF8DocumentText(t *testing.T) {
+	pipe := newMediaPipeline(testMediaLimits(), fakeDownloader{data: []byte("status,owner\nready,alice\n")}, &fakeUploader{}, "org_default", "inst_1", mediaNow)
+	got := pipe.Store(context.Background(), MediaDescriptor{
+		DeclaredType: KindDocument, Kind: KindDocument, Mime: "text/csv", MessageID: "3EB0DOC", GroupJID: "120363043123456789@g.us",
+	})
+	if got.Status != MediaStored || got.Kind != KindDocument || got.Mime != "text/plain" {
+		t.Fatalf("document = %+v, want stored text document", got)
+	}
+	if got.Text != "status,owner\nready,alice" {
+		t.Fatalf("extracted text = %q", got.Text)
+	}
+}
+
 func TestStoreMedia_UnparsedKeepsDeclaredTypeAndLink(t *testing.T) {
 	up := &fakeUploader{}
 	pipe := newMediaPipeline(testMediaLimits(), fakeDownloader{data: []byte{0x00, 0x01, 0x02, 0x03}}, up, "org_default", "inst_1", mediaNow)
