@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 import Link from "next/link";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { SmartPhone01Icon } from "@hugeicons/core-free-icons";
-import { Button } from "@/components/ui/button";
+import { ButtonLink } from "@/components/shell/button-link";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { Item, ItemActions, ItemContent, ItemDescription, ItemTitle } from "@/components/ui/item";
 import { InstanceStatusBadge } from "@/components/shell/status-badge";
@@ -37,9 +37,9 @@ export default async function InstancesPage() {
           Each instance is one linked WhatsApp account.
         </p>
         <div>
-          <Button render={<Link href="/instances/new" />} className="max-md:h-11">
+          <ButtonLink href="/instances/new" className="max-md:h-11">
             Link an account
-          </Button>
+          </ButtonLink>
         </div>
       </header>
 
@@ -63,9 +63,9 @@ export default async function InstancesPage() {
               An instance appears here once a WhatsApp account is linked and the worker pairs it.
             </EmptyDescription>
             <EmptyContent>
-              <Button render={<Link href="/instances/new" />} variant="outline" className="max-md:h-11">
+              <ButtonLink href="/instances/new" variant="outline" className="max-md:h-11">
                 Link an account
-              </Button>
+              </ButtonLink>
             </EmptyContent>
           </EmptyHeader>
         </Empty>

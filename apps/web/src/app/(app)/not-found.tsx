@@ -1,5 +1,4 @@
-import Link from "next/link";
-import { Button } from "@/components/ui/button";
+import { ButtonLink } from "@/components/shell/button-link";
 
 /**
  * What the console shows for a route that does not resolve inside it, kept
@@ -14,9 +13,9 @@ export default function ConsoleNotFound() {
         organisation.
       </p>
       <div>
-        <Button render={<Link href="/instances" />} variant="outline">
+        <ButtonLink href="/instances" variant="outline">
           Back to instances
-        </Button>
+        </ButtonLink>
       </div>
     </div>
   );
