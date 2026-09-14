@@ -88,16 +88,33 @@ const ambientEventSource: EventSourceFactory = (url) => {
 };
 
 /**
- * Whether a frame's payload can patch a subscription at this scope (`R-V5`).
- * A frame that does not name an instance is delivered to everyone: only the
- * payloads that carry identity are narrowed.
+ * The instance a frame is about. Every event the BFF emits names its instance
+ * as `instanceId`; an `instance.updated` frame *is* the instances row, which
+ * names the same value `id`. A frame that names no instance is not about any
+ * instance, and is therefore never delivered to a scoped subscription.
+ */
+function frameInstanceId(payload: Record<string, unknown>): string | undefined {
+  if (typeof payload.instanceId === "string") return payload.instanceId;
+  return typeof payload.id === "string" ? payload.id : undefined;
+}
+
+/**
+ * Whether a frame may patch a subscription at this scope (`R-V5`).
+ *
+ * Strict by construction: a scoped subscription accepts a frame only when the
+ * frame *names* that scope's instance (and, at group scope, that group). An
+ * unidentifiable or foreign frame is dropped rather than fanned out, so two
+ * scopes' data can never be interleaved — and an `instance.updated` frame,
+ * whose instance arrives as the row's `id`, is matched by the same rule as
+ * every other event.
  */
 function frameMatchesScope(scope: Scope, data: unknown): boolean {
-  if (scope.kind === "global" || !data || typeof data !== "object") return true;
-  const payload = data as { instanceId?: unknown; groupJid?: unknown };
-  if (typeof payload.instanceId === "string" && payload.instanceId !== scope.instanceId) return false;
-  if (scope.kind !== "group") return true;
-  return typeof payload.groupJid !== "string" || payload.groupJid === scope.groupJid;
+  if (scope.kind === "global") return true;
+  if (!data || typeof data !== "object") return false;
+  const payload = data as Record<string, unknown>;
+  if (frameInstanceId(payload) !== scope.instanceId) return false;
+  if (scope.kind === "instance") return true;
+  return payload.groupJid === scope.groupJid;
 }
 
 export function createStreamCoordinator(factory?: EventSourceFactory): StreamCoordinator {

@@ -174,11 +174,14 @@ export function useResource<D, P = unknown>(
         }
       }
 
-      resourceCache.begin(key, resource.id);
+      const write = resourceCache.begin(key, resource.id);
       resource.fetch({ scope, params }).then(
         (data) => {
           if (request.current !== requestId) return;
-          resourceCache.resolve(key, resource.id, data);
+          // A live patch that landed while this read was in flight moved the
+          // entry on; the cache drops the older snapshot instead of undoing it
+          // (R-V4). The read is still finished, so the tier settles either way.
+          resourceCache.resolve(write, data);
           // A background poll updates the cache and nothing else: no tier
           // change, no bar, no skeleton (R-V3).
           if (mode === "load") settle();
@@ -188,7 +191,7 @@ export function useResource<D, P = unknown>(
           // A failed poll keeps the last good payload on screen (R-V3); only a
           // load the operator is waiting on may surface an error surface.
           if (mode === "revalidate") return;
-          resourceCache.reject(key, resource.id, error);
+          resourceCache.reject(write, error);
           settle();
         },
       );

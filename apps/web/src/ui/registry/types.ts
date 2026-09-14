@@ -58,11 +58,21 @@ export const EMPTY_REASONS: readonly EmptyReason[] = [
   "not-permitted",
 ];
 
+/**
+ * The way out of an empty state (§4.4 R-E1): a link to where the state is
+ * fixed, or the operation that fixes it. It is deliberately not a label with
+ * nothing behind it — a control that does nothing is worse than no control —
+ * which is why the effect is part of the type rather than an optional extra.
+ */
+export type EmptyAction =
+  | { readonly label: string; readonly href: string }
+  | { readonly label: string; readonly run: () => void };
+
 /** One reason's copy. The action is the way out, never a bare statement (§4.4 R-E1). */
 export interface EmptyCopy {
   title: string;
   body: string;
-  action?: { label: string; href?: string };
+  action?: EmptyAction;
 }
 
 /** One copy per reason: the type makes an omission a compile error (§4.4 R-E1). */

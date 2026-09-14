@@ -275,10 +275,17 @@ describe("GET /api/stream resume", () => {
     const db = await getDb();
     await until(
       async () =>
-        (await db.collection<{ _id: string; resumeToken?: unknown }>(COLLECTIONS.streamCursors).findOne({ _id: "sse" })) !==
-        null,
-      "the resume cursor to be persisted",
+        (await db
+          .collection<{ _id: string; organizationId?: string; resumeToken?: unknown }>(COLLECTIONS.streamCursors)
+          .findOne({ _id: "sse:org_default" })) !== null,
+      "the tenant's resume cursor to be persisted",
     );
+    const stored = await db
+      .collection<{ _id: string; organizationId?: string; resumeToken?: unknown }>(COLLECTIONS.streamCursors)
+      .findOne({ _id: "sse:org_default" });
+    // The cursor is the tenant's own row, not one shared by every organisation.
+    expect(stored?.organizationId).toBe("org_default");
+    expect(stored?.resumeToken).toBeTruthy();
 
     const resumed = await open(`?resume=${encodeURIComponent(token)}`);
     await readUntil(resumed.reader, (text) => text.includes(": open"), "the resumed opening comment");
@@ -297,6 +304,8 @@ describe("GET /api/stream resume", () => {
   });
 
   test("a resume token this deployment never minted does not kill the stream", async () => {
+    // An undecodable token is not a token: the connection must still open, and
+    // still deliver what happens next.
     const { reader, close } = await open("?resume=bm90LWEtdG9rZW4");
     await readUntil(reader, (text) => text.includes(": open"), "the opening comment");
 
@@ -306,33 +315,115 @@ describe("GET /api/stream resume", () => {
     close();
   });
 
-  test("a fresh connection never replays a previous connection's changes", async () => {
-    // The persisted cursor records where the stream got to; it is a record, not
-    // a resume point, or opening the dashboard would replay the last session.
+  test("a connection with no token of its own resumes from the tenant's cursor", async () => {
+    const db = await getDb();
+    await db.collection(COLLECTIONS.streamCursors).deleteMany({});
+
     const first = await open();
     await readUntil(first.reader, (text) => text.includes(": open"), "the opening comment");
-    await touchGroup("120363040000000004@g.us", "SeenByTheFirstConnection");
-    await readFrame(first.reader, "group.updated", forGroup("120363040000000004@g.us"), "the first connection's patch");
+    await touchGroup("120363040000000007@g.us", "DeliveredThenClosed");
+    await readFrame(first.reader, "group.updated", forGroup("120363040000000007@g.us"), "the first connection's patch");
+    first.close();
+    await until(
+      async () =>
+        (await db
+          .collection<{ _id: string }>(COLLECTIONS.streamCursors)
+          .findOne({ _id: "sse:org_default" })) !== null,
+      "the tenant's resume cursor to be persisted",
+    );
+
+    // The change lands while nothing is connected. A connection that started at
+    // "now" would miss it; resuming from the persisted cursor catches it up.
+    await touchGroup("120363040000000008@g.us", "WrittenWhileNobodyListened");
+
+    const reopened = await open();
+    const { frame } = await readFrame(
+      reopened.reader,
+      "group.updated",
+      forGroup("120363040000000008@g.us"),
+      "the catch-up patch",
+    );
+    expect(frame.data).toMatchObject({ name: "WrittenWhileNobodyListened" });
+    reopened.close();
+  });
+
+  test("the client's own token wins over the tenant's persisted cursor", async () => {
+    const db = await getDb();
+    await db.collection(COLLECTIONS.streamCursors).deleteMany({});
+
+    const first = await open();
+    await readUntil(first.reader, (text) => text.includes(": open"), "the opening comment");
+    await touchGroup("120363040000000009@g.us", "First");
+    const { frame: firstFrame } = await readFrame(
+      first.reader,
+      "group.updated",
+      forGroup("120363040000000009@g.us"),
+      "the first patch",
+    );
+    const olderToken = firstFrame.id;
+
+    // A second change moves the persisted cursor past the first token.
+    await touchGroup("120363040000000010@g.us", "Second");
+    await readFrame(first.reader, "group.updated", forGroup("120363040000000010@g.us"), "the second patch");
+    first.close();
+    await until(
+      async () =>
+        (await db
+          .collection<{ _id: string }>(COLLECTIONS.streamCursors)
+          .findOne({ _id: "sse:org_default" })) !== null,
+      "the tenant's resume cursor to be persisted",
+    );
+
+    // Resuming from the *older* client token must replay the second change; a
+    // connection that preferred the persisted cursor would start after it.
+    const resumed = await open(`?resume=${encodeURIComponent(olderToken)}`);
+    const { frame } = await readFrame(
+      resumed.reader,
+      "group.updated",
+      forGroup("120363040000000010@g.us"),
+      "the change the client token predates",
+    );
+    expect(frame.data).toMatchObject({ name: "Second" });
+    resumed.close();
+  });
+
+  test("another tenant's cursor row is never consumed", async () => {
+    const db = await getDb();
+    await db.collection(COLLECTIONS.streamCursors).deleteMany({});
+
+    const first = await open();
+    await readUntil(first.reader, (text) => text.includes(": open"), "the opening comment");
+    await touchGroup("120363040000000011@g.us", "BeforeTheOtherTenantRow");
+    const { frame } = await readFrame(
+      first.reader,
+      "group.updated",
+      forGroup("120363040000000011@g.us"),
+      "the earlier patch",
+    );
     first.close();
 
-    // One more write advances the oplog past that change, so a fresh anchor is
-    // strictly after it and the assertion below cannot be a race.
-    await touchGroup("120363040000000006@g.us", "WrittenWhileNoStreamWasOpen");
+    // A cursor that points *before* that change, filed under another tenant.
+    await db
+      .collection<{ _id: string; organizationId?: string; resumeToken?: unknown; updatedAt?: Date }>(
+        COLLECTIONS.streamCursors,
+      )
+      .insertOne({
+        _id: "sse:org_other",
+        organizationId: "org_other",
+        resumeToken: JSON.parse(Buffer.from(frame.id, "base64url").toString("utf8")),
+        updatedAt: new Date(),
+      });
 
     const fresh = await open();
     await readUntil(fresh.reader, (text) => text.includes(": open"), "the fresh opening comment");
-    await touchGroup("120363040000000005@g.us", "SeenByTheFreshConnection");
-
-    const { text, frame } = await readFrame(
+    await touchGroup("120363040000000012@g.us", "AfterTheOtherTenantRow");
+    const { text } = await readFrame(
       fresh.reader,
       "group.updated",
-      forGroup("120363040000000005@g.us"),
-      "the fresh connection's patch",
+      forGroup("120363040000000012@g.us"),
+      "the fresh patch",
     );
-    expect(frame.data).toMatchObject({ name: "SeenByTheFreshConnection" });
-    // Only the boundary change (the write that happened with no stream open)
-    // may repeat; the first session's change must not come back.
-    expect(JSON.stringify(parseFrames(text))).not.toContain("SeenByTheFirstConnection");
+    expect(JSON.stringify(parseFrames(text))).not.toContain("BeforeTheOtherTenantRow");
     fresh.close();
   });
 });

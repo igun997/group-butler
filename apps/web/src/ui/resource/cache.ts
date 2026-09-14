@@ -31,11 +31,25 @@ export interface CacheEntry<D = unknown> {
   readonly version: number;
 }
 
+/**
+ * The handle `begin` mints for one fetch: which entry, and which *generation*
+ * of it. A fetch may only write back the generation it started from, so a slow
+ * read can never resurrect the snapshot it began with after a live patch (or a
+ * newer read) has already moved the entry on (`R-V4`).
+ */
+export interface CacheWrite {
+  readonly key: string;
+  readonly resourceId: string;
+  readonly version: number;
+}
+
 export interface ResourceCache {
   read<D>(key: string): CacheEntry<D> | undefined;
-  begin(key: string, resourceId: string): void;
-  resolve<D>(key: string, resourceId: string, data: D): void;
-  reject(key: string, resourceId: string, error: unknown): void;
+  begin(key: string, resourceId: string): CacheWrite;
+  /** Store a finished read; dropped (and `false`) when its generation is stale. */
+  resolve<D>(write: CacheWrite, data: D): boolean;
+  /** Store a failure under the same generation rule. */
+  reject(write: CacheWrite, error: unknown): boolean;
   /**
    * Apply a live patch (an SSE frame) to a cached value. An updater that
    * returns the value it was given is a no-op, so an event for another scope
@@ -72,10 +86,18 @@ export function createResourceCache(): ResourceCache {
     for (const listener of [...listeners]) listener();
   };
 
-  const write = (entry: MutableEntry, patch: Partial<CacheEntry>): void => {
+  /** Replace an entry in place (immutably) and bump the shared generation. */
+  const put = (entry: MutableEntry, patch: Partial<CacheEntry>): number => {
     version += 1;
     entries.set(entry.key, { ...entry, ...patch, version } as MutableEntry);
     notify();
+    return version;
+  };
+
+  /** The entry a write owns, or `null` when a newer write has superseded it. */
+  const generation = (candidate: CacheWrite): MutableEntry | null => {
+    const entry = entries.get(candidate.key);
+    return entry && entry.version === candidate.version ? entry : null;
   };
 
   const ensure = (key: string, resourceId: string): MutableEntry => {
@@ -99,16 +121,23 @@ export function createResourceCache(): ResourceCache {
       return entries.get(key) as CacheEntry<D> | undefined;
     },
 
-    begin(key: string, resourceId: string) {
-      write(ensure(key, resourceId), { resourceId, status: "loading" });
+    begin(key: string, resourceId: string): CacheWrite {
+      const entry = ensure(key, resourceId);
+      return { key, resourceId, version: put(entry, { resourceId, status: "loading" }) };
     },
 
-    resolve<D>(key: string, resourceId: string, data: D) {
-      write(ensure(key, resourceId), { resourceId, status: "success", data, error: undefined });
+    resolve<D>(write: CacheWrite, data: D): boolean {
+      const entry = generation(write);
+      if (!entry) return false;
+      put(entry, { resourceId: write.resourceId, status: "success", data, error: undefined });
+      return true;
     },
 
-    reject(key: string, resourceId: string, error: unknown) {
-      write(ensure(key, resourceId), { resourceId, status: "error", error });
+    reject(write: CacheWrite, error: unknown): boolean {
+      const entry = generation(write);
+      if (!entry) return false;
+      put(entry, { resourceId: write.resourceId, status: "error", error });
+      return true;
     },
 
     patch<D>(key: string, updater: (data: D) => D) {
@@ -116,7 +145,7 @@ export function createResourceCache(): ResourceCache {
       if (!entry || entry.data === undefined) return;
       const next = updater(entry.data as D);
       if (next === entry.data) return;
-      write(entry, { data: next });
+      put(entry, { data: next });
     },
 
     depend(key: string, resourceIds: readonly string[]) {
@@ -137,14 +166,14 @@ export function createResourceCache(): ResourceCache {
       }
       for (const key of touched) {
         const entry = entries.get(key);
-        if (entry && !entry.stale) write(entry, { stale: true });
+        if (entry && !entry.stale) put(entry, { stale: true });
       }
       return [...touched];
     },
 
     markFresh(key: string) {
       const entry = entries.get(key);
-      if (entry?.stale) write(entry, { stale: false });
+      if (entry?.stale) put(entry, { stale: false });
     },
 
     clear() {

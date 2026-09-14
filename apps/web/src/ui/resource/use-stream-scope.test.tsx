@@ -146,6 +146,66 @@ describe("the tab's single EventSource", () => {
     expect(frames[0]?.id).toBe("tok-3");
   });
 
+  test("an instance.updated row, which names its instance as `id`, only reaches that instance", () => {
+    const frames: StreamFrame[] = [];
+    streamCoordinator.subscribe({
+      scope: { kind: "instance", instanceId: "inst_1" },
+      event: "instance.updated",
+      onFrame: (frame) => frames.push(frame),
+    });
+    const source = FakeEventSource.last();
+    source.open();
+
+    source.emit("instance.updated", { id: "inst_2", label: "Other", status: "connected" }, "tok-1");
+    expect(frames).toHaveLength(0);
+
+    source.emit("instance.updated", { id: "inst_1", label: "Mine", status: "connected" }, "tok-2");
+    expect(frames).toHaveLength(1);
+    expect(frames[0]?.id).toBe("tok-2");
+  });
+
+  test("a group scope takes only its own group, and a global scope takes everything", () => {
+    const mine: StreamFrame[] = [];
+    const every: StreamFrame[] = [];
+    streamCoordinator.subscribe({
+      scope: { kind: "group", instanceId: "inst_1", groupJid: "1203@g.us" },
+      event: "group.updated",
+      onFrame: (frame) => mine.push(frame),
+    });
+    streamCoordinator.subscribe({ scope: GLOBAL, event: "group.updated", onFrame: (frame) => every.push(frame) });
+    const source = FakeEventSource.last();
+    source.open();
+
+    source.emit("group.updated", { instanceId: "inst_1", groupJid: "9999@g.us", name: "Another group" }, "tok-1");
+    source.emit("group.updated", { instanceId: "inst_2", groupJid: "1203@g.us", name: "Another instance" }, "tok-2");
+    expect(mine).toHaveLength(0);
+    expect(every).toHaveLength(2);
+
+    source.emit("group.updated", { instanceId: "inst_1", groupJid: "1203@g.us", name: "Mine" }, "tok-3");
+    expect(mine).toHaveLength(1);
+    expect(every).toHaveLength(3);
+  });
+
+  test("a frame that names no scope reaches no scoped subscription", () => {
+    const mine: StreamFrame[] = [];
+    streamCoordinator.subscribe({
+      scope: { kind: "group", instanceId: "inst_1", groupJid: "1203@g.us" },
+      event: "group.updated",
+      onFrame: (frame) => mine.push(frame),
+    });
+    const source = FakeEventSource.last();
+    source.open();
+
+    // An instance-level frame is not about any group, and an unidentifiable
+    // payload is not about any instance: neither may patch a scoped read.
+    source.emit("group.updated", { instanceId: "inst_1", name: "No group named" }, "tok-1");
+    source.emit("group.updated", { name: "No instance named" }, "tok-2");
+    expect(mine).toHaveLength(0);
+
+    source.emit("group.updated", { instanceId: "inst_1", groupJid: "1203@g.us", name: "Mine" }, "tok-3");
+    expect(mine).toHaveLength(1);
+  });
+
   test("a malformed frame is dropped rather than thrown", () => {
     const onFrame = vi.fn();
     streamCoordinator.subscribe({ scope: GLOBAL, event: "group.updated", onFrame });

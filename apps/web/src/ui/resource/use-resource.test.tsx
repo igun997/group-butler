@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, render, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import type { EmptyPlan, ResourceDescriptor, Scope } from "../registry";
+import type { EmptyAction, EmptyPlan, ResourceDescriptor, Scope } from "../registry";
 import { resourceCache, resourceKey } from "./cache";
 import { ResourceGate } from "./resource-gate";
 import { SKELETON_DELAY_MS, SKELETON_MIN_VISIBLE_MS, useResource } from "./use-resource";
@@ -274,6 +274,127 @@ describe("ResourceGate surfaces (R-L1, R-E1, R-V3)", () => {
     expect(document.body.textContent).not.toContain("Nothing yet");
   });
 
+  test("a cold read carries exactly one labelled status while the skeleton stays hidden", async () => {
+    useTierTimers();
+    const load = vi.fn(() => new Promise<string[]>((resolve) => setTimeout(() => resolve([]), 60_000)));
+    const resource = makeResource("gate-status", load);
+    render(
+      <ResourceGate resource={resource} scope={GLOBAL} label="Groups" emptyReason="no-data">
+        {() => <p>loaded rows</p>}
+      </ResourceGate>,
+    );
+
+    const status = document.querySelectorAll('[role="status"]');
+    expect(status).toHaveLength(1);
+    expect(status[0]?.textContent).toBe("Loading Groups");
+    // The status is present before the skeleton, and stays the only one once
+    // the skeleton appears — the skeleton itself is announced to nobody.
+    expect(document.querySelector(".resource-skeleton")).toBeNull();
+
+    act(() => {
+      vi.advanceTimersByTime(SKELETON_DELAY_MS + 1);
+    });
+    const skeleton = document.querySelector(".resource-skeleton");
+    expect(skeleton?.getAttribute("aria-hidden")).toBe("true");
+    expect(document.querySelectorAll('[role="status"]')).toHaveLength(1);
+  });
+
+  test("a cold read with no label still carries one status, unnamed", async () => {
+    useTierTimers();
+    const load = vi.fn(() => new Promise<string[]>((resolve) => setTimeout(() => resolve([]), 60_000)));
+    const resource = makeResource("gate-status-bare", load);
+    render(
+      <ResourceGate resource={resource} scope={GLOBAL}>
+        {() => <p>loaded rows</p>}
+      </ResourceGate>,
+    );
+
+    const status = document.querySelectorAll('[role="status"]');
+    expect(status).toHaveLength(1);
+    expect(status[0]?.textContent).toBe("Loading");
+  });
+
+  test("a settled read carries no loading status at all", async () => {
+    const resource = makeResource("gate-no-status", () => Promise.resolve(["row"]));
+    render(
+      <ResourceGate resource={resource} scope={GLOBAL} label="Groups">
+        {() => <p>loaded rows</p>}
+      </ResourceGate>,
+    );
+
+    await waitFor(() => expect(document.body.textContent).toContain("loaded rows"));
+    expect(document.querySelectorAll('[role="status"]')).toHaveLength(0);
+  });
+
+  test("an empty copy's action is a real operation, not a dead control", async () => {
+    const run = vi.fn();
+    const resource = makeResource<string[]>(
+      "gate-empty-action",
+      () => Promise.resolve([]),
+      {
+        empty: {
+          ...EMPTY,
+          filtered: { title: "No matches", body: "No rows match.", action: { label: "Clear filters", run } },
+        },
+      },
+    );
+    render(
+      <ResourceGate resource={resource} scope={GLOBAL} emptyReason="filtered">
+        {() => <p>loaded rows</p>}
+      </ResourceGate>,
+    );
+
+    await waitFor(() => expect(document.body.textContent).toContain("No matches"));
+    const button = document.querySelector<HTMLButtonElement>("button.resource-surface__action");
+    expect(button?.textContent).toBe("Clear filters");
+    act(() => {
+      button?.click();
+    });
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  test("an empty copy's link action keeps its href", async () => {
+    const resource = makeResource<string[]>("gate-empty-link", () => Promise.resolve([]), {
+      empty: {
+        ...EMPTY,
+        unconfigured: {
+          title: "Not set up",
+          body: "This instance has not been configured.",
+          action: { label: "Open settings", href: "/settings" },
+        },
+      },
+    });
+    render(
+      <ResourceGate resource={resource} scope={GLOBAL} emptyReason="unconfigured">
+        {() => <p>loaded rows</p>}
+      </ResourceGate>,
+    );
+
+    await waitFor(() => expect(document.body.textContent).toContain("Not set up"));
+    const link = document.querySelector<HTMLAnchorElement>("a.resource-surface__action");
+    expect(link?.getAttribute("href")).toBe("/settings");
+    expect(link?.textContent).toBe("Open settings");
+  });
+
+  test("an empty copy with no action renders no control at all", async () => {
+    const resource = makeResource<string[]>("gate-empty-none", () => Promise.resolve([]));
+    render(
+      <ResourceGate resource={resource} scope={GLOBAL} emptyReason="no-data">
+        {() => <p>loaded rows</p>}
+      </ResourceGate>,
+    );
+
+    await waitFor(() => expect(document.body.textContent).toContain("Nothing yet"));
+    expect(document.querySelector(".resource-surface__action")).toBeNull();
+  });
+
+  test("an action without an effect is a type error, not a dead control", () => {
+    // @ts-expect-error — `EmptyAction` requires a link or an operation, so a
+    // label with nothing behind it cannot be written down.
+    const broken: EmptyAction = { label: "Does nothing" };
+    expect(broken).toBeDefined();
+  });
+
   test("a settled read with no rows shows the declared reason's copy, not a bare line", async () => {
     const resource = makeResource("gate-empty", () => Promise.resolve([]));
     render(
@@ -341,12 +462,76 @@ describe("resource cache identity and invalidation", () => {
   });
 
   test("a patch that returns the same reference costs no render and no copy", () => {
-    resourceCache.resolve("k", "r", ["row"]);
+    resourceCache.resolve(resourceCache.begin("k", "r"), ["row"]);
     const before = resourceCache.read<string[]>("k");
     resourceCache.patch<string[]>("k", (data) => data);
     expect(resourceCache.read<string[]>("k")).toBe(before);
 
     resourceCache.patch<string[]>("k", (data) => [...data, "next"]);
     expect(resourceCache.read<string[]>("k")?.data).toEqual(["row", "next"]);
+  });
+});
+
+describe("a fetch may only write the generation it started from (R-V4)", () => {
+  test("a resolve that began before a live patch never overwrites it", () => {
+    resourceCache.resolve(resourceCache.begin("gen", "r"), ["row"]);
+
+    const inflight = resourceCache.begin("gen", "r");
+    resourceCache.patch<string[]>("gen", (rows) => [...rows, "patched"]);
+
+    expect(resourceCache.resolve(inflight, ["row"])).toBe(false);
+    expect(resourceCache.read<string[]>("gen")?.data).toEqual(["row", "patched"]);
+    // The superseded read is dropped, not applied: the entry is still the
+    // in-flight one the patch moved, and it never became the stale snapshot.
+    expect(resourceCache.read<string[]>("gen")?.status).toBe("loading");
+  });
+
+  test("a rejection from a superseded generation cannot blank a patched entry", () => {
+    resourceCache.resolve(resourceCache.begin("gen-fail", "r"), ["row"]);
+
+    const inflight = resourceCache.begin("gen-fail", "r");
+    resourceCache.patch<string[]>("gen-fail", (rows) => [...rows, "patched"]);
+
+    expect(resourceCache.reject(inflight, new Error("stale failure"))).toBe(false);
+    expect(resourceCache.read<string[]>("gen-fail")?.data).toEqual(["row", "patched"]);
+    expect(resourceCache.read<string[]>("gen-fail")?.error).toBeUndefined();
+  });
+
+  test("a newer load supersedes an older one for the same key", () => {
+    const older = resourceCache.begin("gen-order", "r");
+    const newer = resourceCache.begin("gen-order", "r");
+
+    expect(resourceCache.resolve(older, ["old"])).toBe(false);
+    expect(resourceCache.resolve(newer, ["new"])).toBe(true);
+    expect(resourceCache.read<string[]>("gen-order")?.data).toEqual(["new"]);
+  });
+
+  test("a live patch landing mid-load is not undone by the older snapshot", async () => {
+    const pending: Array<(rows: string[]) => void> = [];
+    const load = vi.fn(() => new Promise<string[]>((resolve) => pending.push(resolve)));
+    const resource = makeResource<string[]>("mid-load", load);
+    const { result } = renderHook(() => useResource(resource, { scope: GLOBAL }));
+
+    await act(async () => {
+      pending[0]?.(["first"]);
+    });
+    await waitFor(() => expect(result.current.data).toEqual(["first"]));
+
+    act(() => {
+      result.current.refresh();
+    });
+    const key = resource.key(GLOBAL, undefined);
+    act(() => {
+      resourceCache.patch<string[]>(key, (rows) => [...rows, "live"]);
+    });
+    expect(result.current.data).toEqual(["first", "live"]);
+
+    // The refetch resolves with the snapshot it started from; it must not win.
+    await act(async () => {
+      pending[1]?.(["first"]);
+    });
+    expect(result.current.data).toEqual(["first", "live"]);
+    expect(result.current.tier).toBe("live");
+    expect(result.current.showSkeleton).toBe(false);
   });
 });

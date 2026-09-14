@@ -16,6 +16,12 @@ import { useResource, type ResourceView } from "./use-resource";
  * The rendered state is `data-state`, never the transport, because a degraded
  * transport MUST leave the DOM byte-identical (`R-V3`); only the header's live
  * indicator may say that the stream is polling.
+ *
+ * A cold read carries exactly one accessible status — a labelled `role="status"`
+ * naming the region — while the skeleton it reserves space with stays
+ * `aria-hidden`, so a screen reader is told *that* the panel is loading without
+ * being read a shape (`R-L1`, `R-L4`). The status is the state, never the
+ * transport, so it survives a degrade unchanged.
  */
 
 export interface ResourceGateProps<D, P = unknown> {
@@ -24,6 +30,8 @@ export interface ResourceGateProps<D, P = unknown> {
   params?: P;
   /** The reason to show when the read settled with nothing; omit if any value counts. */
   emptyReason?: EmptyReason;
+  /** What this region is, for the one loading announcement (`R-L1`). */
+  label?: string;
   children: (view: ResourceView<D>) => ReactNode;
 }
 
@@ -38,6 +46,7 @@ export function ResourceGate<D, P = unknown>({
   scope,
   params,
   emptyReason,
+  label,
   children,
 }: ResourceGateProps<D, P>) {
   const view = useResource(resource, { scope, params });
@@ -61,7 +70,11 @@ export function ResourceGate<D, P = unknown>({
       <div className="resource-surface">
         <p className="resource-surface__title">{error.title}</p>
         {error.body ? <p className="resource-surface__body">{error.body}</p> : null}
-        {error.action?.kind === "retry" || error.retryable ? (
+        {error.action?.kind === "navigate" && error.action.href !== undefined ? (
+          <a className="resource-surface__action" href={error.action.href}>
+            {error.action.label}
+          </a>
+        ) : error.action?.kind === "retry" || error.retryable ? (
           <button type="button" className="resource-surface__action" onClick={view.refresh}>
             {error.action?.label ?? "Try again"}
           </button>
@@ -82,17 +95,15 @@ export function ResourceGate<D, P = unknown>({
       <div className="resource-surface">
         <p className="resource-surface__title">{copy.title}</p>
         <p className="resource-surface__body">{copy.body}</p>
-        {copy.action ? (
-          copy.action.href ? (
-            <a className="resource-surface__action" href={copy.action.href}>
-              {copy.action.label}
-            </a>
-          ) : (
-            <button type="button" className="resource-surface__action">
-              {copy.action.label}
-            </button>
-          )
-        ) : null}
+        {copy.action === undefined ? null : "href" in copy.action ? (
+          <a className="resource-surface__action" href={copy.action.href}>
+            {copy.action.label}
+          </a>
+        ) : (
+          <button type="button" className="resource-surface__action" onClick={copy.action.run}>
+            {copy.action.label}
+          </button>
+        )}
       </div>
     );
   } else if (view.data === undefined && view.tier !== "live" && view.tier !== "poll") {
@@ -114,6 +125,11 @@ export function ResourceGate<D, P = unknown>({
       aria-busy={state === "cold" || state === "warm" ? true : undefined}
     >
       {view.showWarmBar ? <div className="resource-gate__bar" aria-hidden="true" /> : null}
+      {state === "cold" ? (
+        <p className="visually-hidden" role="status">
+          {label === undefined ? "Loading" : `Loading ${label}`}
+        </p>
+      ) : null}
       {surface}
     </div>
   );

@@ -14,9 +14,9 @@ import { toMessageRow, type MessageDoc } from "../../../server/repos/messages";
  * shows and filters them by the session's `organizationId`, so one cursor and
  * one resume token cover all of them and a frame can never carry another
  * tenant's document. The token rides out as the SSE `id:`, which is what lets a
- * reconnecting client resume without replaying the day, and the last delivered
- * token is persisted in `streamCursors` as the durable record of how far the
- * stream got.
+ * reconnecting client resume without replaying the day; the last delivered token
+ * is also persisted per tenant in `streamCursors`, and is consumed as the resume
+ * point when a connection presents no token of its own.
  *
  * Change streams need a replica set. When the deployment cannot provide one the
  * route answers `503 stream_unavailable` rather than holding an idle connection
@@ -102,9 +102,19 @@ type ChangeLike = {
   _id?: unknown;
 };
 
-/** The one resume-token row (§5.1). */
+/**
+ * This tenant's resume-token row (§5.1). The identity is the tenant, never one
+ * row shared by everyone: two organisations must not resume from each other's
+ * position, and `organizationId` is written alongside the token so the row says
+ * which tenant it belongs to.
+ */
+function cursorId(organizationId: string): string {
+  return `sse:${organizationId}`;
+}
+
 type StreamCursorDoc = {
   _id: string;
+  organizationId?: string;
   resumeToken?: unknown;
   updatedAt?: Date;
 };
@@ -117,7 +127,10 @@ function encodeResumeToken(token: unknown): string | null {
 function decodeResumeToken(value: string | null): unknown {
   if (!value) return undefined;
   try {
-    return JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+    const token: unknown = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+    // A resume token is a BSON document. Anything else — a bare string, a list,
+    // a number — is not one, and must not reach the server as a resume point.
+    return typeof token === "object" && token !== null && !Array.isArray(token) ? token : undefined;
   } catch {
     return undefined;
   }
@@ -267,10 +280,27 @@ function serializeFrame(id: string | null, frame: StreamFrame): string {
   return `${lines.join("\n")}\n\n`;
 }
 
-async function saveStreamCursor(db: Db, resumeToken: unknown): Promise<void> {
+/**
+ * Where this tenant's stream last delivered. It is the resume point for a
+ * connection that presents no token of its own — a reloaded page, or a client
+ * whose last event id is gone — so the connection catches up on the gap instead
+ * of starting mid-change and dropping it.
+ */
+async function readStreamCursor(db: Db, organizationId: string): Promise<unknown> {
+  const cursor = await db
+    .collection<StreamCursorDoc>(COLLECTIONS.streamCursors)
+    .findOne({ _id: cursorId(organizationId) });
+  return cursor?.resumeToken;
+}
+
+async function saveStreamCursor(db: Db, organizationId: string, resumeToken: unknown): Promise<void> {
   await db
     .collection<StreamCursorDoc>(COLLECTIONS.streamCursors)
-    .updateOne({ _id: "sse" }, { $set: { resumeToken, updatedAt: new Date() } }, { upsert: true });
+    .updateOne(
+      { _id: cursorId(organizationId) },
+      { $set: { organizationId, resumeToken, updatedAt: new Date() } },
+      { upsert: true },
+    );
 }
 
 function openChangeStream(
@@ -318,13 +348,16 @@ export async function GET(request: Request): Promise<Response> {
     return Response.json({ error: "stream_unavailable" }, { status: 503, headers: { "cache-control": "no-store" } });
   }
 
-  // The client's own token is the resume point: `Last-Event-ID` is what an
+  // Resume precedence: the client's own token first — `Last-Event-ID` is what an
   // `EventSource` sends by itself, and `?resume=` is what the coordinator adds
-  // when it opens a replacement source. A connection that presents neither is a
-  // fresh page, and it starts at the probe's operation time — resuming a fresh
-  // page from the persisted row would replay everything the last session saw,
-  // which is the opposite of "does not replay the whole day".
-  const resume = decodeResumeToken(request.headers.get("last-event-id") ?? new URL(request.url).searchParams.get("resume"));
+  // when it opens a replacement source — and then this tenant's persisted
+  // cursor, so a connection that presents neither still catches up on the gap
+  // instead of starting past a change it never saw. Both are decoded the same
+  // way, and a token that is not a token is `undefined` rather than a crash.
+  const clientToken = decodeResumeToken(
+    request.headers.get("last-event-id") ?? new URL(request.url).searchParams.get("resume"),
+  );
+  const resume = clientToken ?? (await readStreamCursor(db, organizationId));
 
   const encoder = new TextEncoder();
   const body = new ReadableStream<Uint8Array>({
@@ -371,7 +404,7 @@ export async function GET(request: Request): Promise<Response> {
             if (frame) send(serializeFrame(token, frame));
             if (pending && Date.now() - savedAt >= CURSOR_SAVE_MS) {
               savedAt = Date.now();
-              await saveStreamCursor(db, pending).catch(() => undefined);
+              await saveStreamCursor(db, organizationId, pending).catch(() => undefined);
             }
           }
           break;
@@ -390,7 +423,7 @@ export async function GET(request: Request): Promise<Response> {
       clearInterval(heartbeat);
       request.signal.removeEventListener("abort", onAbort);
       await changeStream?.close().catch(() => undefined);
-      if (pending) await saveStreamCursor(db, pending).catch(() => undefined);
+      if (pending) await saveStreamCursor(db, organizationId, pending).catch(() => undefined);
       try {
         controller.close();
       } catch {
