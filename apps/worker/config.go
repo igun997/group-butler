@@ -3,9 +3,12 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"time"
+
+	"go.mau.fi/whatsmeow/types"
 )
 
 const (
@@ -40,6 +43,14 @@ type Config struct {
 	R2SecretKey    string
 	R2Bucket       string
 	R2PublicURL    string
+
+	// OwnerWhatsAppJID enables automatic replies to the dashboard owner. The
+	// callback credentials deliver only qualifying owner mentions to the BFF.
+	// These three settings are all-or-none so partial configuration cannot
+	// silently change the bot's authorization boundary.
+	OwnerWhatsAppJID    string
+	ReplyCallbackURL    string
+	ReplyCallbackSecret string
 
 	IngestQueueSize int
 	IngestFlush     time.Duration
@@ -127,6 +138,10 @@ func loadConfig() (Config, error) {
 		AIAPIKey:  os.Getenv("AI_API_KEY"),
 		AIModel:   os.Getenv("AI_MODEL"),
 
+		OwnerWhatsAppJID:    os.Getenv("OWNER_WHATSAPP_JID"),
+		ReplyCallbackURL:    os.Getenv("REPLY_CALLBACK_URL"),
+		ReplyCallbackSecret: os.Getenv("REPLY_CALLBACK_SECRET"),
+
 		LogLevel: env("LOG_LEVEL", "info"),
 	}
 
@@ -183,7 +198,7 @@ func loadConfig() (Config, error) {
 // nothing, a zero concurrency or attempt budget can never finish, and a zero
 // interval either spins a loop or panics time.NewTicker. PORT is excluded (a
 // blank port falls back to the documented one) and so are the booleans.
-func (c Config) validate() error {
+func (c *Config) validate() error {
 	for _, v := range []struct {
 		key   string
 		value time.Duration
@@ -218,6 +233,36 @@ func (c Config) validate() error {
 		if v.value <= 0 {
 			return fmt.Errorf("%s must be positive, got %d", v.key, v.value)
 		}
+	}
+	if err := c.validateOwnerReply(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Config) validateOwnerReply() error {
+	configured := 0
+	for _, value := range []string{c.OwnerWhatsAppJID, c.ReplyCallbackURL, c.ReplyCallbackSecret} {
+		if value != "" {
+			configured++
+		}
+	}
+	if configured == 0 {
+		return nil
+	}
+	if configured != 3 {
+		return errors.New("OWNER_WHATSAPP_JID, REPLY_CALLBACK_URL, and REPLY_CALLBACK_SECRET must be configured together")
+	}
+
+	owner, err := types.ParseJID(c.OwnerWhatsAppJID)
+	if err != nil || owner.Server != types.DefaultUserServer || phoneDigitsFromJID(owner) == "" {
+		return fmt.Errorf("OWNER_WHATSAPP_JID must be a WhatsApp user JID, got %q", c.OwnerWhatsAppJID)
+	}
+	c.OwnerWhatsAppJID = types.NewJID(phoneDigitsFromJID(owner), types.DefaultUserServer).String()
+
+	callback, err := url.ParseRequestURI(c.ReplyCallbackURL)
+	if err != nil || callback.Host == "" || (callback.Scheme != "http" && callback.Scheme != "https") {
+		return fmt.Errorf("REPLY_CALLBACK_URL must be an absolute HTTP(S) URL, got %q", c.ReplyCallbackURL)
 	}
 	return nil
 }

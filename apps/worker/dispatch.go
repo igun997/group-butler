@@ -174,6 +174,10 @@ func (m *manager) sendText(ctx context.Context, request dispatchRequest) (string
 	if err != nil {
 		return "", err
 	}
+	_ = session.client.SendChatPresence(ctx, to, types.ChatPresenceComposing, types.ChatPresenceMediaText)
+	defer func() {
+		_ = session.client.SendChatPresence(context.WithoutCancel(ctx), to, types.ChatPresencePaused, types.ChatPresenceMediaText)
+	}()
 	response, err := session.client.SendMessage(ctx, to, message, whatsmeow.SendRequestExtra{ID: types.MessageID(request.ID)})
 	if err != nil {
 		return "", err

@@ -249,6 +249,9 @@ func (c *fakeClient) DownloadToFile(_ context.Context, _ whatsmeow.DownloadableM
 func (c *fakeClient) SendMessage(context.Context, types.JID, *waE2E.Message, ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
 	return whatsmeow.SendResponse{ID: types.MessageID("sent_by_fake")}, nil
 }
+func (c *fakeClient) SendChatPresence(context.Context, types.JID, types.ChatPresence, types.ChatPresenceMedia) error {
+	return nil
+}
 func (c *fakeClient) GetJoinedGroups(context.Context) ([]*types.GroupInfo, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

@@ -15,6 +15,7 @@ export interface SendRow {
   status: SendStatus;
   scheduledFor: Date;
   approval: { state: "pending" | "approved" | "rejected"; approvedBy?: "owner"; approvedAt?: Date };
+  provenance?: { source: "owner_mention"; replyToMessageId: string };
   dispatch: { attempts: number; lockedAt: Date | null; lockedBy: string | null; waMessageId: string | null; errorClass: string | null };
   createdAt: Date;
   updatedAt: Date;
@@ -22,6 +23,13 @@ export interface SendRow {
 
 export type CreateSendInput = Pick<SendRow, "organizationId" | "instanceId" | "groupJid" | "text" | "idempotencyKey"> & {
   actorIP: string;
+};
+
+export type CreateAutomaticSendInput = Pick<
+  SendRow,
+  "organizationId" | "instanceId" | "groupJid" | "text" | "idempotencyKey"
+> & {
+  replyToMessageId: string;
 };
 
 export type SendTransition = SendRow | { kind: "not_found" | "invalid_state" | "ambiguous" };
@@ -77,6 +85,58 @@ export async function createSend(db: Db, input: CreateSendInput): Promise<SendRo
       .collection<SendRow>(COLLECTIONS.sendRequests)
       .findOne({ organizationId: input.organizationId, idempotencyKey: input.idempotencyKey }, { projection: sendProjection });
     if (stored === null) throw new Error("created send request was not found");
+    return stored;
+  } finally {
+    await session.endSession();
+  }
+}
+
+/** Creates a dispatcher-eligible send for a verified owner mention. Manual sends
+ * retain the pending-approval path above; this function is deliberately the
+ * only automatic-reply exception and records why it bypassed the dashboard. */
+export async function createAutomaticSend(db: Db, input: CreateAutomaticSendInput): Promise<SendRow> {
+  const now = new Date();
+  const candidate: SendRow = {
+    id: randomUUID(),
+    organizationId: input.organizationId,
+    instanceId: input.instanceId,
+    groupJid: input.groupJid,
+    text: input.text,
+    idempotencyKey: input.idempotencyKey,
+    status: "approved",
+    scheduledFor: now,
+    approval: { state: "approved", approvedBy: "owner", approvedAt: now },
+    provenance: { source: "owner_mention", replyToMessageId: input.replyToMessageId },
+    dispatch: { attempts: 0, lockedAt: null, lockedBy: null, waMessageId: null, errorClass: null },
+    createdAt: now,
+    updatedAt: now,
+  };
+  const session = db.client.startSession();
+  try {
+    await session.withTransaction(async () => {
+      const result = await db.collection<SendRow>(COLLECTIONS.sendRequests).updateOne(
+        { organizationId: input.organizationId, idempotencyKey: input.idempotencyKey },
+        { $setOnInsert: candidate },
+        { upsert: true, session },
+      );
+      if (result.upsertedCount !== 1) return;
+      await writeAudit(
+        db,
+        {
+          organizationId: input.organizationId,
+          actor: "worker",
+          action: "send.created",
+          target: { type: "send", id: candidate.id },
+          meta: { instanceId: input.instanceId, groupJid: input.groupJid, replyToMessageId: input.replyToMessageId },
+          ip: "worker",
+        },
+        session,
+      );
+    });
+    const stored = await db
+      .collection<SendRow>(COLLECTIONS.sendRequests)
+      .findOne({ organizationId: input.organizationId, idempotencyKey: input.idempotencyKey }, { projection: sendProjection });
+    if (stored === null) throw new Error("created automatic send request was not found");
     return stored;
   } finally {
     await session.endSession();

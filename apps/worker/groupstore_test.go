@@ -73,6 +73,9 @@ func TestUpsertGroupFromSync_PreservesConfig(t *testing.T) {
 	if doc.Observed.Subject != "Ops Team" || doc.Observed.SubjectSearch != "ops team" {
 		t.Errorf("subject = %q/%q, want Ops Team/ops team", doc.Observed.Subject, doc.Observed.SubjectSearch)
 	}
+	if len(doc.Observed.Members) != 0 {
+		t.Errorf("members = %+v, want empty when the snapshot supplied none", doc.Observed.Members)
+	}
 	if doc.Observed.SubjectSource != SubjectFromSync || doc.Observed.LastSyncSource != SyncOnTimer {
 		t.Errorf("provenance = %q/%q, want sync/timer", doc.Observed.SubjectSource, doc.Observed.LastSyncSource)
 	}

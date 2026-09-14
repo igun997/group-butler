@@ -1,7 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { SESSION_COOKIE } from "./server/auth/cookie";
 
-const OPEN_API_PATHS = ["/api/auth/login", "/api/health"];
+const OPEN_API_PATHS = ["/api/auth/login", "/api/health", "/api/internal/reply-jobs"];
 
 /**
  * Route handlers verify the signed owner session. This edge gate cheaply rejects

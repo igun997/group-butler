@@ -91,6 +91,7 @@ func run() error {
 	mgr := newManager(cfg, newGroupStore(db), newInstanceMongo(db), newPairingMongo(db), queue, authStore)
 	mgr.stats = newStatsStore(db)
 	mgr.audit = newAuditStore(db)
+	queue.setAfterSave(mgr.deliverSavedReplies)
 	// The health probe reports the database the worker is actually using.
 	mgr.ping = func(ctx context.Context) error { return client.Ping(ctx, nil) }
 	// Media is enabled only by present R2 credentials; nil keeps every

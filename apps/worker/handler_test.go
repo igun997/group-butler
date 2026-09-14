@@ -7,9 +7,11 @@ import (
 	"testing"
 	"time"
 
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/proto"
 )
 
 // ---- blocker 1 fakes -----------------------------------------------------
@@ -262,8 +264,8 @@ func TestGroupTouchIsRoutedOffTheCallback(t *testing.T) {
 	if touch, _, _ := groups.calls(); touch != 0 {
 		t.Fatal("the callback touched the group inline")
 	}
-	if persist.Depth() != 1 {
-		t.Fatalf("persist depth = %d, want the group touch queued", persist.Depth())
+	if persist.Depth() != 2 {
+		t.Fatalf("persist depth = %d, want the group touch and assignment gate queued", persist.Depth())
 	}
 }
 
@@ -280,4 +282,49 @@ func TestHistorySyncIsRoutedOffTheCallback(t *testing.T) {
 	if _, _, _ = groups.calls(); persist.Depth() != 0 {
 		t.Fatalf("an empty history sync must queue nothing, depth = %d", persist.Depth())
 	}
+}
+
+func TestInboundMessageJobPersistsOnlyAssignedGroups(t *testing.T) {
+	groupJID := types.NewJID("120363043123456789", types.GroupServer).String()
+	groups := newFakeGroupStore()
+	ingest := newIngestQueue(2, time.Hour, 10)
+	mgr := testManagerWithDeps(groups, nil, nil)
+	mgr.ingest = ingest
+	s := testSession(mgr, newFakeClient())
+	evt := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:    types.NewJID("120363043123456789", types.GroupServer),
+				Sender:  types.NewJID("628990000001", types.DefaultUserServer),
+				IsGroup: true,
+			},
+			ID:        "3EB0ASSIGNED",
+			Timestamp: time.Unix(1757750000, 0),
+		},
+		Message: &waE2E.Message{Conversation: proto.String("private group message")},
+	}
+	doc, err := parseInbound(evt, mgr.orgID, s.id)
+	if err != nil {
+		t.Fatalf("parseInbound: %v", err)
+	}
+
+	t.Run("unassigned", func(t *testing.T) {
+		groups.docs[groupJID] = &groupDoc{Config: groupConfig{Assigned: false}}
+		if err := (inboundMessageJob{session: s, evt: evt, doc: doc}).persist(context.Background(), mgr); err != nil {
+			t.Fatalf("persist: %v", err)
+		}
+		if ingest.Depth() != 0 {
+			t.Fatal("unassigned group message reached the ingest queue")
+		}
+	})
+
+	t.Run("assigned", func(t *testing.T) {
+		groups.docs[groupJID] = &groupDoc{Config: groupConfig{Assigned: true}}
+		if err := (inboundMessageJob{session: s, evt: evt, doc: doc}).persist(context.Background(), mgr); err != nil {
+			t.Fatalf("persist: %v", err)
+		}
+		if ingest.Depth() != 1 {
+			t.Fatalf("assigned group ingest depth = %d, want 1", ingest.Depth())
+		}
+	})
 }

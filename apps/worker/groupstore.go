@@ -104,6 +104,7 @@ func observedFields(o Observed, fromSync bool) bson.D {
 		{Key: "observed.isDefaultSubGroup", Value: o.IsDefaultSubGroup},
 		{Key: "observed.participantCount", Value: o.ParticipantCount},
 		{Key: "observed.participantCountDirty", Value: o.ParticipantCountDirty},
+		{Key: "observed.members", Value: o.Members},
 		{Key: "observed.groupCreatedAt", Value: o.GroupCreatedAt},
 		{Key: "observed.state", Value: o.State},
 		{Key: "observed.leftDetectedAt", Value: o.LeftDetectedAt},
@@ -133,25 +134,18 @@ func ObservedFromGroupInfo(info *types.GroupInfo, source SyncSource, at time.Tim
 	if info.Suspended {
 		state = GroupSuspended
 	}
+	members := make([]GroupMember, 0, len(info.Participants))
+	for _, participant := range info.Participants {
+		members = append(members, GroupMember{
+			JID: participant.JID.String(), PhoneJID: participant.PhoneNumber.ToNonAD().String(), LID: participant.LID.ToNonAD().String(),
+			IsAdmin: participant.IsAdmin, IsSuperAdmin: participant.IsSuperAdmin, DisplayName: participant.DisplayName,
+		})
+	}
 	return Observed{
-		Subject:           info.Name,
-		SubjectSearch:     foldText(info.Name),
-		SubjectUpdatedAt:  info.NameSetAt,
-		SubjectObservedAt: at,
-		SubjectSetBy:      pn,
-		SubjectSetByLID:   lid,
-		SubjectSource:     subjectSource,
-		Topic:             info.Topic,
-		TopicUpdatedAt:    info.TopicSetAt,
-		IsAnnounce:        info.IsAnnounce,
-		IsLocked:          info.IsLocked,
-		IsEphemeral:       info.IsEphemeral,
-		IsDefaultSubGroup: info.IsDefaultSubGroup,
-		ParticipantCount:  info.ParticipantCount,
-		GroupCreatedAt:    info.GroupCreated,
-		State:             state,
-		LastSyncedAt:      at,
-		LastSyncSource:    source,
+		Subject: info.Name, SubjectSearch: foldText(info.Name), SubjectUpdatedAt: info.NameSetAt, SubjectObservedAt: at,
+		SubjectSetBy: pn, SubjectSetByLID: lid, SubjectSource: subjectSource, Topic: info.Topic, TopicUpdatedAt: info.TopicSetAt,
+		IsAnnounce: info.IsAnnounce, IsLocked: info.IsLocked, IsEphemeral: info.IsEphemeral, IsDefaultSubGroup: info.IsDefaultSubGroup,
+		ParticipantCount: info.ParticipantCount, Members: members, GroupCreatedAt: info.GroupCreated, State: state, LastSyncedAt: at, LastSyncSource: source,
 	}
 }
 

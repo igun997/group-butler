@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from "vit
 import { MongoMemoryReplSet } from "mongodb-memory-server";
 import { COLLECTIONS } from "../collections";
 import { closeDb, getDb } from "../mongo";
-import { approveSend, createSend, transitionSend } from "./sends";
+import { approveSend, createAutomaticSend, createSend, transitionSend } from "./sends";
 
 let replSet: MongoMemoryReplSet;
 
@@ -95,5 +95,19 @@ describe("send request state machine", () => {
     );
 
     expect(await approveSend(db, request.organizationId, created.id, { actorIP: request.actorIP })).toEqual({ kind: "ambiguous" });
+  });
+
+  test("creates one immediately approved automatic reply per inbound job", async () => {
+    const db = await getDb();
+    const first = await createAutomaticSend(db, { ...request, idempotencyKey: "reply:job-001", replyToMessageId: "3EB0OWNER" });
+    const replay = await createAutomaticSend(db, { ...request, idempotencyKey: "reply:job-001", replyToMessageId: "3EB0OWNER" });
+
+    expect(first).toMatchObject({
+      status: "approved",
+      approval: { state: "approved", approvedBy: "owner" },
+      provenance: { source: "owner_mention", replyToMessageId: "3EB0OWNER" },
+    });
+    expect(replay).toEqual(first);
+    expect(await db.collection(COLLECTIONS.sendRequests).countDocuments({})).toBe(1);
   });
 });

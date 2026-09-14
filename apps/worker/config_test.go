@@ -76,6 +76,9 @@ func setDevEnv(t *testing.T) {
 		"AI_BASE_URL",
 		"AI_API_KEY",
 		"AI_MODEL",
+		"OWNER_WHATSAPP_JID",
+		"REPLY_CALLBACK_URL",
+		"REPLY_CALLBACK_SECRET",
 		"INGEST_QUEUE_SIZE",
 		"INGEST_FLUSH_MS",
 		"INGEST_FLUSH_MAX",
@@ -306,4 +309,31 @@ func TestLoadConfigLeavesRawCapsUntouchedWhenItRejects(t *testing.T) {
 		}
 		assertSentinels(t)
 	})
+}
+
+func TestLoadConfig_RejectsIncompleteOwnerReplyConfiguration(t *testing.T) {
+	setDevEnv(t)
+	t.Setenv("OWNER_WHATSAPP_JID", "628990000001@s.whatsapp.net")
+
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("loadConfig accepted an owner reply identity without callback credentials")
+	}
+}
+
+func TestLoadConfig_LoadsOwnerReplyConfiguration(t *testing.T) {
+	setDevEnv(t)
+	t.Setenv("OWNER_WHATSAPP_JID", "628990000001:5@s.whatsapp.net")
+	t.Setenv("REPLY_CALLBACK_URL", "http://127.0.0.1:3000/api/internal/reply-jobs")
+	t.Setenv("REPLY_CALLBACK_SECRET", "reply-callback-secret")
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.OwnerWhatsAppJID != "628990000001@s.whatsapp.net" {
+		t.Errorf("OwnerWhatsAppJID = %q, want canonical phone JID", cfg.OwnerWhatsAppJID)
+	}
+	if cfg.ReplyCallbackURL != "http://127.0.0.1:3000/api/internal/reply-jobs" {
+		t.Errorf("ReplyCallbackURL = %q", cfg.ReplyCallbackURL)
+	}
 }

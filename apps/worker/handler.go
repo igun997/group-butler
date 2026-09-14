@@ -54,10 +54,10 @@ func handleEvent(s *session, evt any) {
 	}
 }
 
-// onMessage parses every inbound message (including own messages, §6.1) and
-// hands it to the ingest queue, then records the group and queues any
-// attachment. The message document is enqueued before the media attempt, so a
-// crash can only leave `media.status:"pending"`, never lose the message (§6.2).
+// onMessage keeps the WhatsApp callback free of I/O. Group discovery metadata
+// is queued for every group, but message contents, sender identity, and media
+// cross the persistence boundary only after the worker has confirmed that the
+// group is assigned.
 func (m *manager) onMessage(s *session, evt *events.Message) {
 	doc, err := parseInbound(evt, m.orgID, s.id)
 	if err != nil {
@@ -65,13 +65,11 @@ func (m *manager) onMessage(s *session, evt *events.Message) {
 		return
 	}
 	s.touch(now().UTC())
-	if m.ingest != nil {
-		m.ingest.Enqueue(doc)
+	if !doc.IsGroup {
+		return
 	}
-	if doc.IsGroup {
-		m.ensureGroupKnown(s.id, doc.GroupJID, doc.Timestamp)
-	}
-	m.attachMedia(s, evt, doc)
+	m.ensureGroupKnown(s.id, doc.GroupJID, doc.Timestamp)
+	m.enqueuePersist(inboundMessageJob{session: s, evt: evt, doc: doc})
 }
 
 // onHistorySync replays the phone's backfill through the same parse/ingest path
@@ -113,13 +111,11 @@ func (m *manager) onHistorySync(s *session, evt *events.HistorySync) {
 				continue
 			}
 			doc.Historical = true
-			if m.ingest != nil {
-				m.ingest.Enqueue(doc)
+			if !doc.IsGroup {
+				continue
 			}
-			if doc.IsGroup {
-				m.ensureGroupKnown(s.id, doc.GroupJID, doc.Timestamp)
-			}
-			m.attachMedia(s, msgEvt, doc)
+			m.ensureGroupKnown(s.id, doc.GroupJID, doc.Timestamp)
+			m.enqueuePersist(inboundMessageJob{session: s, evt: msgEvt, doc: doc})
 			ingested++
 		}
 	}
@@ -224,6 +220,47 @@ func (m *manager) attachMedia(s *session, evt *events.Message, doc MessageDoc) {
 }
 
 // ---- off-callback persistence --------------------------------------------
+
+// inboundMessageJob owns the policy decision that message data may enter
+// storage. Group discovery is intentionally separate: it may retain group
+// metadata, but never a direct-chat or unassigned-group message.
+type inboundMessageJob struct {
+	session *session
+	evt     *events.Message
+	doc     MessageDoc
+}
+
+func (j inboundMessageJob) persist(ctx context.Context, m *manager) error {
+	if !j.doc.IsGroup || m.groups == nil {
+		return nil
+	}
+	group := m.groups.FindOne(ctx, j.doc.OrganizationID, j.doc.InstanceID, j.doc.GroupJID)
+	if group == nil || !group.Config.Assigned {
+		return nil
+	}
+	if m.replyCandidate(j.doc, j.session) {
+		j.doc.AutoReplyCandidate = true
+	}
+	if m.ingest != nil {
+		m.ingest.Enqueue(j.doc)
+	}
+	m.attachMedia(j.session, j.evt, j.doc)
+	return nil
+}
+
+func (m *manager) replyCandidate(doc MessageDoc, s *session) bool {
+	if doc.FromMe || doc.Text == "" || s == nil {
+		return false
+	}
+	bot := s.deviceJID().ToNonAD()
+	for _, raw := range doc.Mentions {
+		mentioned, err := types.ParseJID(raw)
+		if err == nil && mentioned.ToNonAD() == bot {
+			return true
+		}
+	}
+	return false
+}
 
 // persistJob is one unit of Mongo work that originated on the whatsmeow event
 // loop. Jobs are values (not closures) so the queue can log and count them by

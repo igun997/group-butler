@@ -60,6 +60,15 @@ type SubjectHistoryEntry struct {
 	By   string    `bson:"by"`
 }
 
+type GroupMember struct {
+	JID          string `bson:"jid"`
+	PhoneJID     string `bson:"phoneJid"`
+	LID          string `bson:"lid"`
+	IsAdmin      bool   `bson:"isAdmin"`
+	IsSuperAdmin bool   `bson:"isSuperAdmin"`
+	DisplayName  string `bson:"displayName"`
+}
+
 // Observed is the worker-owned half of a `groups` document (§5.1) in Go form.
 // The BFF's `config.*` is deliberately absent: the worker never writes it. The
 // bson tags are the decode spelling of §5.1; the write path spells the same keys
@@ -82,6 +91,7 @@ type Observed struct {
 	IsDefaultSubGroup     bool                  `bson:"isDefaultSubGroup"`
 	ParticipantCount      int                   `bson:"participantCount"`
 	ParticipantCountDirty bool                  `bson:"participantCountDirty"`
+	Members               []GroupMember         `bson:"members"`
 	GroupCreatedAt        time.Time             `bson:"groupCreatedAt"`
 	State                 GroupState            `bson:"state"`
 	LastActivityAt        time.Time             `bson:"lastActivityAt"`

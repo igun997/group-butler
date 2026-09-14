@@ -25,6 +25,15 @@ export interface GroupSubjectEntry {
   by: string | null;
 }
 
+export interface GroupMemberRow {
+  jid: string;
+  phoneJid: string;
+  lid: string;
+  isAdmin: boolean;
+  isSuperAdmin: boolean;
+  displayName: string;
+}
+
 /**
  * The §7.5 wire row: one group's identity, current name, provenance and config.
  * The never-blank rule is already applied here, so no consumer ever branches on
@@ -71,6 +80,7 @@ type GroupDoc = {
     state?: GroupState;
     lastActivityAt?: Date;
     messageCount?: number;
+    members?: GroupMemberRow[];
   };
   config?: { assigned?: boolean; whitelisted?: boolean };
 };
@@ -198,6 +208,7 @@ export interface GroupDetail {
   group: GroupRow;
   /** The instance's label, or its id when the instance row is gone — never blank. */
   instanceLabel: string;
+  members: GroupMemberRow[];
 }
 
 export async function readGroupDetail(
@@ -210,7 +221,7 @@ export async function readGroupDetail(
     .collection<GroupDoc>(COLLECTIONS.groups)
     .findOne({ organizationId, instanceId, groupJid });
   if (!doc) return null;
-  return { group: toRow(doc), instanceLabel: await instanceLabel(db, organizationId, instanceId) };
+  return { group: toRow(doc), instanceLabel: await instanceLabel(db, organizationId, instanceId), members: doc.observed?.members ?? [] };
 }
 
 /** One instance's label, or its id when the document has none or is gone. */

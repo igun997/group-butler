@@ -48,6 +48,7 @@ type whatsmeowClient interface {
 	PairPhone(ctx context.Context, phone string, showPushNotification bool, clientType whatsmeow.PairClientType, clientDisplayName string) (string, error)
 	ParseWebMessage(chatJID types.JID, webMsg *waWeb.WebMessageInfo) (*events.Message, error)
 	SendMessage(ctx context.Context, to types.JID, message *waE2E.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error)
+	SendChatPresence(ctx context.Context, jid types.JID, presence types.ChatPresence, media types.ChatPresenceMedia) error
 }
 
 // whatsmeowNewClient is the one place a real client is built, so the manager's

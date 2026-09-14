@@ -27,6 +27,7 @@ type ingestQueue struct {
 	dropped    atomic.Int64
 	flushEvery time.Duration
 	flushMax   int
+	afterSave  func([]MessageDoc)
 }
 
 // newIngestQueue builds a queue of the configured size. A non-positive size
@@ -41,6 +42,12 @@ func newIngestQueue(size int, flushEvery time.Duration, flushMax int) *ingestQue
 		flushEvery: flushEvery,
 		flushMax:   flushMax,
 	}
+}
+
+func (q *ingestQueue) setAfterSave(fn func([]MessageDoc)) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.afterSave = fn
 }
 
 // Enqueue accepts one parsed message without blocking on the buffer. Overflow is
@@ -130,6 +137,8 @@ func (q *ingestQueue) Run(ctx context.Context, store *messageStore) {
 			// overflow, and the unique index makes any later replay a no-op.
 			logf("ingest flush failed, dropping %d messages: %v", len(batch), err)
 			q.dropped.Add(int64(len(batch)))
+		} else if q.afterSave != nil {
+			q.afterSave(batch)
 		}
 		batch = nil
 	}

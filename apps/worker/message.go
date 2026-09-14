@@ -156,6 +156,10 @@ type MessageDoc struct {
 	// as `flags.historical`.
 	Historical bool
 
+	// AutoReplyCandidate is an in-memory delivery marker. ingest.go does not
+	// serialize it; it is evaluated only after this exact message is durable.
+	AutoReplyCandidate bool
+
 	ParseState    ParseState
 	ParseErrors   []string
 	SchemaVersion int
