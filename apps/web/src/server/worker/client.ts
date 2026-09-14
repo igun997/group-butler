@@ -182,7 +182,16 @@ export async function callWorker<T>(call: WorkerCall<T>): Promise<WorkerResult<T
     return unreachable("the WhatsApp service did not answer");
   }
 
-  const text = await readBounded(response);
+  let text: string | null;
+  try {
+    text = await readBounded(response);
+  } catch {
+    // The answer never finished arriving: a reset connection or a truncated
+    // body fails the read, and the deadline can fire here too. That is the same
+    // loss as a request that never connected, so it answers with the same safe
+    // failure rather than letting a transport error escape as a 500.
+    return unreachable("the WhatsApp service did not answer");
+  }
   if (text === null) return { ok: false, failure: UPSTREAM_FAILURE };
   let payload: unknown;
   try {

@@ -10,7 +10,7 @@ import {
   requestWorkerPairingCode,
   workerFailureResponse,
 } from "./client";
-import { jsonAnswer as answer, withStubWorker as withWorker } from "./test-helpers";
+import { jsonAnswer as answer, truncatedAnswer, withStubWorker as withWorker } from "./test-helpers";
 
 const instance: InstanceSnapshot = {
   id: "V1StGXR8_Z5jdHi6B-myT",
@@ -138,6 +138,27 @@ describe("worker client transport", () => {
         expect(worker.requests).toHaveLength(1);
       },
     );
+  });
+
+  test("reports a body that dies mid-read instead of throwing out of the client", async () => {
+    await withWorker(truncatedAnswer(), async () => {
+      const result = await listWorkerInstances();
+
+      expect(result).toMatchObject({
+        ok: false,
+        failure: { status: 502, code: "worker_unreachable", message: expect.any(String) },
+      });
+    });
+  });
+
+  test("reports a mid-read failure with one of its own phrases, never the transport's", async () => {
+    await withWorker(truncatedAnswer(), async () => {
+      const result = await listWorkerInstances();
+
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.failure.message).not.toMatch(/terminated|aborted|socket|ECONN|fetch failed/i);
+    });
   });
 });
 

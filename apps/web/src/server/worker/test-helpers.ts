@@ -68,6 +68,24 @@ export function jsonAnswer(status: number, payload: unknown, delayMs = 0): Worke
 }
 
 /**
+ * An answer whose connection dies mid-body: the headers promise `contentLength`
+ * bytes, a prefix is written, then the socket is destroyed. A real client sees
+ * the failure an upstream reset produces, which is not the same thing as a clean
+ * end of stream and is what a body-read error looks like from the outside.
+ *
+ * The destroy is delayed so it lands while the caller is reading the body rather
+ * than before the response is handed out; that timing is the whole point of the
+ * case, so it uses the platform clock.
+ */
+export function truncatedAnswer(contentLength = 4096, delayMs = 30): WorkerResponder {
+  return (_req, res) => {
+    res.writeHead(200, { "content-type": "application/json", "content-length": String(contentLength) });
+    res.write('{"instances":[');
+    setTimeout(() => res.destroy(), delayMs);
+  };
+}
+
+/**
  * Points `WORKER_URL`/`WORKER_SECRET` at a stubbed worker for the duration of
  * `run`, then closes it. The stub's address is loopback-only, so a test that
  * forgets to stub the environment fails loudly instead of reaching anything.

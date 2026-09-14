@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import { UnauthorizedError } from "../../../server/auth/owner";
 import { issueSession } from "../../../server/auth/session";
-import { jsonAnswer, withStubWorker } from "../../../server/worker/test-helpers";
+import { jsonAnswer, truncatedAnswer, withStubWorker } from "../../../server/worker/test-helpers";
 import { GET, POST } from "./route";
 
 /** Same request-scoped cookie seam as the group read-model route tests. */
@@ -100,6 +100,16 @@ describe("GET /api/instances", () => {
 
     expect(res.status).toBe(502);
     expect(await res.json()).toMatchObject({ code: "worker_unreachable" });
+  });
+
+  test("answers a worker whose answer dies mid-body with a no-store 502, not a throw", async () => {
+    await withStubWorker(truncatedAnswer(), async () => {
+      const res = await list();
+
+      expect(res.status).toBe(502);
+      expect(res.headers.get("cache-control")).toBe("no-store");
+      expect(await res.json()).toMatchObject({ code: "worker_unreachable", error: expect.any(String) });
+    });
   });
 });
 
