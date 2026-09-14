@@ -1,6 +1,8 @@
 "use client";
 
 import type { ReactNode } from "react";
+import { EmptyState } from "../../components/empty-state";
+import { ErrorState } from "../../components/error-state";
 import type { EmptyReason, ResourceDescriptor, Scope } from "../registry";
 import { useResource, type ResourceView } from "./use-resource";
 
@@ -70,22 +72,9 @@ export function ResourceGate<D, P = unknown>({
 
   let surface: ReactNode = null;
   if (view.tier === "error") {
-    const error = resource.errorMap(view.error);
-    surface = (
-      <div className="resource-surface">
-        <p className="resource-surface__title">{error.title}</p>
-        {error.body ? <p className="resource-surface__body">{error.body}</p> : null}
-        {error.action?.kind === "navigate" && error.action.href !== undefined ? (
-          <a className="resource-surface__action" href={error.action.href}>
-            {error.action.label}
-          </a>
-        ) : error.action?.kind === "retry" || error.retryable ? (
-          <button type="button" className="resource-surface__action" onClick={view.refresh}>
-            {error.action?.label ?? "Try again"}
-          </button>
-        ) : null}
-      </div>
-    );
+    // R-X2: the failure is inline in this panel and keeps its own recovery, and
+    // the failed call it re-runs is exactly this read (R-X4).
+    surface = <ErrorState error={resource.errorMap(view.error)} onRetry={view.refresh} />;
   } else if (view.showSkeleton) {
     surface = (
       <div className="resource-skeleton" aria-hidden="true">
@@ -95,22 +84,7 @@ export function ResourceGate<D, P = unknown>({
   } else if (emptyReason && (view.tier === "live" || view.tier === "poll") && hasNothing(view.data)) {
     // Only a *settled* read can be empty: during `cold` the rows simply have
     // not arrived, and showing "nothing here" then would be a lie (R-L1).
-    const copy = resource.empty[emptyReason];
-    surface = (
-      <div className="resource-surface">
-        <p className="resource-surface__title">{copy.title}</p>
-        <p className="resource-surface__body">{copy.body}</p>
-        {copy.action === undefined ? null : "href" in copy.action ? (
-          <a className="resource-surface__action" href={copy.action.href}>
-            {copy.action.label}
-          </a>
-        ) : (
-          <button type="button" className="resource-surface__action" onClick={copy.action.run}>
-            {copy.action.label}
-          </button>
-        )}
-      </div>
-    );
+    surface = <EmptyState reason={emptyReason} copy={resource.empty[emptyReason]} />;
   } else if (view.data === undefined && view.tier !== "live" && view.tier !== "poll") {
     // Nothing to render and nothing to say: the panel's own `minHeight` reserves
     // the geometry (R-L4). Handing a view `undefined` rows would make it paint a

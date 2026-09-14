@@ -980,3 +980,119 @@ body > main [role="alert"]:empty {
   border-radius: var(--radius-control);
   cursor: pointer;
 }
+
+/* ---------------------------------------------------------------------------
+ * P4 — the feedback surfaces: the empty and error states, and the notification
+ * stack (R-E1–R-E5, R-X1–R-X4, R-T1–R-T5, R-M5)
+ *
+ * The empty and error states reuse the P3 `resource-surface` geometry, so only
+ * what is new is styled here: the code chip an unrecognised failure shows, and
+ * the notification stack. The stack hugs the bottom-right edge, centres below
+ * `--breakpoint-sm`, and moves to the top edge while a composer or a sheet owns
+ * the bottom one (R-M5). Nothing animates, so `prefers-reduced-motion` has
+ * nothing to remove here (R-A9), and no status is carried by a stripe, a border
+ * edge, or an inset shadow (R-A4).
+ * ------------------------------------------------------------------------- */
+.error-state__code-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin: 0;
+}
+
+.error-state__code-label {
+  color: var(--muted-foreground);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+}
+
+/*
+ * The raw code of an unrecognised failure, and the only place a code is shown.
+ * `user-select: all` makes the chip one selection, so the code is copyable
+ * without a control that could fail (R-X1).
+ */
+.error-state__code {
+  padding: 0 var(--space-1);
+  font-family: var(--font-mono);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+  background: var(--muted);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-control);
+  user-select: all;
+}
+
+/* Above the sticky header and its menus; modal layers live in the top layer. */
+.toast-region {
+  position: fixed;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  inline-size: min(var(--surface-max-width), calc(100vw - var(--space-8)));
+  inset-block-end: var(--space-4);
+  inset-inline-end: var(--space-4);
+}
+
+.toast-region[data-edge="bottom-center"] {
+  inset-inline: var(--space-4);
+  margin-inline: auto;
+}
+
+/* R-M5: the primary composer keeps the bottom edge to itself. */
+.toast-region[data-edge="top"] {
+  inset-block-start: var(--space-4);
+  inset-block-end: auto;
+}
+
+.toast {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+  padding: var(--space-3) var(--space-4);
+  background: var(--popover);
+  color: var(--popover-foreground);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-panel);
+  box-shadow: var(--elevation-28);
+}
+
+.toast[data-state="pending"] {
+  color: var(--muted-foreground);
+}
+
+.toast__title {
+  display: flex;
+  gap: var(--space-1);
+  margin: 0;
+  font-size: var(--type-body-strong-size);
+  line-height: var(--type-body-strong-line);
+  font-weight: var(--type-body-strong-weight);
+}
+
+.toast__count {
+  color: var(--muted-foreground);
+  font-weight: var(--type-body-weight);
+}
+
+.toast__body {
+  margin: 0;
+  max-width: var(--surface-max-width);
+  color: var(--muted-foreground);
+  font-size: var(--type-body-size);
+  line-height: var(--type-body-line);
+}
+
+/* The record's one control (R-T4). */
+.toast__action {
+  min-height: var(--target-min);
+  padding: var(--space-1) var(--space-2);
+  font: inherit;
+  color: var(--foreground);
+  background: var(--muted);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
