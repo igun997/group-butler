@@ -185,6 +185,18 @@ describe("token layer (spec §3.2)", () => {
       "../../components/jid-cell.tsx",
       "../../components/group-name-cell.tsx",
       "../../components/state-badges.tsx",
+      // P5's surfaces are held to the same rule: the workspace shell that wires
+      // the registry, the header and live indicator it renders, the media query
+      // that picks a presentation, and the groups workspace itself.
+      "../../components/workspace-shell.tsx",
+      "../../components/workspace-header.tsx",
+      "../../components/live-indicator.tsx",
+      "../../components/media-query.ts",
+      "../../components/utc-stamp.ts",
+      "../registry/views/groups/index.tsx",
+      "../registry/views/groups/columns.tsx",
+      "../registry/views/groups/panel.tsx",
+      "../registry/views/groups/resources.tsx",
     ] as const;
     const raw = /#[0-9a-fA-F]{3,8}\b|\b\d+(\.\d+)?px\b/g;
 

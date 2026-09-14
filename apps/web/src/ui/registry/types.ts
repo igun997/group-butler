@@ -202,6 +202,14 @@ export interface ResourceDescriptor<D, P = unknown> {
   poll?: { intervalMs: number };
   invalidateOn?: readonly string[];
   skeleton: (ctx: ResourceCtx<P>) => ReactNode;
+  /**
+   * What "nothing" means for this read (R-E1). By default a read is empty when
+   * it settled with an absent value or an empty list, which is the shape a list
+   * read has; a read whose rows live inside a page object (a list and the stamp
+   * of when it was taken) says so here, so the gate decides the empty surface
+   * from the descriptor's own vocabulary instead of guessing at its shape.
+   */
+  isEmpty?: (data: D) => boolean;
   empty: Record<EmptyReason, EmptyCopy>;
   errorMap: (err: unknown) => UIError;
 }

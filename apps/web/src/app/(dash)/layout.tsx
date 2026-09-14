@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { redirect } from "next/navigation";
-import { AppShell } from "../../components/app-shell";
+import { WorkspaceShell } from "../../components/workspace-shell";
 import { currentOwner } from "../../server/auth/owner";
 
 /** The layout reads the signed cookie, so it is never prerendered. */
@@ -14,22 +14,14 @@ export const dynamic = "force-dynamic";
  * is verified here with the same code the API routes use, so a forged cookie
  * gets no further than the login page.
  *
- * The title and scope label are the shell's `h1` and scope text (R-A5). P2's
- * registry resolves both from the URL; until the routes it resolves exist, this
- * layout serves the one address the build has — the `overview` address at `/`.
+ * What the shell renders — the workspace title, the scope's label, the
+ * navigation — is resolved from the address by `WorkspaceShell`, which is the
+ * registry's one wiring point (§2.3, §2.5). This layout's own job is the session
+ * and nothing else, so it cannot grow an opinion about a workspace.
  */
 export default async function DashboardLayout({ children }: { children: ReactNode }) {
   const owner = await currentOwner();
   if (!owner) redirect("/login");
 
-  return (
-    <AppShell
-      title="Overview"
-      scopeLabel="All instances"
-      currentId="overview"
-      ownerEmail={owner.email}
-    >
-      {children}
-    </AppShell>
-  );
+  return <WorkspaceShell ownerEmail={owner.email}>{children}</WorkspaceShell>;
 }

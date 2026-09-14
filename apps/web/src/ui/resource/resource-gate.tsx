@@ -42,8 +42,13 @@ export interface ResourceGateProps<D, P = unknown> {
   children: (view: ResourceView<D>) => ReactNode;
 }
 
-/** What counts as "nothing" for a declared empty reason: absent, or an empty list. */
-function hasNothing(value: unknown): boolean {
+/**
+ * What counts as "nothing" for a declared empty reason: whatever the descriptor
+ * says, or — for a descriptor that does not say — an absent value, or an empty
+ * list.
+ */
+function isEmpty<D, P>(resource: ResourceDescriptor<D, P>, value: D | undefined): boolean {
+  if (resource.isEmpty) return value !== undefined && resource.isEmpty(value);
   if (value === undefined || value === null) return true;
   return Array.isArray(value) && value.length === 0;
 }
@@ -81,7 +86,7 @@ export function ResourceGate<D, P = unknown>({
         {resource.skeleton(context)}
       </div>
     );
-  } else if (emptyReason && (view.tier === "live" || view.tier === "poll") && hasNothing(view.data)) {
+  } else if (emptyReason && (view.tier === "live" || view.tier === "poll") && isEmpty(resource, view.data)) {
     // Only a *settled* read can be empty: during `cold` the rows simply have
     // not arrived, and showing "nothing here" then would be a lie (R-L1).
     surface = <EmptyState reason={emptyReason} copy={resource.empty[emptyReason]} />;

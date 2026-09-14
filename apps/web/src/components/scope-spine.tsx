@@ -7,6 +7,7 @@ import { trapTabKey } from "./focus-trap";
 import { GroupNameCell, type GroupNameSource } from "./group-name-cell";
 import { JidCell } from "./jid-cell";
 import { GroupStateBadge, InstanceStateBadge } from "./state-badges";
+import { utcStamp } from "./utc-stamp";
 
 /**
  * The scope spine: the switcher that makes a scope change one click from
@@ -222,11 +223,8 @@ function scopeLabel(
  * second case, never a zero date.
  */
 function lastSyncLabel(stamp: string | null): string {
-  if (!stamp) return "Never synced";
-  const date = new Date(stamp);
-  if (Number.isNaN(date.getTime())) return "Never synced";
-  const iso = date.toISOString();
-  return `Last sync ${iso.slice(0, 10)} ${iso.slice(11, 16)} UTC`;
+  const at = utcStamp(stamp);
+  return at ? `Last sync ${at}` : "Never synced";
 }
 
 /*

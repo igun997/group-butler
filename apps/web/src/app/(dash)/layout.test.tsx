@@ -10,7 +10,14 @@ const { currentOwner, redirect } = vi.hoisted(() => ({
 }));
 
 vi.mock("../../server/auth/owner", () => ({ currentOwner }));
-vi.mock("next/navigation", () => ({ redirect }));
+vi.mock("next/navigation", () => ({
+  redirect,
+  // The shell resolves the address with these; the layout's own concern is the
+  // session, so the address here is the one address this file cares about.
+  usePathname: () => "/",
+  useSearchParams: () => new URLSearchParams(),
+  useRouter: () => ({ replace: () => undefined }),
+}));
 
 import DashboardLayout from "./layout";
 

@@ -43,3 +43,10 @@ export {
   type StreamTransport,
 } from "./use-stream-scope";
 export { ResourceGate, type ResourceGateProps } from "./resource-gate";
+export {
+  createScopeLabelStore,
+  fallbackScopeLabel,
+  scopeLabels,
+  useScopeLabel,
+  type ScopeLabelStore,
+} from "./scope-labels";
