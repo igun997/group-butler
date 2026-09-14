@@ -67,4 +67,28 @@ describe("scope editor", () => {
     expect(html).toContain("Saving");
     expect(html).toMatch(/<button[^>]*disabled/);
   });
+
+  test("the group list scrolls inside a bounded box, and the search stays above it", () => {
+    const many = Array.from({ length: 24 }, (_, index) => ({
+      jid: `12036304000000${String(index).padStart(4, "0")}@g.us`,
+      name: `Group ${index}`,
+    }));
+
+    const html = renderToStaticMarkup(<ScopeEditor groups={many} whitelisted={[]} onSave={() => {}} />);
+
+    const searchIndex = html.indexOf('aria-label="Search groups"');
+    const listIndex = html.indexOf('data-slot="scope-list"');
+    expect(searchIndex).toBeGreaterThan(-1);
+    expect(listIndex).toBeGreaterThan(searchIndex);
+
+    // The list is the thing that scrolls, inside a height the panel bounds.
+    const container = html.slice(listIndex, html.indexOf(">", listIndex));
+    expect(container).toContain("overflow-y-auto");
+    expect(container).toMatch(/max-h-\d/);
+
+    // And every group lives inside it, so the count stays honest while scrolling.
+    const scrollBox = html.slice(listIndex);
+    expect(scrollBox).toContain("120363040000000023@g.us");
+    expect(scrollBox).toContain("Group 23");
+  });
 });

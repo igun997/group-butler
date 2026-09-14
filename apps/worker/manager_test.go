@@ -478,6 +478,41 @@ func TestRestoreInstancesReconnectsOnlyOwnDevice(t *testing.T) {
 
 // ---- DELETE must not claim success before cleanup succeeds (blocker 2) ----
 
+// Removing a connected instance is the action that unlinks the device, so this
+// pins the whole sequence on the happy path: log the device out once, delete its
+// stored credential, and only then forget the row. The cases below it cover what
+// happens when each step refuses, and nothing else asserted that the logout is
+// reached at all.
+func TestDeleteInstanceLogsOutAndDeletesTheCredential(t *testing.T) {
+	phone := types.NewJID("628990000001:5", types.DefaultUserServer)
+	repo := newFakeInstanceRepo(InstanceRow{
+		ID: "inst_1", OrganizationID: "org_default", Label: "Bot",
+		Mode: modeQR, Status: stateConnected, PhoneNumber: "628990000001",
+	})
+	devices := &fakeDeviceStore{device: &store.Device{ID: &phone}}
+	client := newFakeClient()
+	mgr := testManager(repo, newFakePairingStore(), devices, client)
+	defer mgr.shutdown(context.Background())
+	mgr.put(newSession(mgr, InstanceRow{ID: "inst_1", OrganizationID: "org_default", Mode: modeQR}, &store.Device{ID: &phone}, client))
+
+	rec := callJSON(t, mgr.api(), http.MethodDelete, "/instances/inst_1", "dev-secret", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if client.logouts != 1 {
+		t.Fatalf("logouts = %d, want the linked device logged out exactly once", client.logouts)
+	}
+	if len(devices.deleted) != 1 {
+		t.Fatalf("deleted credentials = %d, want the stored device gone", len(devices.deleted))
+	}
+	repo.mu.Lock()
+	deleted := repo.deleted["inst_1"]
+	repo.mu.Unlock()
+	if !deleted {
+		t.Fatal("the row was not soft-deleted after a successful cleanup")
+	}
+}
+
 func TestDeleteInstanceKeepsTheRowWhenLogoutFails(t *testing.T) {
 	phone := types.NewJID("628990000001:5", types.DefaultUserServer)
 	repo := newFakeInstanceRepo(InstanceRow{

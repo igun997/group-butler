@@ -65,28 +65,39 @@ export function ScopeEditor({
         className="mt-3 max-md:h-11"
       />
 
-      <ul className="mt-2 flex flex-col divide-y divide-border">
-        {visible.map((group) => (
-          <li key={group.jid}>
-            <label className="flex items-start gap-3 py-2.5">
-              <Checkbox
-                className="mt-0.5"
-                checked={selected.includes(group.jid)}
-                disabled={saving}
-                onCheckedChange={(checked) =>
-                  setSelected((current) =>
-                    checked === true ? [...current, group.jid] : current.filter((jid) => jid !== group.jid),
-                  )
-                }
-              />
-              <span className="flex min-w-0 flex-col gap-0.5">
-                <span className="text-sm">{group.name}</span>
-                <span className="font-mono text-xs break-all text-muted-foreground">{group.jid}</span>
-              </span>
-            </label>
-          </li>
-        ))}
-      </ul>
+      {/* The list is what scrolls. A long group list would otherwise push the
+          search field and the Save control out of the panel, and the operator
+          needs both while working down it. `overscroll-contain` keeps a flick at
+          the end of the list from scrolling the page behind the panel, and the
+          scrollbar is made explicit because an overlay scrollbar that only
+          appears while scrolling says nothing about the list being cut off. */}
+      <div
+        data-slot="scope-list"
+        className="mt-2 max-h-80 overflow-y-auto overscroll-contain rounded-lg border border-border [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin] [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar]:w-2"
+      >
+        <ul className="flex flex-col divide-y divide-border px-3 pb-1">
+          {visible.map((group) => (
+            <li key={group.jid}>
+              <label className="flex items-start gap-3 py-2.5">
+                <Checkbox
+                  className="mt-0.5"
+                  checked={selected.includes(group.jid)}
+                  disabled={saving}
+                  onCheckedChange={(checked) =>
+                    setSelected((current) =>
+                      checked === true ? [...current, group.jid] : current.filter((jid) => jid !== group.jid),
+                    )
+                  }
+                />
+                <span className="flex min-w-0 flex-col gap-0.5">
+                  <span className="text-sm">{group.name}</span>
+                  <span className="font-mono text-xs break-all text-muted-foreground">{group.jid}</span>
+                </span>
+              </label>
+            </li>
+          ))}
+        </ul>
+      </div>
 
       {visible.length === 0 ? (
         <p className="mt-2 text-sm text-muted-foreground">No group matches that search.</p>
