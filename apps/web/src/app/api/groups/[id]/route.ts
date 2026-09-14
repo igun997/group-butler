@@ -2,7 +2,6 @@ import { z } from "zod";
 import { clientKey } from "../../../../server/auth/client";
 import { UnauthorizedError, requireOwner } from "../../../../server/auth/owner";
 import { getDb } from "../../../../server/mongo";
-import { setGroupWhitelisted } from "../../../../server/repos/instance-config";
 import { updateGroupConfig } from "../../../../server/repos/groups";
 
 /**
@@ -26,7 +25,10 @@ import { updateGroupConfig } from "../../../../server/repos/groups";
  * (§7.2), of which §5.1 says the row is a mirror. The two writers that can
  * change that scope — this toggle and the instance's whitelist editor — each
  * keep both documents in step, so un-whitelisting here cannot leave the
- * assistant reading the group.
+ * assistant reading the group. The repository does both of this route's writes
+ * in one transaction, together with the audit row that records the move, which
+ * is why the handler below has one call and one failure mapping rather than a
+ * write and then a second one to keep in step.
  */
 
 const PatchSchema = z
@@ -74,20 +76,22 @@ export async function PATCH(
 
   const { id } = await params;
   const db = await getDb();
-  const result = await updateGroupConfig(db, organizationId, id, patch.data);
+  let result;
+  try {
+    result = await updateGroupConfig(db, organizationId, id, patch.data, clientKey(request));
+  } catch {
+    // The row, the assistant's scope it mirrors and the record of the move are
+    // one transaction (§5.1, §7.2), so a write that cannot commit leaves all
+    // three as they were and the operation can be repeated. The driver's own
+    // words never reach the browser (§11.5).
+    return Response.json(
+      { error: "the configuration could not be stored", code: "store_error" },
+      { status: 502, headers: noStore },
+    );
+  }
 
   switch (result.kind) {
     case "updated":
-      if (patch.data.whitelisted !== undefined) {
-        await setGroupWhitelisted(
-          db,
-          organizationId,
-          result.instanceId,
-          id,
-          patch.data.whitelisted,
-          clientKey(request),
-        );
-      }
       return Response.json({ group: result.group }, { headers: noStore });
     case "not_found":
       // Another organisation's group and a group that is not here are the same

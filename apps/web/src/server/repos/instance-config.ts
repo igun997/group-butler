@@ -1,4 +1,4 @@
-import type { Db } from "mongodb";
+import type { ClientSession, Db } from "mongodb";
 import { COLLECTIONS } from "../collections";
 import { writeAudit, type AuditEntry } from "./audit";
 
@@ -184,43 +184,49 @@ export async function updateInstanceConfig(
 }
 
 /**
- * Moves one JID in the instance's whitelist, for the groups workspace's own
- * whitelist toggle. It is an `$addToSet`/`$pull` rather than a recomputation, so
- * two operators toggling different groups at once cannot lose each other's edit,
- * and it matches no document when the instance is gone — the group's own config
- * is still written by its caller, which is the pre-existing behaviour of that
- * surface.
+ * Moves one JID in the instance's whitelist and records it, inside the caller's
+ * transaction. It is an `$addToSet`/`$pull` rather than a recomputation, so two
+ * operators toggling different groups at once cannot lose each other's edit.
  *
- * Ordering: the row is written first, then the list. A crash between the two
- * leaves the row un-whitelisted and the list still naming it, which the next
- * whitelisted write for that instance converges (the list is the assistant's
- * scope, and the assistant reads it per request, §7.2 step 6).
+ * It runs in a session because the list, the row it mirrors and the audit row
+ * that evidences the change are one write: the groups workspace's own toggle
+ * passes the transaction it already holds, so a change to the assistant's scope
+ * can never commit without the row that says so and the record that proves who
+ * asked for it. An `updateOne` that matches nothing is an instance this
+ * organisation does not have — there is no list to move, so there is nothing to
+ * record either.
  */
-export async function setGroupWhitelisted(
+export async function moveGroupWhitelistJid(
   db: Db,
-  organizationId: string,
-  instanceId: string,
-  groupJid: string,
-  whitelisted: boolean,
-  ip: string,
+  move: {
+    organizationId: string;
+    instanceId: string;
+    groupJid: string;
+    whitelisted: boolean;
+    ip: string;
+  },
+  session: ClientSession,
 ): Promise<void> {
   const updated = await db
     .collection<InstanceDoc>(COLLECTIONS.instances)
     .updateOne(
-      { _id: instanceId, organizationId },
-      whitelisted
-        ? { $addToSet: { "config.groupJidWhitelist": groupJid } }
-        : { $pull: { "config.groupJidWhitelist": groupJid } },
+      { _id: move.instanceId, organizationId: move.organizationId },
+      move.whitelisted
+        ? { $addToSet: { "config.groupJidWhitelist": move.groupJid } }
+        : { $pull: { "config.groupJidWhitelist": move.groupJid } },
+      { session },
     );
-  // An update that matched no document is an instance this organisation does not
-  // have; there is no list to keep in step and nothing to record.
   if (updated.matchedCount === 0) return;
-  await writeAudit(db, {
-    organizationId,
-    actor: "owner",
-    action: "instance.whitelist.updated",
-    target: { type: "instance", id: instanceId },
-    meta: { source: "group-row", groupJid, whitelisted },
-    ip,
-  });
+  await writeAudit(
+    db,
+    {
+      organizationId: move.organizationId,
+      actor: "owner",
+      action: "instance.whitelist.updated",
+      target: { type: "instance", id: move.instanceId },
+      meta: { source: "group-row", groupJid: move.groupJid, whitelisted: move.whitelisted },
+      ip: move.ip,
+    },
+    session,
+  );
 }

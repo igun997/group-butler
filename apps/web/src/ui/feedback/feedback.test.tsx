@@ -553,6 +553,26 @@ describe("the error map (R-X1, R-X3, R-X4)", () => {
     expect(mapped.retryable).toBe(false);
   });
 
+  /**
+   * The instance's `runtime.status` is the condition of the scope rather than
+   * the outcome of a call, so its home is the banner however it reached the map.
+   * A panel that reads a logged-out instance (a polling read, a refetch) must
+   * still be told where that belongs: rendering it in the panel's own inline
+   * surface says "this read failed" about a read that succeeded.
+   */
+  test("an instance's condition is the banner surface for a read as well (R-X2, R-X3)", () => {
+    for (const runtimeStatus of ["logged_out", "error"]) {
+      const mapped = mapError({ runtimeStatus });
+      expect([runtimeStatus, mapped.surface]).toEqual([runtimeStatus, "banner"]);
+      // A condition is not an announcement: the toast never carries it.
+      expect(mapped.toast).toBe("never");
+    }
+
+    // A read's own failure keeps its one home, which is the panel (R-X2).
+    expect(mapError({ code: "worker_unreachable" }).surface).toBe("inline");
+    expect(mapError({ code: "unknown_code" }).surface).toBe("inline");
+  });
+
   test("a failure with no code at all is still named, without reading the thrown value (R-X1)", () => {
     const stack = signalOf(
       Object.assign(new Error("MongoServerError: connect ECONNREFUSED 127.0.0.1:27017\n    at Connection.onError"), {

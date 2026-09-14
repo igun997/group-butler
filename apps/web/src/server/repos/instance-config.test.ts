@@ -1,8 +1,9 @@
+import type { ClientSession } from "mongodb";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { MongoMemoryReplSet, MongoMemoryServer } from "mongodb-memory-server";
 import { COLLECTIONS } from "../collections";
 import { closeDb, getDb } from "../mongo";
-import { readInstanceConfig, setGroupWhitelisted, updateInstanceConfig } from "./instance-config";
+import { moveGroupWhitelistJid, readInstanceConfig, updateInstanceConfig } from "./instance-config";
 import { insertGroup, insertInstance } from "./test-helpers";
 
 /**
@@ -208,7 +209,23 @@ describe("writing the whitelist (R5)", () => {
   });
 });
 
-describe("the groups workspace's own whitelist toggle (§5.1)", () => {
+/**
+ * The move the groups workspace's own toggle performs. It runs inside the
+ * caller's transaction (the route passes the one that also writes the row), so
+ * it is exercised that way here: the list move, the row it mirrors and the audit
+ * row are one commit or none.
+ */
+describe("the groups workspace's own whitelist move (§5.1)", () => {
+  /** Runs the move the way its caller does: inside one transaction. */
+  async function inTransaction(run: (session: ClientSession) => Promise<void>): Promise<void> {
+    const session = (await getDb()).client.startSession();
+    try {
+      await session.withTransaction(() => run(session));
+    } finally {
+      await session.endSession();
+    }
+  }
+
   test("it moves exactly one JID in the instance's list, and records what moved", async () => {
     await resetAt(replSet, "butler_instance_config_row");
     await insertInstance("org_default", "inst_1", "Support bot");
@@ -222,13 +239,25 @@ describe("the groups workspace's own whitelist toggle (§5.1)", () => {
     });
     await updateInstanceConfig(await getDb(), "org_default", "inst_1", [OTHER_JID], "direct");
 
-    await setGroupWhitelisted(await getDb(), "org_default", "inst_1", JID, true, "direct");
+    await inTransaction(async (session) =>
+      moveGroupWhitelistJid(
+        await getDb(),
+        { organizationId: "org_default", instanceId: "inst_1", groupJid: JID, whitelisted: true, ip: "direct" },
+        session,
+      ),
+    );
     expect((await readInstanceConfig(await getDb(), "org_default", "inst_1"))?.groupJidWhitelist).toEqual([
       JID,
       OTHER_JID,
     ]);
 
-    await setGroupWhitelisted(await getDb(), "org_default", "inst_1", OTHER_JID, false, "direct");
+    await inTransaction(async (session) =>
+      moveGroupWhitelistJid(
+        await getDb(),
+        { organizationId: "org_default", instanceId: "inst_1", groupJid: OTHER_JID, whitelisted: false, ip: "direct" },
+        session,
+      ),
+    );
     expect((await readInstanceConfig(await getDb(), "org_default", "inst_1"))?.groupJidWhitelist).toEqual([JID]);
 
     const row = await (await getDb())
@@ -241,7 +270,13 @@ describe("the groups workspace's own whitelist toggle (§5.1)", () => {
     await resetAt(replSet, "butler_instance_config_row");
     await insertInstance("org_other", "inst_9", "Someone else");
 
-    await setGroupWhitelisted(await getDb(), "org_default", "inst_9", JID, true, "direct");
+    await inTransaction(async (session) =>
+      moveGroupWhitelistJid(
+        await getDb(),
+        { organizationId: "org_default", instanceId: "inst_9", groupJid: JID, whitelisted: true, ip: "direct" },
+        session,
+      ),
+    );
 
     expect((await storedConfig("inst_9"))?.config).toBeUndefined();
     expect(await (await getDb()).collection(COLLECTIONS.auditLog).countDocuments({})).toBe(0);

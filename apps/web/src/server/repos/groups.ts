@@ -1,6 +1,7 @@
 import type { GroupState } from "@butler/shared";
 import type { Db } from "mongodb";
 import { COLLECTIONS } from "../collections";
+import { moveGroupWhitelistJid } from "./instance-config";
 
 /** Where a group's current name came from (`observed.subjectSource`, §5.1). */
 export type GroupNameSource = "sync" | "event" | "fallback";
@@ -210,57 +211,86 @@ export interface GroupConfigPatch {
 }
 
 /**
- * The outcome of a config write: one row updated, or why it was refused. The
- * instance the row belongs to travels with it, because the two fields are not
- * only this document's: `whitelisted` is the mirror of the instance's
- * `config.groupJidWhitelist` (§5.1), and the caller that maintains that pair
- * needs to know which instance it just wrote.
+ * The outcome of a config write: one row updated, or why it was refused.
  */
-export type GroupConfigUpdate =
-  | { kind: "updated"; group: GroupRow; instanceId: string }
-  | { kind: "not_found" }
-  | { kind: "ambiguous" };
+export type GroupConfigUpdate = { kind: "updated"; group: GroupRow } | { kind: "not_found" } | { kind: "ambiguous" };
 
 /**
- * Writes `assigned`/`whitelisted` on one group of one organisation.
+ * Writes `assigned`/`whitelisted` on one group of one organisation, as one
+ * transaction.
  *
- * The group JID is the addressing key, and a JID can legitimately exist under
- * two instances (the same group joined by two linked accounts). Rather than
- * silently writing both, this resolves the target first: an unqualified JID that
- * matches more than one instance is refused, so the caller must say which
- * instance it means.
+ * Two properties are the reason this is one operation rather than a write the
+ * caller completes. **The target is resolved before anything is written**: the
+ * group JID is the addressing key, a JID can legitimately exist under two
+ * instances (the same group joined by two linked accounts), and an unqualified
+ * JID that matches more than one is refused — so the row is written only once
+ * the tenant relation is known, and never speculatively. **`whitelisted` is two
+ * documents plus their evidence**: §5.1 makes `groups.config.whitelisted` the
+ * mirror of the instance's `config.groupJidWhitelist` and §7.2 makes that list
+ * the assistant's actual scope, so the row, the list and the `auditLog` row that
+ * records the move commit together or not at all. A failure leaves the scope
+ * exactly as it was and unaudited rather than half-changed, which is what the
+ * route reports.
  */
 export async function updateGroupConfig(
   db: Db,
   organizationId: string,
   groupJid: string,
   patch: GroupConfigPatch,
+  ip: string,
 ): Promise<GroupConfigUpdate> {
   const groups = db.collection<GroupDoc>(COLLECTIONS.groups);
-  const matched = await groups
-    .find(
-      { organizationId, groupJid, ...(patch.instanceId === undefined ? {} : { instanceId: patch.instanceId }) },
-      { projection: { instanceId: 1 } },
-    )
-    .toArray();
-  if (matched.length === 0) return { kind: "not_found" };
-
-  const instanceIds = new Set(matched.map((doc) => doc.instanceId));
-  if (instanceIds.size > 1) return { kind: "ambiguous" };
-  // The set holds exactly one id here, and the match that produced it is the one
-  // the write below addresses.
-  const instanceId = matched[0]?.instanceId;
-  if (instanceId === undefined) return { kind: "not_found" };
-
   const changes: Record<string, boolean> = {};
   if (patch.assigned !== undefined) changes["config.assigned"] = patch.assigned;
   if (patch.whitelisted !== undefined) changes["config.whitelisted"] = patch.whitelisted;
 
-  const updated = await groups.findOneAndUpdate(
-    { organizationId, instanceId, groupJid },
-    { $set: changes },
-    { returnDocument: "after" },
-  );
-  if (!updated) return { kind: "not_found" };
-  return { kind: "updated", group: toRow(updated), instanceId };
+  let outcome: GroupConfigUpdate = { kind: "not_found" };
+  const session = db.client.startSession();
+  try {
+    await session.withTransaction(async () => {
+      const matched = await groups
+        .find(
+          { organizationId, groupJid, ...(patch.instanceId === undefined ? {} : { instanceId: patch.instanceId }) },
+          { projection: { instanceId: 1 }, session },
+        )
+        .toArray();
+      if (matched.length === 0) {
+        outcome = { kind: "not_found" };
+        return;
+      }
+
+      const instanceIds = new Set(matched.map((doc) => doc.instanceId));
+      if (instanceIds.size > 1) {
+        outcome = { kind: "ambiguous" };
+        return;
+      }
+      const instanceId = matched[0]?.instanceId;
+      if (instanceId === undefined) {
+        outcome = { kind: "not_found" };
+        return;
+      }
+
+      const updated = await groups.findOneAndUpdate(
+        { organizationId, instanceId, groupJid },
+        { $set: changes },
+        { returnDocument: "after", session },
+      );
+      if (!updated) {
+        outcome = { kind: "not_found" };
+        return;
+      }
+
+      if (patch.whitelisted !== undefined) {
+        await moveGroupWhitelistJid(
+          db,
+          { organizationId, instanceId, groupJid, whitelisted: patch.whitelisted, ip },
+          session,
+        );
+      }
+      outcome = { kind: "updated", group: toRow(updated) };
+    });
+  } finally {
+    await session.endSession();
+  }
+  return outcome;
 }

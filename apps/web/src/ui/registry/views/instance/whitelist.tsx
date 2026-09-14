@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { EmptyState } from "../../../../components/empty-state";
-import { ErrorState } from "../../../../components/error-state";
+import { ErrorBanner } from "../../../../components/error-banner";
 import type { MappedError } from "../../../feedback";
 import { JidCell } from "../../../../components/jid-cell";
 import type { GroupRow } from "../groups/model";
@@ -40,9 +40,11 @@ export interface WhitelistEditorProps {
   pending: boolean;
   failure: MappedError | null;
   onSave(groupJidWhitelist: readonly string[]): void;
+  /** R-X4: re-runs exactly the save that failed, with the list it carried. */
+  onRetry(): void;
 }
 
-export function WhitelistEditor({ config, groups, pending, failure, onSave }: WhitelistEditorProps) {
+export function WhitelistEditor({ config, groups, pending, failure, onSave, onRetry }: WhitelistEditorProps) {
   const [selection, setSelection] = useState<ReadonlySet<string>>(() => new Set(config.groupJidWhitelist));
   const firstChoice = useRef<HTMLInputElement>(null);
   const legendId = useId();
@@ -109,7 +111,7 @@ export function WhitelistEditor({ config, groups, pending, failure, onSave }: Wh
         </ul>
       </fieldset>
 
-      {failure === null ? null : <ErrorState error={failure} />}
+      {failure === null ? null : <ErrorBanner error={failure} onRetry={onRetry} />}
 
       <div className="whitelist-editor__actions">
         <button

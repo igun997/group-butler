@@ -277,8 +277,15 @@ describe("pairing is a state, never a load (R-L5)", () => {
 
     render(<InstancePanel scope={INSTANCE} params={{}} />);
 
-    await settled("Pairing stopped");
+    const banner = await waitFor(() => {
+      const found = screen.getByRole("region", { name: "Pairing stopped" });
+      expect(found.getAttribute("data-surface")).toBe("banner");
+      return found;
+    });
+    // The banner states the condition; the surface below states what the
+    // instance is doing now, and the worker's own words are its evidence.
     expect(screen.getByText("Pairing stopped before the account linked.")).toBeTruthy();
+    expect(within(banner).getByText(/never linked/i)).toBeTruthy();
     expect(screen.getByText("the login websocket did not become ready")).toBeTruthy();
     // R-L5's leave affordance: a long-running state must not be a trap.
     expect(screen.getByRole("link", { name: "Back to instances" }).getAttribute("href")).toBe("/instances");
@@ -318,9 +325,15 @@ describe("the logged-out instance (R-X3)", () => {
       </>,
     );
 
-    await settled("The instance is logged out of WhatsApp");
-    // The banner's own copy, anchored so the surface's step line cannot answer it.
-    expect(screen.getByText(/^Stored groups and messages stay readable/)).toBeTruthy();
+    // R-X3: a durable condition of the instance is the banner surface — a named
+    // region above the content, not the panel's own inline error state.
+    const banner = await waitFor(() => {
+      const found = screen.getByRole("region", { name: "The instance is logged out of WhatsApp" });
+      expect(found.getAttribute("data-surface")).toBe("banner");
+      return found;
+    });
+    expect(within(banner).getByText(/^Stored groups and messages stay readable/)).toBeTruthy();
+    expect(document.querySelector(".error-state")).toBeNull();
     await settled("Ops Team");
     // Both statements are on screen at once: the failure, and the data that
     // does not need the session (§7.5).
@@ -346,7 +359,15 @@ describe("the logged-out instance (R-X3)", () => {
       </>,
     );
 
-    await settled("The WhatsApp service is unreachable");
+    // A failed *read* is the panel's own inline surface (R-X2), with the call
+    // that failed beside it — not the instance banner, which states a condition.
+    const inline = await waitFor(() => {
+      const found = document.querySelector(".error-state");
+      expect(found).not.toBeNull();
+      return found;
+    });
+    expect(within(inline as HTMLElement).getByRole("button", { name: "Try again" })).toBeTruthy();
+    expect(document.querySelector(".error-banner")).toBeNull();
     // The other panel's reads are stored here, so they are still on screen.
     await settled("1 of 2 groups readable by the assistant");
     expect(screen.getByRole("checkbox", { name: /Ops Team/ }).hasAttribute("checked")).toBe(true);
@@ -413,7 +434,13 @@ describe("the whitelist editor (§7.2)", () => {
     fireEvent.click(screen.getByRole("checkbox", { name: /Support/ }));
     fireEvent.click(screen.getByRole("button", { name: "Save whitelist" }));
 
-    await settled("The WhatsApp service is unreachable");
+    const banner = await waitFor(() => {
+      const found = screen.getByRole("region", { name: "The WhatsApp service is unreachable" });
+      expect(found.getAttribute("data-surface")).toBe("banner");
+      return found;
+    });
+    // R-X4: the banner carries the recovery the failure declares.
+    expect(within(banner).getByRole("button", { name: "Try again" })).toBeTruthy();
     // Nothing was predicted: the stored list is still what the boxes say.
     expect(screen.getByRole("checkbox", { name: /Ops Team/ }).hasAttribute("checked")).toBe(true);
     expect(screen.getByRole("checkbox", { name: /Support/ }).hasAttribute("checked")).toBe(false);

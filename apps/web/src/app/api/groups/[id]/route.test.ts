@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
-import { MongoMemoryReplSet } from "mongodb-memory-server";
+import { MongoMemoryReplSet, MongoMemoryServer } from "mongodb-memory-server";
 import { COLLECTIONS } from "../../../../server/collections";
 import { issueSession } from "../../../../server/auth/session";
 import { closeDb, getDb } from "../../../../server/mongo";
@@ -21,10 +21,13 @@ vi.mock("next/headers", () => ({
 const ownerToken = () => issueSession({ email: "owner@local", organizationId: "org_default" });
 const JID = "120363043123456789@g.us";
 
+/** The deployment's own topology (a replica set), and a server without transactions. */
 let replSet: MongoMemoryReplSet;
+let standalone: MongoMemoryServer;
 
 beforeAll(async () => {
   replSet = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
+  standalone = await MongoMemoryServer.create();
   vi.stubEnv("MONGODB_URI", replSet.getUri());
   vi.stubEnv("MONGODB_DB", "butler_group_config_test");
   vi.stubEnv("AUTH_SECRET", "test-secret-test-secret-test-secret");
@@ -35,18 +38,38 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   session.token = ownerToken();
-  // Each case starts from an empty read model: several of them write the same
-  // JID across organisations, and leftovers would make the boundary assertions
-  // pass for the wrong reason.
+  // The topology is per-case state: one case below points this process at a
+  // server without transactions, and every other case is a replica set.
+  vi.stubEnv("MONGODB_URI", replSet.getUri());
+  await closeDb();
+  // Each case starts from an empty estate: several of them write the same JID
+  // across organisations, and leftovers would make the boundary, the rollback
+  // and the audit assertions pass for the wrong reason.
   const db = await getDb();
-  await db.collection(COLLECTIONS.groups).deleteMany({});
+  await Promise.all([
+    db.collection(COLLECTIONS.groups).deleteMany({}),
+    db.collection(COLLECTIONS.instances).deleteMany({}),
+    db.collection(COLLECTIONS.auditLog).deleteMany({}),
+  ]);
 });
 
 afterAll(async () => {
   await closeDb();
   await replSet.stop();
+  await standalone.stop();
   vi.unstubAllEnvs();
 });
+
+/** A transaction the deployment cannot run: a server that is not a replica set. */
+async function withoutTransactions(): Promise<void> {
+  vi.stubEnv("MONGODB_URI", standalone.getUri());
+  await closeDb();
+}
+
+async function instanceDoc(instanceId: string) {
+  return (await getDb()).collection(COLLECTIONS.instances).findOne({ _id: instanceId as never });
+}
+
 
 function patch(groupJid: string, body: unknown): Promise<Response> {
   return PATCH(
@@ -270,6 +293,71 @@ describe("PATCH /api/groups/[id]", () => {
       .collection(COLLECTIONS.auditLog)
       .findOne({ action: "instance.whitelist.updated" });
     expect(audit?.meta).toEqual({ source: "group-row", groupJid: JID, whitelisted: true });
+  });
+
+  /**
+   * The regression this pair exists for. The row, the assistant's own scope and
+   * the record of the move are one transaction, so a deployment that cannot run
+   * one changes nothing at all — no divergence between the two documents, and no
+   * scope change without the audit row that evidences it.
+   */
+  test("a write that cannot commit changes no scope and records nothing", async () => {
+    await withoutTransactions();
+    await insertInstance("org_default", "inst_1", "Support bot");
+    await insertGroup({
+      organizationId: "org_default",
+      instanceId: "inst_1",
+      groupJid: JID,
+      subject: "Ops Team",
+      subjectSource: "event",
+    });
+
+    const res = await patch(JID, { whitelisted: true });
+
+    expect(res.status).toBe(502);
+    const body = await res.json();
+    expect(body).toMatchObject({ code: "store_error" });
+    expect(JSON.stringify(body)).not.toContain("Transaction");
+
+    expect((await stored("org_default", "inst_1", JID))?.config).toMatchObject({ whitelisted: false });
+    expect((await instanceDoc("inst_1"))?.config).toBeUndefined();
+    expect(await (await getDb()).collection(COLLECTIONS.auditLog).countDocuments({})).toBe(0);
+  });
+
+  test("an assignment that cannot commit leaves the row as it was too", async () => {
+    await withoutTransactions();
+    await insertGroup({
+      organizationId: "org_default",
+      instanceId: "inst_1",
+      groupJid: JID,
+      subject: "Ops Team",
+      subjectSource: "event",
+    });
+
+    const res = await patch(JID, { assigned: true });
+
+    expect(res.status).toBe(502);
+    expect(await res.json()).toMatchObject({ code: "store_error" });
+    expect((await stored("org_default", "inst_1", JID))?.config).toMatchObject({ assigned: false });
+  });
+
+  test("a group whose instance has no document writes the row and records no scope change", async () => {
+    // The estate is the instance documents; a group row with no instance behind
+    // it has no assistant scope to move, so nothing is moved and nothing is
+    // recorded as moved.
+    await insertGroup({
+      organizationId: "org_default",
+      instanceId: "inst_1",
+      groupJid: JID,
+      subject: "Ops Team",
+      subjectSource: "event",
+    });
+
+    const res = await patch(JID, { whitelisted: true });
+
+    expect(res.status).toBe(200);
+    expect((await stored("org_default", "inst_1", JID))?.config).toMatchObject({ whitelisted: true });
+    expect(await (await getDb()).collection(COLLECTIONS.auditLog).countDocuments({})).toBe(0);
   });
 
   test("an assignment patch does not touch the whitelist it does not mention", async () => {

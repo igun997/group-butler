@@ -216,6 +216,8 @@ describe("token layer (spec §3.2)", () => {
       "../registry/views/instance/pairing.tsx",
       "../registry/views/instance/resources.tsx",
       "../registry/views/instance/whitelist.tsx",
+      // The banner surface P6 landed with them (R-X2, R-X3).
+      "../../components/error-banner.tsx",
     ] as const;
     const raw = /#[0-9a-fA-F]{3,8}\b|\b\d+(\.\d+)?px\b/g;
 

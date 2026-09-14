@@ -328,15 +328,27 @@ function isDispatchErrorClass(value: unknown): value is DispatchErrorClass {
 /**
  * One failure → one `UIError`, in the shape the surface that made the call must
  * use. The signals are read in causal order: a dispatch class says what
- * happened to a send, a logged-out runtime says what the instance is, and a
- * code says what the service refused — and an unrecognised code is the last
- * resort rather than a silent generic.
+ * happened to a send, a `runtime.status` says what the instance *is*, and a code
+ * says what the service refused — and an unrecognised code is the last resort
+ * rather than a silent generic.
+ *
+ * Where the failure belongs follows from which of those it is. A read's own
+ * failure is inline in the panel that made the read (R-X2), and an action's is
+ * the home its copy declares or the toast. An instance's `runtime.status` is
+ * neither: it is the condition of the scope rather than the outcome of a call,
+ * and the spec puts it on the instance banner whatever brought it here (R-X3) —
+ * which is why its declared home wins over the read default.
  */
 export function mapError(signal: FailureSignal, origin: FailureOrigin = "read"): MappedError {
+  const condition =
+    signal.runtimeStatus === "logged_out"
+      ? LOGGED_OUT
+      : signal.runtimeStatus === "error"
+        ? PAIRING_STOPPED
+        : undefined;
   const copy =
     (signal.errorClass === undefined ? undefined : DISPATCH_FAILURES[signal.errorClass]) ??
-    (signal.runtimeStatus === "logged_out" ? LOGGED_OUT : undefined) ??
-    (signal.runtimeStatus === "error" ? PAIRING_STOPPED : undefined) ??
+    condition ??
     (signal.code === undefined ? undefined : FAILURES[signal.code]) ??
     UNKNOWN;
 
@@ -345,8 +357,15 @@ export function mapError(signal: FailureSignal, origin: FailureOrigin = "read"):
     title: copy.title,
     body: copy.body,
     // A read has one home and always had it: the panel that made the read
-    // (R-X2). An action takes the home the failure names, or the toast.
-    surface: origin === "action" ? (copy.action?.surface ?? "toast") : "inline",
+    // (R-X2). An action takes the home the failure names, or the toast. A
+    // runtime condition takes the home its copy names, because the banner is
+    // where a condition of the scope is stated rather than where a call failed.
+    surface:
+      origin === "action"
+        ? (copy.action?.surface ?? "toast")
+        : copy === condition
+          ? (copy.action?.surface ?? "inline")
+          : "inline",
     retryable: copy.retryable === true,
     copyableCode: copy === UNKNOWN ? signal.code : undefined,
     toast: toastFor(origin, copy),

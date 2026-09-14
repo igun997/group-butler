@@ -3,7 +3,7 @@
 import type { InstanceSnapshot } from "@butler/shared";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
-import { ErrorState } from "../../../../components/error-state";
+import { ErrorBanner } from "../../../../components/error-banner";
 import { LiveIndicator } from "../../../../components/live-indicator";
 import { InstanceStateBadge } from "../../../../components/state-badges";
 import { utcStamp } from "../../../../components/utc-stamp";
@@ -207,8 +207,11 @@ function InstanceSession({
       <p className="instance-workspace__state">
         <InstanceStateBadge status={snapshot.status} />
       </p>
-      {alert === null ? null : <ErrorState error={alert} />}
-      {codeFailure === null ? null : <ErrorState error={codeFailure} onRetry={onRequestCode} />}
+      {/* R-X3: a logged-out session and a stopped pairing are durable operating
+          conditions, so they are banners above the panel's own content — read
+          while the groups below stay readable — and not a toast. */}
+      {alert === null ? null : <ErrorBanner error={alert} />}
+      {codeFailure === null ? null : <ErrorBanner error={codeFailure} onRetry={onRequestCode} />}
       <PairingSurface snapshot={snapshot} requesting={requestingCode} onRequestCode={onRequestCode} />
     </>
   );
@@ -250,10 +253,14 @@ export function InstanceConfigPanel({ scope }: PanelProps) {
   const action = useAction();
   const [pending, setPending] = useState(false);
   const [failure, setFailure] = useState<MappedError | null>(null);
+  // R-X4: the retry re-runs exactly the call that failed, so the list the
+  // operator asked for is kept beside its failure.
+  const attempted = useRef<readonly string[]>([]);
 
   const save = useCallback(
     (groupJidWhitelist: readonly string[]) => {
       if (scope.kind !== "instance") return;
+      attempted.current = groupJidWhitelist;
       setPending(true);
       setFailure(null);
       const count = `${groupJidWhitelist.length} ${groupJidWhitelist.length === 1 ? "group" : "groups"} readable by the assistant.`;
@@ -281,6 +288,8 @@ export function InstanceConfigPanel({ scope }: PanelProps) {
     [action, scope],
   );
 
+  const retry = useCallback(() => save(attempted.current), [save]);
+
   return (
     <section className="instance-workspace" aria-labelledby={headingId}>
       <WorkspaceHeader
@@ -307,6 +316,7 @@ export function InstanceConfigPanel({ scope }: PanelProps) {
                     pending={pending}
                     failure={failure}
                     onSave={save}
+                    onRetry={retry}
                   />
                 )
               }

@@ -982,17 +982,60 @@ body > main [role="alert"]:empty {
 }
 
 /* ---------------------------------------------------------------------------
- * P4 — the feedback surfaces: the empty and error states, and the notification
- * stack (R-E1–R-E5, R-X1–R-X4, R-T1–R-T5, R-M5)
+ * P4 — the feedback surfaces: the empty, error and banner states, and the
+ * notification stack (R-E1–R-E5, R-X1–R-X4, R-T1–R-T5, R-M5)
  *
  * The empty and error states reuse the P3 `resource-surface` geometry, so only
- * what is new is styled here: the code chip an unrecognised failure shows, and
- * the notification stack. The stack hugs the bottom-right edge, centres below
+ * what is new is styled here: the banner surface (added with P6, which is the
+ * first workspace to have a durable operating condition to state), the code chip
+ * an unrecognised failure shows, and the notification stack. The stack hugs the bottom-right edge, centres below
  * `--breakpoint-sm`, and moves to the top edge while a composer or a sheet owns
  * the bottom one (R-M5). Nothing animates, so `prefers-reduced-motion` has
  * nothing to remove here (R-A9), and no status is carried by a stripe, a border
  * edge, or an inset shadow (R-A4).
  * ------------------------------------------------------------------------- */
+/* The banner surface (R-X2, R-X3): a durable condition of the scope, stated
+   above the workspace's own content and readable for as long as it is true. It
+   is a card at rest, like every other named region — no edge stripe, no fill
+   that means a state on its own (R-A3, R-A4). */
+.error-banner {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+  padding: var(--space-3) var(--space-4);
+  color: var(--card-foreground);
+  background: var(--card);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-panel);
+}
+
+.error-banner__title {
+  margin: 0;
+  font-size: var(--type-body-strong-size);
+  line-height: var(--type-body-strong-line);
+  font-weight: var(--type-body-strong-weight);
+}
+
+.error-banner__body {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: var(--type-body-size);
+  line-height: var(--type-body-line);
+}
+
+/* R-A8/R-X4: whatever recovery the failure declares, as a control that does it. */
+.error-banner__action {
+  min-block-size: var(--target-min);
+  padding: var(--space-1) var(--space-3);
+  font: inherit;
+  color: var(--foreground);
+  background: var(--background);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+
 /* The raw code of an unrecognised failure — the error state's chip and the
    toast's are the same chip (R-X1). `user-select: all` makes it one selection,
    so the code is copyable without a control that could fail. */
