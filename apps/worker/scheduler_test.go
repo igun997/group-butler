@@ -247,3 +247,49 @@ func TestMediaJanitorIsInertWhenMediaIsDisabled(t *testing.T) {
 	})
 	cancel()
 }
+
+// A tick has to reach the operator, not just the work: this is the wiring the
+// console reads, and a refactor that kept syncing without recording would leave
+// /scheduler claiming the loop never ran.
+func TestGroupSyncSchedulerRecordsThePassItRan(t *testing.T) {
+	client := newFakeClient()
+	mgr := testManagerWithDeps(newFakeGroupStore(), nil, nil)
+	ticker := newManualTicker()
+	mgr.newTicker = ticker.new
+	s := testSession(mgr, client)
+	s.status = stateConnected
+	mgr.put(s)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); mgr.runGroupSyncScheduler(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	// The loop declares itself as it starts, which is inside its goroutine, so the
+	// registry is empty for a moment. Waiting for the declaration is the honest
+	// assertion: the endpoint can be read at any time, including that moment.
+	waitFor(t, "the loop to declare itself", func() bool {
+		loops := mgr.loops.snapshot()
+		return len(loops) == 1 && loops[0].Name == loopGroupSync && loops[0].Runs == 0
+	})
+
+	ticker.tick()
+	waitFor(t, "the pass to be recorded", func() bool {
+		loops := mgr.loops.snapshot()
+		return len(loops) == 1 && loops[0].Runs == 1
+	})
+
+	got := mgr.loops.snapshot()[0]
+	if got.IntervalMs != mgr.cfg.GroupSyncInterval.Milliseconds() {
+		t.Fatalf("interval = %d, want the configured one", got.IntervalMs)
+	}
+	if got.LastRunAt == nil {
+		t.Fatal("a recorded pass must carry when it happened")
+	}
+	if got.LastError != "" {
+		t.Fatalf("last error = %q, want a clean pass", got.LastError)
+	}
+}
