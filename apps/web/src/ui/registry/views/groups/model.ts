@@ -7,7 +7,7 @@ import {
   type GroupUpdatedEvent,
 } from "@butler/shared";
 import { z } from "zod";
-import { resourceCache, resourceKey, type StreamFrame } from "../../../resource";
+import { BffRequestError, readJson, resourceCache, resourceKey, UNREADABLE_BODY, type StreamFrame } from "../../../resource";
 import type { Scope } from "../../types";
 
 /**
@@ -93,19 +93,6 @@ export interface GroupsData {
 }
 
 /**
- * The one failure a read or a mutation throws: the server's own code, and
- * nothing else. The error map turns it into the copy, the surface, and the
- * retry the operator gets (§4.5 R-X1); a code nobody recognises still keeps the
- * raw code for the chip, because the alternative is a failure nobody can name.
- */
-export class GroupsRequestError extends Error {
-  constructor(readonly code: string) {
-    super(code);
-    this.name = "GroupsRequestError";
-  }
-}
-
-/**
  * The worker's rename-ring cap (`apps/worker/groupdelta.go` `subjectHistoryMax`),
  * which the read model applies too (`server/repos/groups.ts`). The twin is not
  * redundant: the BFF's copy bounds what one answer may carry, and this one
@@ -113,39 +100,10 @@ export class GroupsRequestError extends Error {
  */
 export const SUBJECT_HISTORY_CAP = 20;
 
-/** The stable code of an answer this build cannot read (§4.5: raw codes only). */
-const UNREADABLE = "decode_error";
-
-/** The server's own code for a failed answer, or the best one this build can name. */
-async function failureCode(response: Response): Promise<string> {
-  try {
-    const body: unknown = await response.json();
-    const code = (body as { code?: unknown } | null)?.code;
-    if (typeof code === "string" && code.length > 0) return code;
-  } catch {
-    // The body was not JSON, so the status is the only evidence there is.
-  }
-  return response.status === 401 ? "unauthorized" : "unknown";
-}
-
-/** One request, with the two failures every call can have mapped to a code. */
-async function readJson(input: string, init: RequestInit = {}): Promise<unknown> {
-  const response = await fetch(input, {
-    ...init,
-    credentials: "same-origin",
-    headers: { accept: "application/json", ...init.headers },
-  });
-  if (!response.ok) throw new GroupsRequestError(await failureCode(response));
-  try {
-    return await response.json();
-  } catch {
-    throw new GroupsRequestError(UNREADABLE);
-  }
-}
-
+/** One page of group rows, parsed from the BFF's own answer. A drift is a declared error. */
 function parsePage(body: unknown): GroupsData {
   const parsed = WirePageSchema.safeParse(body);
-  if (!parsed.success) throw new GroupsRequestError(UNREADABLE);
+  if (!parsed.success) throw new BffRequestError(UNREADABLE_BODY);
   return { groups: parsed.data.groups, syncedAt: parsed.data.syncedAt ?? null };
 }
 
@@ -156,7 +114,7 @@ export async function readAllGroups(): Promise<GroupsData> {
 
 /** One instance's groups, read from Mongo so the table renders while it is offline. */
 export async function readInstanceGroups(scope: Scope): Promise<GroupsData> {
-  if (scope.kind !== "instance") throw new GroupsRequestError("invalid_request");
+  if (scope.kind !== "instance") throw new BffRequestError("invalid_request");
   return parsePage(await readJson(`/api/instances/${encodeURIComponent(scope.instanceId)}/groups`));
 }
 
@@ -189,7 +147,7 @@ export async function setGroupConfig(input: {
         body: JSON.stringify(body),
       }),
     );
-  if (!parsed.success) throw new GroupsRequestError(UNREADABLE);
+  if (!parsed.success) throw new BffRequestError(UNREADABLE_BODY);
   return parsed.data.group;
 }
 
@@ -200,13 +158,13 @@ export async function setGroupConfig(input: {
  * failure rather than reported as a success.
  */
 export async function syncInstanceGroups(scope: Scope): Promise<GroupSyncSummary> {
-  if (scope.kind !== "instance") throw new GroupsRequestError("invalid_request");
+  if (scope.kind !== "instance") throw new BffRequestError("invalid_request");
 
   const parsed = GroupSyncSummarySchema.safeParse(
     await readJson(`/api/instances/${encodeURIComponent(scope.instanceId)}/groups/sync`, { method: "POST" }),
   );
-  if (!parsed.success) throw new GroupsRequestError(UNREADABLE);
-  if (!parsed.data.ok) throw new GroupsRequestError("group_sync_failed");
+  if (!parsed.success) throw new BffRequestError(UNREADABLE_BODY);
+  if (!parsed.data.ok) throw new BffRequestError("group_sync_failed");
   return parsed.data;
 }
 

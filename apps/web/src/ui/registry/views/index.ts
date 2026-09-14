@@ -10,5 +10,7 @@
  */
 
 import { groupsView } from "./groups";
+import { instanceView } from "./instance";
+import { instancesView } from "./instances";
 
-export { groupsView };
+export { groupsView, instanceView, instancesView };

@@ -2,8 +2,9 @@
  * The resource layer's public surface (docs/ui-decision.md §3.3, §4.1–§4.5).
  *
  * Consumers import from here: the cache and its key builder, the read hook with
- * its loading tiers, the one stream coordinator with its poll fallback, and the
- * gate that is the only place a resource surface is chosen.
+ * its loading tiers, the one stream coordinator with its poll fallback, the gate
+ * that is the only place a resource surface is chosen, and the BFF request seam
+ * a descriptor's `fetch` runs through.
  */
 export {
   createResourceCache,
@@ -24,6 +25,7 @@ export {
   type ResourceView,
   type UseResourceOptions,
 } from "./use-resource";
+export { BffRequestError, UNREADABLE_BODY, readJson } from "./request";
 export {
   SSE_MAX_ATTEMPTS,
   SSE_RETRY_BASE_MS,

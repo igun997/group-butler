@@ -264,11 +264,25 @@ const DISPATCH_FAILURES: Readonly<Record<DispatchErrorClass, ErrorCopy>> = {
 /**
  * R-X3: `runtime.status:"logged_out"` is a persistent instance banner whose
  * groups and messages stay readable, because those reads come from Mongo rather
- * than from the logged-out session.
+ * than from the logged-out session. It also states the one way back: the control
+ * plane creates a session with the instance (§6.5), so re-pairing is creating a
+ * new one — an instance whose session is gone cannot be linked again.
  */
 const LOGGED_OUT: ErrorCopy = {
   title: "The instance is logged out of WhatsApp",
-  body: "Stored groups and messages stay readable, because they do not need the session. Sends wait until the instance is paired again.",
+  body: "Stored groups and messages stay readable, because they do not need the session. Nothing new is sent or read until the account is paired again, and pairing again means creating a new instance: a session is created with the instance.",
+  action: { surface: "banner" },
+};
+
+/**
+ * §5.1 `runtime.status:"error"`: pairing stopped before the account linked. The
+ * worker records a reason for it, which the surface may show as the raw value it
+ * is; the copy here is the mapped half — what state this leaves the estate in and
+ * what the way out is (R-X4).
+ */
+const PAIRING_STOPPED: ErrorCopy = {
+  title: "Pairing stopped",
+  body: "The instance never linked, so nothing is being read from it. Its stored groups and messages stay readable from storage, and creating a new instance is how to pair again.",
   action: { surface: "banner" },
 };
 
@@ -322,6 +336,7 @@ export function mapError(signal: FailureSignal, origin: FailureOrigin = "read"):
   const copy =
     (signal.errorClass === undefined ? undefined : DISPATCH_FAILURES[signal.errorClass]) ??
     (signal.runtimeStatus === "logged_out" ? LOGGED_OUT : undefined) ??
+    (signal.runtimeStatus === "error" ? PAIRING_STOPPED : undefined) ??
     (signal.code === undefined ? undefined : FAILURES[signal.code]) ??
     UNKNOWN;
 
@@ -336,6 +351,17 @@ export function mapError(signal: FailureSignal, origin: FailureOrigin = "read"):
     copyableCode: copy === UNKNOWN ? signal.code : undefined,
     toast: toastFor(origin, copy),
   };
+}
+
+/**
+ * Whether a caller has to render this failure itself. `useAction` reports every
+ * failure either way; this is the one test a caller applies to decide whether
+ * the surface is already handled (R-X2, R-X4) — a failure the toast refused to
+ * stand in for, because the spec gives it a home of its own. It lives here, with
+ * the decision it reads, so no view can re-derive it slightly differently.
+ */
+export function needsOwnSurface(error: MappedError): boolean {
+  return error.toast !== "owns";
 }
 
 function toastFor(origin: FailureOrigin, copy: ErrorCopy): ToastDisposition {

@@ -5,6 +5,7 @@ import {
   FOCUS,
   MENU,
   MOTION,
+  PAIRING,
   PALETTE,
   RADIUS,
   RESOURCE,
@@ -134,6 +135,9 @@ describe("token layer (spec §3.2)", () => {
     expect(light.get("--resource-bar-height")).toBe(`${RESOURCE.barHeight}px`);
     expect(light.get("--resource-bar-cycle")).toBe(`${RESOURCE.barCycleMs}ms`);
 
+    // The pairing surface's QR geometry (P6, R-L5) is a named value too.
+    expect(light.get("--pairing-qr-size")).toBe(PAIRING.qrSize);
+
     // The interactive floor, the modal surfaces, and the scrim are tokens too:
     // a control, a palette, and a sheet consume the same values, not their own.
     for (const [name, px] of Object.entries(TARGET)) {
@@ -199,6 +203,19 @@ describe("token layer (spec §3.2)", () => {
       "../registry/views/groups/columns.tsx",
       "../registry/views/groups/panel.tsx",
       "../registry/views/groups/resources.tsx",
+      // P6's two workspaces are held to it as well: the estate list, the
+      // instance page's session, pairing and configuration surfaces, and the
+      // create form.
+      "../registry/views/instances/index.tsx",
+      "../registry/views/instances/columns.tsx",
+      "../registry/views/instances/create-instance.tsx",
+      "../registry/views/instances/panel.tsx",
+      "../registry/views/instances/resources.tsx",
+      "../registry/views/instance/index.tsx",
+      "../registry/views/instance/panel.tsx",
+      "../registry/views/instance/pairing.tsx",
+      "../registry/views/instance/resources.tsx",
+      "../registry/views/instance/whitelist.tsx",
     ] as const;
     const raw = /#[0-9a-fA-F]{3,8}\b|\b\d+(\.\d+)?px\b/g;
 

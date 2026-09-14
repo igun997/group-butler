@@ -8,7 +8,7 @@ import { COMPACT_QUERY, useMediaQuery } from "../../../../components/media-query
 import { utcStamp } from "../../../../components/utc-stamp";
 import { SubjectHistorySheet } from "../../../../components/subject-history-sheet";
 import { WorkspaceHeader } from "../../../../components/workspace-header";
-import { useAction } from "../../../feedback";
+import { needsOwnSurface, useAction } from "../../../feedback";
 import type { MappedError } from "../../../feedback";
 import {
   ResourceGate,
@@ -120,7 +120,7 @@ const TOGGLE_ACTIONS = { assigned: "assign-group", whitelisted: "whitelist-group
 
 /** The failure a toast may not carry gets its own surface, with the call that made it (R-X2, R-X4). */
 function failureOrNull(error: MappedError | undefined, retry: () => void): GroupsFailure | null {
-  return error && error.toast !== "owns" ? { error, retry } : null;
+  return error && needsOwnSurface(error) ? { error, retry } : null;
 }
 
 /**

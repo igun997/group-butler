@@ -1,6 +1,8 @@
 import { z } from "zod";
+import { clientKey } from "../../../../server/auth/client";
 import { UnauthorizedError, requireOwner } from "../../../../server/auth/owner";
 import { getDb } from "../../../../server/mongo";
+import { setGroupWhitelisted } from "../../../../server/repos/instance-config";
 import { updateGroupConfig } from "../../../../server/repos/groups";
 
 /**
@@ -18,6 +20,13 @@ import { updateGroupConfig } from "../../../../server/repos/groups";
  * - **No worker call.** These flags are the dashboard's own data, and the
  *   worker neither reads nor needs them, so a group stays assignable while its
  *   instance is offline.
+ *
+ * `whitelisted` is written twice over, on purpose: the row carries the flag and
+ * the instance's `config.groupJidWhitelist` is the assistant's actual scope
+ * (§7.2), of which §5.1 says the row is a mirror. The two writers that can
+ * change that scope — this toggle and the instance's whitelist editor — each
+ * keep both documents in step, so un-whitelisting here cannot leave the
+ * assistant reading the group.
  */
 
 const PatchSchema = z
@@ -69,6 +78,16 @@ export async function PATCH(
 
   switch (result.kind) {
     case "updated":
+      if (patch.data.whitelisted !== undefined) {
+        await setGroupWhitelisted(
+          db,
+          organizationId,
+          result.instanceId,
+          id,
+          patch.data.whitelisted,
+          clientKey(request),
+        );
+      }
       return Response.json({ group: result.group }, { headers: noStore });
     case "not_found":
       // Another organisation's group and a group that is not here are the same

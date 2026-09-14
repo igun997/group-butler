@@ -3,7 +3,7 @@ import { MongoMemoryReplSet } from "mongodb-memory-server";
 import { COLLECTIONS } from "../../../../server/collections";
 import { issueSession } from "../../../../server/auth/session";
 import { closeDb, getDb } from "../../../../server/mongo";
-import { insertGroup } from "../../../../server/repos/test-helpers";
+import { insertGroup, insertInstance } from "../../../../server/repos/test-helpers";
 import { PATCH } from "./route";
 
 /**
@@ -232,6 +232,63 @@ describe("PATCH /api/groups/[id]", () => {
     expect(await named.json()).toMatchObject({ group: { whitelisted: true } });
     expect((await stored("org_default", "inst_1", JID))?.config).toMatchObject({ whitelisted: false });
     expect((await stored("org_default", "inst_2", JID))?.config).toMatchObject({ whitelisted: true });
+  });
+
+  /**
+   * The two writers of the assistant's scope (§5.1: `groups.config.whitelisted`
+   * mirrors `instances.config.groupJidWhitelist`). This surface writes the row,
+   * so it also moves the instance's list — otherwise un-whitelisting here would
+   * leave the assistant still reading the group (§7.2).
+   */
+  test("a whitelist toggle keeps the instance's own whitelist in step", async () => {
+    await insertInstance("org_default", "inst_1", "Support bot");
+    await insertGroup({
+      organizationId: "org_default",
+      instanceId: "inst_1",
+      groupJid: JID,
+      subject: "Ops Team",
+      subjectSource: "event",
+    });
+
+    const whitelisted = await patch(JID, { whitelisted: true });
+
+    expect(whitelisted.status).toBe(200);
+    const instance = await (await getDb())
+      .collection(COLLECTIONS.instances)
+      .findOne({ _id: "inst_1" as never });
+    expect(instance?.config).toMatchObject({ groupJidWhitelist: [JID] });
+
+    await patch(JID, { whitelisted: false });
+
+    const cleared = await (await getDb())
+      .collection(COLLECTIONS.instances)
+      .findOne({ _id: "inst_1" as never });
+    expect(cleared?.config).toMatchObject({ groupJidWhitelist: [] });
+
+    // §7.2 step 5: the edit is recorded, with what moved.
+    const audit = await (await getDb())
+      .collection(COLLECTIONS.auditLog)
+      .findOne({ action: "instance.whitelist.updated" });
+    expect(audit?.meta).toEqual({ source: "group-row", groupJid: JID, whitelisted: true });
+  });
+
+  test("an assignment patch does not touch the whitelist it does not mention", async () => {
+    await insertInstance("org_default", "inst_1", "Support bot");
+    await insertGroup({
+      organizationId: "org_default",
+      instanceId: "inst_1",
+      groupJid: JID,
+      subject: "Ops Team",
+      subjectSource: "event",
+    });
+    await patch(JID, { whitelisted: true });
+
+    await patch(JID, { assigned: true });
+
+    const instance = await (await getDb())
+      .collection(COLLECTIONS.instances)
+      .findOne({ _id: "inst_1" as never });
+    expect(instance?.config).toMatchObject({ groupJidWhitelist: [JID] });
   });
 
   test("answers 401 for a request with no session and changes nothing", async () => {

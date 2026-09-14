@@ -156,6 +156,13 @@
   --resource-bar-height: 2px;
   --resource-bar-cycle: 1200ms;
 
+  /*
+   * The pairing surface (P6, R-L5): how large the QR is drawn. The worker
+   * encodes a 512 px PNG, so the source size is a fact of the contract and the
+   * rendered size is the one number this table owns.
+   */
+  --pairing-qr-size: 16rem;
+
   /* The labelled type ramp of §3.2, step for step. */
   --type-caption-size: 12px;
   --type-caption-line: 16px;

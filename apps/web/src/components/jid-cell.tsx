@@ -3,29 +3,36 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
- * The group's identity, as the operator needs it (docs/ui-decision.md §4.6 R-A6,
- * §4.7 R-M7; draft §7.5). The full `<id>@g.us` is always the text of the cell —
+ * The identifier's identity, as the operator needs it (docs/ui-decision.md §4.6
+ * R-A6, §4.7 R-M7; draft §7.5). The full value is always the text of the cell —
  * never an abbreviation, never replaced by a name — and it wraps inside its own
  * monospace container rather than being clipped.
  *
  * Where a scope can act on it (`copyable`), the copy control is a real button:
  * reachable by keyboard, named by the value it copies, and large enough to tap.
- * It copies the whole JID and reports what happened on its own label, so the
+ * It copies the whole value and reports what happened on its own label, so the
  * failure of a clipboard the browser refused is visible instead of silent. The
  * info toast of §4.3 R-T1 rides on top of that later; the interaction is here.
+ *
+ * `noun` is what the value is called where it is shown: the groups workspace
+ * copies a group ID, the instances workspace an instance ID, and the control is
+ * named after whichever one it holds (R-A6: an accessible name that says what
+ * the control does *and* to what).
  */
 
 export interface JidCellProps {
   jid: string;
-  /** Whether this surface offers the copy-JID action (R-A6). */
+  /** Whether this surface offers the copy action (R-A6). */
   copyable?: boolean;
+  /** What the value is, in the operator's words: `group ID`, `instance ID`. */
+  noun?: string;
 }
 
-export function JidCell({ jid, copyable = false }: JidCellProps) {
+export function JidCell({ jid, copyable = false, noun = "group ID" }: JidCellProps) {
   return (
     <span className="jid-cell">
       <code className="jid-cell__value">{jid}</code>
-      {copyable ? <CopyJidButton jid={jid} /> : null}
+      {copyable ? <CopyJidButton jid={jid} noun={noun} /> : null}
     </span>
   );
 }
@@ -35,7 +42,7 @@ type CopyState = "idle" | "copied" | "failed";
 /** How long the copy control keeps its outcome before returning to its instruction. */
 const COPY_FEEDBACK_MS = 2000;
 
-function CopyJidButton({ jid }: { jid: string }) {
+function CopyJidButton({ jid, noun }: { jid: string; noun: string }) {
   const [state, setState] = useState<CopyState>("idle");
   const reset = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -52,7 +59,7 @@ function CopyJidButton({ jid }: { jid: string }) {
     reset.current = setTimeout(() => setState("idle"), COPY_FEEDBACK_MS);
   }, [jid]);
 
-  const label = COPY_LABELS[state](jid);
+  const label = COPY_LABELS[state](noun, jid);
 
   return (
     <button type="button" className="jid-cell__copy" aria-label={label} onClick={() => void copy()}>
@@ -77,10 +84,10 @@ function CopyJidButton({ jid }: { jid: string }) {
 }
 
 /** The control's accessible name, named by the value it copies (R-A6). */
-const COPY_LABELS: Record<CopyState, (jid: string) => string> = {
-  idle: (jid) => `Copy group ID ${jid}`,
-  copied: (jid) => `Copied group ID ${jid}`,
-  failed: (jid) => `Could not copy group ID ${jid}`,
+const COPY_LABELS: Record<CopyState, (noun: string, jid: string) => string> = {
+  idle: (noun, jid) => `Copy ${noun} ${jid}`,
+  copied: (noun, jid) => `Copied ${noun} ${jid}`,
+  failed: (noun, jid) => `Could not copy ${noun} ${jid}`,
 };
 
 /**

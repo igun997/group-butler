@@ -1160,11 +1160,13 @@ body > main [role="alert"]:empty {
 
 /* ---------------------------------------------------------------------------
  * P5 — the first vertical slice: the groups workspace (R11, R-L4, R-V4, R-M1,
- * R-M4, §3.2)
+ * R-M4, §3.2), whose table and card shapes P6's instances list reuses
  *
- * The table is the instrument: one row per group, every value wrapping inside
- * its own cell rather than being clipped, and the full JID monospace in its own
- * container. Below `md` the same column definitions render as stacked
+ * The table is the instrument: one row per object, every value wrapping inside
+ * its own cell rather than being clipped. P6's instances list is the second
+ * table in the app and the same instrument, and P6's primary controls (the
+ * create and the whitelist save) are the same control as the sync below, so all
+ * of them share these rules by selector rather than by a second copy of them. Below `md` the same column definitions render as stacked
  * label/value cards — the component mounts one of the two, never both — so
  * nothing here restyles a table into something it is not, and no table ever
  * scrolls sideways.
@@ -1261,12 +1263,14 @@ body > main [role="alert"]:empty {
 
 /* The table proper. Column widths follow the content; the row's own values
    wrap, so a narrow desktop never has to scroll sideways (R-M1). */
-.groups-table {
+.groups-table,
+.instances-table {
   inline-size: 100%;
   border-collapse: collapse;
 }
 
-.groups-table th {
+.groups-table th,
+.instances-table th {
   padding: var(--space-2);
   color: var(--muted-foreground);
   font-size: var(--type-caption-size);
@@ -1277,7 +1281,8 @@ body > main [role="alert"]:empty {
   border-block-end: var(--border-width) solid var(--border);
 }
 
-.groups-table td {
+.groups-table td,
+.instances-table td {
   padding: var(--space-2);
   vertical-align: top;
   font-size: var(--type-body-size);
@@ -1285,12 +1290,14 @@ body > main [role="alert"]:empty {
   border-block-end: var(--border-width) solid var(--border);
 }
 
-.groups-table tbody tr:last-child td {
+.groups-table tbody tr:last-child td,
+.instances-table tbody tr:last-child td {
   border-block-end: none;
 }
 
 /* The row's pointer affordance: a wash, never an edge (R-A4, §3.2). */
-.groups-table tbody tr:hover {
+.groups-table tbody tr:hover,
+.instances-table tbody tr:hover {
   background: var(--muted);
 }
 
@@ -1304,7 +1311,8 @@ body > main [role="alert"]:empty {
 
 /* The same rows below `md`: the row is an object, so it gets a surface, and its
    fields are the label/value pairs the columns already declare (R-M1). */
-.groups-cards {
+.groups-cards,
+.instances-cards {
   display: grid;
   gap: var(--space-3);
   margin: 0;
@@ -1312,7 +1320,8 @@ body > main [role="alert"]:empty {
   list-style: none;
 }
 
-.groups-cards__item {
+.groups-cards__item,
+.instances-cards__item {
   padding: var(--space-3);
   color: var(--card-foreground);
   background: var(--card);
@@ -1320,13 +1329,15 @@ body > main [role="alert"]:empty {
   border-radius: var(--radius-panel);
 }
 
-.groups-cards__fields {
+.groups-cards__fields,
+.instances-cards__fields {
   display: grid;
   gap: var(--space-2);
   margin: 0;
 }
 
-.groups-cards__field {
+.groups-cards__field,
+.instances-cards__field {
   display: grid;
   grid-template-columns: minmax(var(--space-12), auto) minmax(0, 1fr);
   gap: var(--space-2);
@@ -1334,18 +1345,21 @@ body > main [role="alert"]:empty {
 }
 
 /* The identity field is not a value beside a label: it owns the full width. */
-.groups-cards__field:first-child {
+.groups-cards__field:first-child,
+.instances-cards__field:first-child {
   grid-template-columns: minmax(0, 1fr);
   gap: var(--space-1);
 }
 
-.groups-cards__label {
+.groups-cards__label,
+.instances-cards__label {
   color: var(--muted-foreground);
   font-size: var(--type-caption-size);
   line-height: var(--type-caption-line);
 }
 
-.groups-cards__value {
+.groups-cards__value,
+.instances-cards__value {
   margin: 0;
   min-inline-size: 0;
 }
@@ -1373,20 +1387,25 @@ body > main [role="alert"]:empty {
 }
 
 .row-toggle__glyph,
-.groups-sync__glyph {
+.groups-sync__glyph,
+.instances-create__glyph {
   display: inline-flex;
 }
 
 /* R-L9: the control says it is working, and it is the only one disabled. */
 .row-toggle:disabled,
-.groups-sync:disabled {
+.groups-sync:disabled,
+.instances-create:disabled,
+.whitelist-editor__save:disabled {
   color: var(--muted-foreground);
   background: var(--muted);
   border-color: var(--border);
   cursor: progress;
 }
 
-.groups-sync {
+.groups-sync,
+.instances-create,
+.whitelist-editor__save {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
@@ -1581,6 +1600,408 @@ body > main [role="alert"]:empty {
    the same shape the scope spine's switcher takes. */
 @media (max-width: 767px) {
   .history-sheet {
+    inline-size: 100vw;
+    max-block-size: var(--sheet-max-height);
+    margin-block: auto 0;
+    border-end-start-radius: 0;
+    border-end-end-radius: 0;
+    border-start-start-radius: var(--radius-sheet-top);
+    border-start-end-radius: var(--radius-sheet-top);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * P6 — instances and instance (§5 P6): the estate's list, one instance's
+ * session, the assistant's scope, and the create form (R-L4, R-L5, R-M1, R-M4,
+ * R-X2, §3.2)
+ *
+ * Three surfaces live here and no value does. The list is the shared table and
+ * the shared cards above; what this section adds is the row's own cells, the
+ * pairing surface (a long-running state, not a load: step, elapsed time, and a
+ * way to leave), the whitelist editor (the one `instances.config` field with a
+ * reader), and the create form — a native `dialog` like the confirmation and the
+ * rename sheet, so its modal behaviour is the platform's.
+ *
+ * Nothing here animates and nothing encodes a state on an edge: the delete
+ * control is toned destructive *and* named by its label, and the status is a
+ * badge with words and a glyph (R-A3, R-A4). Both P6 workspaces stack their
+ * panels in one column and reflow by content, so nothing scrolls sideways
+ * (R-M1).
+ * ------------------------------------------------------------------------- */
+
+/* R-L4: the pairing skeleton reserves the block the surface will occupy. */
+.skeleton-block[data-shape="cards"] {
+  block-size: calc(var(--row-height-comfortable) * 4);
+}
+
+.instances-workspace,
+.instance-workspace {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-inline-size: 0;
+}
+
+/* The instance page's panels, in reading order: session, configuration, groups (§1). */
+.instance-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+  min-inline-size: 0;
+}
+
+.instances-table__link {
+  font-weight: var(--type-body-strong-weight);
+  overflow-wrap: anywhere;
+}
+
+/* The status cell is the badge and, under it, the worker's own reason. */
+.instances-table__state {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+}
+
+.instances-table__reason,
+.instance-workspace__started {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+  overflow-wrap: anywhere;
+}
+
+.instances-table__number,
+.instances-table__stamp {
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+/* The workspace's state line: the badge on its own row, above the surface. */
+.instance-workspace__state {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+}
+
+/* R-A8: destructive, and named by its label, so colour is not the message. */
+.app-shell .instance-delete {
+  color: var(--destructive);
+  border-color: var(--destructive);
+}
+
+/* ---- The pairing surface (R-L5) ------------------------------------------ */
+
+.pairing-surface {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-inline-size: 0;
+}
+
+.pairing-surface__step {
+  margin: 0;
+  font-size: var(--type-body-size);
+  line-height: var(--type-body-line);
+  font-weight: var(--type-body-strong-weight);
+}
+
+.pairing-surface__elapsed,
+.pairing-surface__hint,
+.pairing-surface__leave {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+}
+
+.pairing-surface__code {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  min-inline-size: 0;
+}
+
+/*
+ * The QR the worker rendered: drawn at a size a phone can scan, never stretched
+ * past the column, and on its own white ground so the modules keep the contrast
+ * the barcode needs in either theme.
+ */
+.pairing-surface__qr {
+  inline-size: var(--pairing-qr-size);
+  max-inline-size: 100%;
+  block-size: auto;
+  padding: var(--space-2);
+  background: var(--background);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-panel);
+}
+
+.pairing-surface__value {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin: 0;
+}
+
+.pairing-surface__value-label {
+  color: var(--muted-foreground);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+}
+
+.pairing-surface__code-value {
+  font-family: var(--font-mono);
+  font-size: var(--type-subtitle-size);
+  line-height: var(--type-subtitle-line);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.pairing-surface__identity {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.pairing-surface__field {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.pairing-surface__field dt {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+}
+
+.pairing-surface__field dd {
+  margin: 0;
+  font-size: var(--type-body-size);
+  line-height: var(--type-body-line);
+  overflow-wrap: anywhere;
+}
+
+/* The worker's own words for a stopped pairing: labelled, and inert text. */
+.pairing-surface__reason {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-control);
+}
+
+.pairing-surface__reason-label {
+  color: var(--muted-foreground);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+}
+
+.pairing-surface__reason-value {
+  font-family: var(--font-mono);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+  overflow-wrap: anywhere;
+}
+
+.pairing-surface__leave {
+  padding-block-start: var(--space-2);
+  border-block-start: var(--border-width) solid var(--border);
+}
+
+.pairing-surface__action {
+  min-block-size: var(--target-min);
+  padding: var(--space-1) var(--space-3);
+}
+
+/* ---- The whitelist editor (§7.2) ---------------------------------------- */
+
+.whitelist-editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-inline-size: 0;
+}
+
+.whitelist-editor__summary {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+}
+
+.whitelist-editor__picker {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-inline-size: 0;
+}
+
+.whitelist-editor__legend {
+  padding: 0;
+  font-size: var(--type-body-strong-size);
+  line-height: var(--type-body-strong-line);
+  font-weight: var(--type-body-strong-weight);
+}
+
+.whitelist-editor__list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.whitelist-editor__item {
+  min-inline-size: 0;
+}
+
+/* R-M4: the label is the target, so the whole row is reachable by touch. */
+.whitelist-editor__choice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  min-block-size: var(--target-min);
+  cursor: pointer;
+}
+
+.whitelist-editor__name {
+  font-size: var(--type-body-size);
+  line-height: var(--type-body-line);
+  overflow-wrap: anywhere;
+}
+
+.whitelist-editor__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* ---- The create form (§6.5 POST /instances) ----------------------------- */
+
+.form-dialog {
+  width: min(var(--surface-max-width), calc(100vw - var(--space-8)));
+  max-block-size: var(--sheet-max-height);
+  padding: 0;
+  color: var(--popover-foreground);
+  background: var(--popover);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-dialog);
+  box-shadow: var(--elevation-28);
+}
+
+.form-dialog::backdrop {
+  background: var(--scrim);
+}
+
+.form-dialog__form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  overflow-y: auto;
+}
+
+.form-dialog__title {
+  margin: 0;
+  font-size: var(--type-subtitle-size);
+  line-height: var(--type-subtitle-line);
+  font-weight: var(--type-subtitle-weight);
+}
+
+.form-dialog__intro {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: var(--type-body-size);
+  line-height: var(--type-body-line);
+}
+
+.form-dialog__field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-inline-size: 0;
+}
+
+.form-dialog__label {
+  padding: 0;
+  font-size: var(--type-body-size);
+  line-height: var(--type-body-line);
+  font-weight: var(--type-body-strong-weight);
+}
+
+.form-dialog__input {
+  display: block;
+  inline-size: 100%;
+  padding: var(--space-2) var(--space-3);
+  font: inherit;
+  color: var(--foreground);
+  background: var(--background);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-control);
+}
+
+/* The field's own evidence (R-T5: validation is inline, never a toast). */
+.form-dialog__error {
+  margin: 0;
+  color: var(--destructive);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+}
+
+.form-dialog__choice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  min-block-size: var(--target-min);
+  cursor: pointer;
+}
+
+.form-dialog__choice-label {
+  font-size: var(--type-body-size);
+  line-height: var(--type-body-line);
+  font-weight: var(--type-body-strong-weight);
+}
+
+.form-dialog__choice-hint {
+  flex-basis: 100%;
+  color: var(--muted-foreground);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+}
+
+.form-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.form-dialog__cancel,
+.form-dialog__submit {
+  min-block-size: var(--target-min);
+  padding: var(--space-1) var(--space-3);
+}
+
+/* Below md the create form is a bottom sheet, in the same shape the rename sheet
+   and the scope switcher take (R-M6). */
+@media (max-width: 767px) {
+  .form-dialog {
     inline-size: 100vw;
     max-block-size: var(--sheet-max-height);
     margin-block: auto 0;

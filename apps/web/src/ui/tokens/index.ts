@@ -65,6 +65,15 @@ export const SURFACE = { maxWidth: 560 } as const;
 export const SHEET = { maxHeight: "80dvh", maxViewport: "82vw" } as const;
 
 /**
+ * The pairing surface (§4.1 R-L5): the size the QR is drawn at, and the size of
+ * the source it is drawn from. The source is not a choice made here — the worker
+ * encodes a 512 px PNG (`apps/worker/lifecycle.go` `qrDataURL`) — so the pair
+ * belongs together, and the rendered size is a length a component would otherwise
+ * write. Geometry, therefore theme-independent, like every other length here.
+ */
+export const PAIRING = { qrSource: 512, qrSize: "16rem" } as const;
+
+/**
  * The command palette's geometry (§3.2): how far it sits from the top edge, and
  * how tall its list grows before it scrolls.
  */

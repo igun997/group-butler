@@ -1,9 +1,20 @@
+import type { ClientSession, Db } from "mongodb";
 import { COLLECTIONS } from "../collections";
 import { getDb } from "../mongo";
 
 export type AuthAuditAction = "auth.login.succeeded" | "auth.login.failed" | "auth.logout";
 
 export type AuthAuditReason = "invalid_credentials" | "malformed_request" | "rate_limited";
+
+/**
+ * Every action this deployment may audit. `auth.*` is written by the sign-in
+ * routes; `instance.whitelist.updated` is written by both whitelist writers
+ * (§7.2 step 5: "a whitelist edit writes an `auditLog` row with before/after"),
+ * which is why the two surfaces that can change AI scope share one action name.
+ */
+export type AuditAction = AuthAuditAction | "instance.whitelist.updated";
+
+export type AuditTargetType = "owner" | "instance" | "group";
 
 export interface AuthAuditEvent {
   organizationId: string;
@@ -15,6 +26,17 @@ export interface AuthAuditEvent {
   reason?: AuthAuditReason;
 }
 
+/** One `auditLog` row, before it is stored (§5.1). */
+export interface AuditEntry {
+  organizationId: string;
+  actor: "owner" | "worker";
+  action: AuditAction;
+  target: { type: AuditTargetType; id: string };
+  /** Whatever the action needs to be reconcilable, e.g. a whitelist's before/after. */
+  meta?: Record<string, unknown>;
+  ip: string;
+}
+
 /** The driver waits 30 s for server selection; a login answer may not wait with it. */
 export const AUDIT_WRITE_TIMEOUT_MS = 2_000;
 
@@ -22,21 +44,38 @@ export const AUDIT_WRITE_TIMEOUT_MS = 2_000;
 const MAX_AUDIT_EMAIL = 254;
 
 /** The `auditLog` document of docs/architecture-draft.md §5.1. */
-function auditRow(event: AuthAuditEvent) {
+function auditRow(entry: AuditEntry) {
   return {
-    organizationId: event.organizationId,
-    actor: "owner" as const,
-    action: event.action,
-    target: { type: "owner" as const, id: event.email.slice(0, MAX_AUDIT_EMAIL) },
-    meta: event.reason === undefined ? {} : { reason: event.reason },
-    ip: event.ip,
+    organizationId: entry.organizationId,
+    actor: entry.actor,
+    action: entry.action,
+    target: entry.target,
+    meta: entry.meta ?? {},
+    ip: entry.ip,
     createdAt: new Date(),
   };
 }
 
+/**
+ * Writes one `auditLog` row. The session is what lets a caller make the record
+ * and the change it describes land together: the whitelist editor passes the
+ * transaction it already holds, so an edit and its evidence are one commit.
+ */
+export async function writeAudit(db: Db, entry: AuditEntry, session?: ClientSession): Promise<void> {
+  await db
+    .collection(COLLECTIONS.auditLog)
+    .insertOne(auditRow(entry), session === undefined ? {} : { session });
+}
+
 async function insertAuditRow(event: AuthAuditEvent): Promise<void> {
-  const db = await getDb();
-  await db.collection(COLLECTIONS.auditLog).insertOne(auditRow(event));
+  await writeAudit(await getDb(), {
+    organizationId: event.organizationId,
+    actor: "owner",
+    action: event.action,
+    target: { type: "owner", id: event.email.slice(0, MAX_AUDIT_EMAIL) },
+    meta: event.reason === undefined ? {} : { reason: event.reason },
+    ip: event.ip,
+  });
 }
 
 /**

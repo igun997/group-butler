@@ -17,6 +17,7 @@ export {
 export { emptyPlan, type EmptyCopyInput } from "./empty-copy";
 export {
   mapError,
+  needsOwnSurface,
   signalOf,
   type DispatchErrorClass,
   type FailureOrigin,

@@ -209,9 +209,15 @@ export interface GroupConfigPatch {
   instanceId?: string;
 }
 
-/** The outcome of a config write: one row updated, or why it was refused. */
+/**
+ * The outcome of a config write: one row updated, or why it was refused. The
+ * instance the row belongs to travels with it, because the two fields are not
+ * only this document's: `whitelisted` is the mirror of the instance's
+ * `config.groupJidWhitelist` (§5.1), and the caller that maintains that pair
+ * needs to know which instance it just wrote.
+ */
 export type GroupConfigUpdate =
-  | { kind: "updated"; group: GroupRow }
+  | { kind: "updated"; group: GroupRow; instanceId: string }
   | { kind: "not_found" }
   | { kind: "ambiguous" };
 
@@ -241,7 +247,10 @@ export async function updateGroupConfig(
 
   const instanceIds = new Set(matched.map((doc) => doc.instanceId));
   if (instanceIds.size > 1) return { kind: "ambiguous" };
-  const [instanceId] = [...instanceIds];
+  // The set holds exactly one id here, and the match that produced it is the one
+  // the write below addresses.
+  const instanceId = matched[0]?.instanceId;
+  if (instanceId === undefined) return { kind: "not_found" };
 
   const changes: Record<string, boolean> = {};
   if (patch.assigned !== undefined) changes["config.assigned"] = patch.assigned;
@@ -253,5 +262,5 @@ export async function updateGroupConfig(
     { returnDocument: "after" },
   );
   if (!updated) return { kind: "not_found" };
-  return { kind: "updated", group: toRow(updated) };
+  return { kind: "updated", group: toRow(updated), instanceId };
 }
