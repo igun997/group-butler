@@ -10,9 +10,19 @@ import (
 // two names on purpose: the day row answers "how much happened, here, today", and
 // the instance row answers "what has this account seen".
 const (
-	dayCounterReceipts       = "receipts"
-	dayCounterMessages       = "messages"
-	runtimeCounterMessagesIn = "messagesIn"
+	dayCounterReceipts      = "receipts"
+	dayCounterMessagesIn    = "messagesIn"
+	dayCounterMediaStored   = "mediaStored"
+	dayCounterMediaUnparsed = "mediaUnparsed"
+	dayCounterSendsSent     = "sendsSent"
+	dayCounterSendsFailed   = "sendsFailed"
+
+	runtimeCounterMessagesIn    = "messagesIn"
+	runtimeCounterMediaStored   = "mediaStored"
+	runtimeCounterMediaUnparsed = "mediaUnparsed"
+	runtimeCounterSendOk        = "sendOk"
+	runtimeCounterSendFailed    = "sendFailed"
+	runtimeCounterGroups        = "groups"
 )
 
 // recordStored writes a flush's new messages into both places §10 reads.
@@ -48,19 +58,82 @@ func (m *manager) recordStored(ctx context.Context, docs []MessageDoc) {
 		byInstance[doc.InstanceID]++
 	}
 
-	if m.stats != nil {
-		for key, count := range byGroup {
-			if err := m.stats.bump(ctx, m.orgID, key.instance, key.group, dayCounterMessages, count, latest[key]); err != nil {
-				logf("message counter for %s/%s: %v", key.instance, key.group, err)
-			}
-		}
+	for key, count := range byGroup {
+		m.bumpDay(ctx, key.instance, key.group, dayCounterMessagesIn, count, latest[key])
 	}
+	for instance, count := range byInstance {
+		m.bumpRuntime(ctx, instance, map[string]int64{runtimeCounterMessagesIn: count})
+	}
+}
 
-	if m.instances != nil {
-		for instance, count := range byInstance {
-			if err := m.instances.BumpCounters(ctx, m.orgID, instance, map[string]int64{runtimeCounterMessagesIn: count}); err != nil {
-				logf("instance counters for %s: %v", instance, err)
-			}
-		}
+// recordMedia writes one attachment's outcome into both places §10 reads. Only
+// media the pipeline actually holds is counted: `pending` is work not yet done,
+// `failed` is work to retry, and `unavailable` is bytes WhatsApp will not give
+// us — none of them is a stored attachment, and counting one would report an
+// object the bucket does not have (R3).
+//
+// The stamp is the moment the pipeline resolved the attachment rather than the
+// message's own timestamp: this is the work the worker did, so a janitor retry
+// of an older message is today's media, not the day that message arrived.
+func (m *manager) recordMedia(ctx context.Context, doc MessageDoc, media Media) {
+	var dayCounter, runtimeCounter string
+	switch media.Status {
+	case MediaStored:
+		dayCounter, runtimeCounter = dayCounterMediaStored, runtimeCounterMediaStored
+	case MediaUnparsed:
+		dayCounter, runtimeCounter = dayCounterMediaUnparsed, runtimeCounterMediaUnparsed
+	default:
+		return
+	}
+	m.bumpDay(ctx, doc.InstanceID, doc.GroupJID, dayCounter, 1, now())
+	m.bumpRuntime(ctx, doc.InstanceID, map[string]int64{runtimeCounter: 1})
+}
+
+// recordSend writes one dispatch outcome. Both directions are recorded: a
+// console that only learned about the sends that worked would report a success
+// rate of 100% (§10).
+func (m *manager) recordSend(ctx context.Context, instanceID, groupJID string, ok bool, at time.Time) {
+	dayCounter, runtimeCounter := dayCounterSendsFailed, runtimeCounterSendFailed
+	if ok {
+		dayCounter, runtimeCounter = dayCounterSendsSent, runtimeCounterSendOk
+	}
+	m.bumpDay(ctx, instanceID, groupJID, dayCounter, 1, at)
+	m.bumpRuntime(ctx, instanceID, map[string]int64{runtimeCounter: 1})
+}
+
+// recordGroups records how many groups a full sync observed. `groups` is a
+// gauge rather than a tally — the snapshot *is* the membership — so the value is
+// set: adding the total on every pass would grow with the number of syncs and
+// answer nothing. §10 keeps this per instance, not per day.
+func (m *manager) recordGroups(ctx context.Context, instanceID string, total int) {
+	if m.instances == nil {
+		return
+	}
+	if err := m.instances.SetCounter(ctx, m.orgID, instanceID, runtimeCounterGroups, int64(total)); err != nil {
+		logf("%s counter for %s: %v", runtimeCounterGroups, instanceID, err)
+	}
+}
+
+// bumpDay adds to one counter on a day's row. A failed statistic is logged
+// rather than returned: the event it describes has already happened, and losing
+// a message, an attachment or a send because the counter write failed would be
+// the statistic costing more than it is worth.
+func (m *manager) bumpDay(ctx context.Context, instanceID, groupJID, counter string, count int64, at time.Time) {
+	if m.stats == nil {
+		return
+	}
+	if err := m.stats.bump(ctx, m.orgID, instanceID, groupJID, counter, count, at); err != nil {
+		logf("%s counter for %s/%s: %v", counter, instanceID, groupJID, err)
+	}
+}
+
+// bumpRuntime adds to the instance's own live counters (§5.1). It is the same
+// tolerance as bumpDay and the same reason.
+func (m *manager) bumpRuntime(ctx context.Context, instanceID string, counters map[string]int64) {
+	if m.instances == nil {
+		return
+	}
+	if err := m.instances.BumpCounters(ctx, m.orgID, instanceID, counters); err != nil {
+		logf("instance counters for %s: %v", instanceID, err)
 	}
 }

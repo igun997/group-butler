@@ -1,6 +1,9 @@
 import { checkHealth, type HealthReport } from "./health";
 import { getDb } from "./mongo";
 import { listInstances, type InstanceRow } from "./repos/instances";
+import { readUsage, type UsageDay } from "./repos/usage";
+import { getWorkerScheduler } from "./worker/client";
+import type { LoopReport } from "@butler/shared";
 
 /**
  * A read that a page can render either way. Failures are values rather than
@@ -8,6 +11,10 @@ import { listInstances, type InstanceRow } from "./repos/instances";
  * down, and the page says which half is missing instead of collapsing.
  */
 export type Loaded<T> = { ok: true; data: T } | { ok: false; error: string };
+
+/** The page renders these without reaching into the modules that produced them. */
+export type { LoopReport } from "@butler/shared";
+export type { UsageCounters, UsageDay, UsageInstance, UsageTokens } from "./repos/usage";
 
 /**
  * Fixed phrases only. The console never echoes a driver message or the worker's
@@ -28,6 +35,32 @@ export async function loadHealth(): Promise<Loaded<HealthReport>> {
     return { ok: true, data: body };
   } catch {
     return { ok: false, error: "The dependency probe did not finish." };
+  }
+}
+
+/**
+ * The worker's scheduled loops (§6.5). A worker that is down or that answered
+ * something unreadable is a failure value here, so the operations page's loops
+ * section says why it is empty while the usage section below it still renders —
+ * the two halves fail independently on purpose.
+ */
+export async function loadScheduler(): Promise<Loaded<LoopReport[]>> {
+  const result = await getWorkerScheduler();
+  if (!result.ok) return { ok: false, error: result.failure.message };
+  return { ok: true, data: result.data.loops };
+}
+
+/**
+ * Today's usage (§10): the worker's counters and the assistant's calls for the
+ * current UTC day, per instance. MongoDB owns these numbers, so this read never
+ * touches the worker and stays available while it is down.
+ */
+export async function loadUsage(organizationId: string): Promise<Loaded<UsageDay>> {
+  try {
+    const db = await getDb();
+    return { ok: true, data: await readUsage(db, organizationId) };
+  } catch {
+    return { ok: false, error: "MongoDB did not answer, so today's usage could not be read." };
   }
 }
 

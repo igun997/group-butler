@@ -1,4 +1,4 @@
-import { DashboardSquare01Icon, SmartPhone01Icon } from "@hugeicons/core-free-icons";
+import { Activity01Icon, DashboardSquare01Icon, SmartPhone01Icon } from "@hugeicons/core-free-icons";
 
 export type NavItem = {
   href: string;
@@ -15,6 +15,8 @@ export type NavItem = {
 export const NAV_ITEMS: readonly NavItem[] = [
   { href: "/", label: "Overview", icon: DashboardSquare01Icon },
   { href: "/instances", label: "Instances", icon: SmartPhone01Icon },
+  // A heartbeat: what the worker is doing on a timer, and what the day has used.
+  { href: "/operations", label: "Operations", icon: Activity01Icon },
 ];
 
 /** `/` is active only on itself; every other item owns its whole subtree. */

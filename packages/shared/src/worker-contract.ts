@@ -87,6 +87,26 @@ export type InstanceSnapshot = z.infer<typeof InstanceSnapshotSchema>;
 export const InstanceListSchema = z.object({ instances: z.array(InstanceSnapshotSchema) });
 export type InstanceList = z.infer<typeof InstanceListSchema>;
 
+/**
+ * One scheduled loop as `GET /scheduler` reports it (`apps/worker/loops.go`).
+ * The worker declares each loop with its interval as it starts and records a
+ * pass after the work, so `runs` counts completed passes and `lastRunAt` is null
+ * only for a loop that has not finished one yet — "never ran" stays a fact
+ * rather than a zero time the console would have to interpret.
+ */
+export const LoopReportSchema = z.object({
+  name: z.string().min(1),
+  intervalMs: z.number().int().nonnegative(),
+  lastRunAt: z.string().nullable(),
+  lastError: z.string(),
+  runs: z.number().int().nonnegative(),
+});
+export type LoopReport = z.infer<typeof LoopReportSchema>;
+
+/** `GET /scheduler` (§6.5): what this worker's timers are doing. */
+export const SchedulerReportSchema = z.object({ loops: z.array(LoopReportSchema) });
+export type SchedulerReport = z.infer<typeof SchedulerReportSchema>;
+
 export const GroupUpdatedEventSchema = z.object({
   type: z.literal("group.updated"),
   instanceId: z.string().min(1),

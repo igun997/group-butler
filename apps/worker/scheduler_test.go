@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -147,7 +149,7 @@ func TestMediaJanitorEnqueuesPendingAttachmentsForLiveInstances(t *testing.T) {
 		storedImageCandidate(t, "offline", "3EB0JAN2"),
 	}}
 	mgr := testManagerWithDeps(newFakeGroupStore(), nil, nil)
-	mgr.media = newMediaRunner(mgr.cfg, &fakeUploader{}, store, "org_default")
+	mgr.media = newMediaRunner(mgr.cfg, &fakeUploader{}, store, "org_default", mgr)
 
 	online := testSession(mgr, newFakeClient())
 	online.status = stateConnected
@@ -171,7 +173,7 @@ func TestMediaJanitorEnqueuesPendingAttachmentsForLiveInstances(t *testing.T) {
 func TestMediaJanitorSweepsOnTick(t *testing.T) {
 	store := &fakeMediaStore{candidates: []mediaCandidate{storedImageCandidate(t, "inst_1", "3EB0JAN3")}}
 	mgr := testManagerWithDeps(newFakeGroupStore(), nil, nil)
-	mgr.media = newMediaRunner(mgr.cfg, &fakeUploader{}, store, "org_default")
+	mgr.media = newMediaRunner(mgr.cfg, &fakeUploader{}, store, "org_default", mgr)
 	ticker := newManualTicker()
 	mgr.newTicker = ticker.new
 
@@ -204,7 +206,7 @@ func TestMediaJanitorRetryLandsTheStoredStatus(t *testing.T) {
 	store := &fakeMediaStore{candidates: []mediaCandidate{storedImageCandidate(t, "inst_1", "3EB0JAN4")}}
 	mgr := testManagerWithDeps(newFakeGroupStore(), nil, nil)
 	uploader := &fakeUploader{}
-	mgr.media = newMediaRunner(mgr.cfg, uploader, store, "org_default")
+	mgr.media = newMediaRunner(mgr.cfg, uploader, store, "org_default", mgr)
 
 	client := newFakeClient()
 	client.download = pngBytes()
@@ -225,6 +227,82 @@ func TestMediaJanitorRetryLandsTheStoredStatus(t *testing.T) {
 	}
 	if saved.Width != 4 || saved.Height != 3 {
 		t.Errorf("dimensions = %dx%d, want the bytes that were downloaded", saved.Width, saved.Height)
+	}
+}
+
+// The retry path is only useful to the console if the counter moves with it:
+// this drives the janitor's queued retry end to end and reads both documents the
+// numbers live in, rather than trusting the runner to have reported.
+func TestMediaJanitorRetryCountsTheStoredAttachment(t *testing.T) {
+	store := &fakeMediaStore{candidates: []mediaCandidate{storedImageCandidate(t, "inst_1", "3EB0JAN5")}}
+	stats := &fakeDayCounters{}
+	repo := newFakeInstanceRepo()
+	mgr := testManagerWithDeps(newFakeGroupStore(), stats, nil)
+	mgr.instances = repo
+	mgr.media = newMediaRunner(mgr.cfg, &fakeUploader{}, store, "org_default", mgr)
+
+	client := newFakeClient()
+	client.download = pngBytes()
+	s := testSession(mgr, client)
+	s.status = stateConnected
+	mgr.put(s)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go mgr.media.run(ctx)
+
+	mgr.janitorSweep(ctx)
+	waitFor(t, "the stored attachment's counters", func() bool {
+		return repo.counters["inst_1"][runtimeCounterMediaStored] == 1
+	})
+
+	calls := stats.recorded()
+	if len(calls) != 1 {
+		t.Fatalf("day bumps = %d, want one for one stored attachment: %+v", len(calls), calls)
+	}
+	if calls[0].counter != dayCounterMediaStored {
+		t.Errorf("counter = %q, want %q", calls[0].counter, dayCounterMediaStored)
+	}
+	// The retry carries the group the message belongs to, so the outcome lands on
+	// the same day row the live path would have written.
+	if calls[0].groupJID != "120363043123456789@g.us" {
+		t.Errorf("group = %q, want the group the attachment was sent to", calls[0].groupJID)
+	}
+}
+
+// A sync's number describes the membership the snapshot held, so only a snapshot
+// that arrived moves it: a refused call must leave the last observed total
+// standing, never record the refusal as an empty membership (§6.6.5, R11).
+func TestGroupSyncCountsTheGroupsAPassObserved(t *testing.T) {
+	client := newFakeClient()
+	client.groups = []*types.GroupInfo{
+		groupInfo("120363043123456789", "Ops Team", 12),
+		groupInfo("120363043000000001", "Ops Team Two", 5),
+	}
+	stats := &fakeDayCounters{}
+	repo := newFakeInstanceRepo()
+	mgr := testManagerWithDeps(newFakeGroupStore(), stats, nil)
+	mgr.instances = repo
+	s := testSession(mgr, client)
+	s.status = stateConnected
+	mgr.put(s)
+
+	if err := mgr.runGroupSyncOnce(context.Background(), s, SyncOnTimer); err != nil {
+		t.Fatalf("runGroupSyncOnce: %v", err)
+	}
+	if got := repo.counters["inst_1"][runtimeCounterGroups]; got != 2 {
+		t.Fatalf("%s = %d, want the 2 groups the snapshot held", runtimeCounterGroups, got)
+	}
+
+	client.groupErr = errors.New("group sync: get joined groups: iq refused")
+	if err := mgr.runGroupSyncOnce(context.Background(), s, SyncOnTimer); err == nil {
+		t.Fatal("a refused sync must be reported")
+	}
+	if got := repo.counters["inst_1"][runtimeCounterGroups]; got != 2 {
+		t.Errorf("%s = %d, want the last snapshot's total", runtimeCounterGroups, got)
+	}
+	if got := stats.count(); got != 0 {
+		t.Errorf("day bumps = %d, want none: §10 keeps groups per instance, not per day", got)
 	}
 }
 

@@ -428,6 +428,12 @@ func (a *api) handleGroupSync(w http.ResponseWriter, r *http.Request, instanceID
 		writeError(w, http.StatusBadGateway, "group_sync_failed", err.Error())
 		return
 	}
+	// A manual sync describes the membership just as a timer-driven one does, so
+	// it moves the same counter. The harness that wires this handler without a
+	// manager (the group surface on its own) has no counters to move.
+	if a.manager != nil {
+		a.manager.recordGroups(r.Context(), instanceID, summary.Total)
+	}
 	writeJSON(w, http.StatusOK, syncResponse{OK: true, InstanceID: instanceID, SyncSummary: summary})
 }
 

@@ -1,0 +1,6 @@
+{
+  "loops": [
+    { "name": "group-sync", "intervalMs": 1800000, "lastRunAt": "2026-09-14T10:00:00.123456789Z", "lastError": "", "runs": 3 },
+    { "name": "media-janitor", "intervalMs": 300000, "lastRunAt": null, "lastError": "the WhatsApp service did not answer", "runs": 0 }
+  ]
+}

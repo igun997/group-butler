@@ -395,6 +395,14 @@ listed in `organizations.config.autoReplyAuthorizedJids`. It retrieves context
 only from that group, then creates one idempotent approved send with
 `provenance.source: "owner_mention"` and `provenance.replyToMessageId`.
 
+Every model call writes one `aiCalls` row, before the answer is decided and on
+success and failure alike: `{ organizationId, instanceId, groupJid,
+kind: "assistant", model, status: "ok" | "error", latencyMs, usage: {
+inputTokens, outputTokens, totalTokens }, createdAt }`. A token figure is `null`
+when the provider did not report it — never `0`, which would read as a free call.
+The write is best-effort: a statistics row the database refused is logged, not
+turned into a second model call or a 5xx.
+
 The worker emits WhatsApp `composing` before delivery and `paused` after it
 returns, including error paths.
 
@@ -521,6 +529,72 @@ Cancels only an `approved` or `scheduled` send. Success:
 ```ts
 { send: Send }
 ```
+
+## Operations
+
+### `GET /api/scheduler`
+
+Proxies the worker's `GET /scheduler` behind the owner session, with
+`Cache-Control: no-store`. It reports the scheduled loops this worker owns — the
+worker declares each one with its interval as it starts and records a pass after
+the work, so a loop that has not finished one yet appears with `lastRunAt: null`
+rather than being absent.
+
+```ts
+{
+  loops: Array<{
+    name: string;              // "group-sync" | "media-janitor" | "send-dispatch"
+    intervalMs: number;
+    lastRunAt: string | null;  // null until the loop has completed a pass
+    lastError: string;         // "" after a clean pass
+    runs: number;              // completed passes since this worker started
+  }>;
+}
+```
+
+An unreachable worker is `502 { "error", "code": "worker_unreachable" }`; an
+answer this dashboard cannot read is `502 { "error", "code": "internal" }`. The
+usage read below does not depend on this route, so the two sections of the
+operations page fail independently.
+
+### Server read models (no HTTP route)
+
+The usage half of the page is read through `apps/web/src/server/console.ts`,
+because MongoDB owns the numbers and the page must render them while the worker
+is down. `loadScheduler(): Promise<Loaded<LoopReport[]>>` wraps the route above,
+and `loadUsage(organizationId)` returns:
+
+```ts
+type UsageDay = {
+  day: string;                     // UTC calendar day, "YYYY-MM-DD"
+  maxTokensPerDay: number | null;  // appSettings.ai.maxTokensPerDay; null when unconfigured
+  recorded: boolean;               // whether anything at all was recorded
+  instances: Array<{
+    instanceId: string;
+    label: string;
+    recorded: boolean;             // a row of zeroes is not a day of work
+    counters: {
+      messagesIn: number;          // statsDaily.counters.messagesIn
+      mediaStored: number;
+      mediaUnparsed: number;
+      sendsOk: number;             // statsDaily.counters.sendsSent
+      sendsFailed: number;         // statsDaily.counters.sendsFailed
+      receipts: number;
+    };
+    tokens: {
+      calls: number;               // assistant aiCalls rows today
+      inputTokens: number | null;  // null ⇔ the provider reported no figure
+      outputTokens: number | null;
+      totalTokens: number | null;
+    };
+  }>;
+};
+```
+
+Loaders return values, never throws: `{ ok: true, data }` or
+`{ ok: false, error }` with a fixed phrase. A row is the organisation's live
+instances plus any instance that recorded usage today (a removal does not delete
+today's work).
 
 ## Server-sent events
 

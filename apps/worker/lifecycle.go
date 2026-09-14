@@ -568,6 +568,9 @@ func (m *manager) runGroupSyncOnce(ctx context.Context, s *session, source SyncS
 		logf("instance %s: group sync (%s): %v", s.id, source, err)
 		return err
 	}
+	// Only a snapshot that arrived describes the membership; a refused sync must
+	// leave the last observed total standing rather than counting the refusal.
+	m.recordGroups(ctx, s.id, summary.Total)
 	logf("instance %s: group sync (%s): %d group(s), %d added, %d marked left",
 		s.id, source, summary.Total, summary.Added, summary.MarkedLeft)
 	return nil

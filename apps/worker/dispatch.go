@@ -121,6 +121,10 @@ func (d *sendDispatcher) claim(ctx context.Context, now time.Time) (dispatchRequ
 func (d *sendDispatcher) deliver(ctx context.Context, mgr *manager, request dispatchRequest) error {
 	messageID, err := mgr.sendText(ctx, request)
 	if err != nil {
+		// The send is the event the counters describe, so it is counted here:
+		// the caller only logs the returned error, and a failure that nothing
+		// counted would leave the console's send success rate at 100% (§10).
+		mgr.recordSend(ctx, request.InstanceID, request.GroupJID, false, time.Now())
 		return d.failed(ctx, request.ID, classifySendFailure(err), err)
 	}
 	result, err := d.requests.UpdateOne(
@@ -141,6 +145,9 @@ func (d *sendDispatcher) deliver(ctx context.Context, mgr *manager, request disp
 	if result.MatchedCount == 0 {
 		return errors.New("send claim was lost before acknowledgement was stored")
 	}
+	// Counted once the request is stored as `sent`: the number has to describe a
+	// delivery the dispatcher also recorded, not one whose record was lost.
+	mgr.recordSend(ctx, request.InstanceID, request.GroupJID, true, time.Now())
 	return nil
 }
 

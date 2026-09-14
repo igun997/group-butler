@@ -2,8 +2,10 @@ import { timingSafeEqual } from "node:crypto";
 import { NextResponse } from "next/server";
 import { COLLECTIONS } from "../../../../server/collections";
 import { getDb } from "../../../../server/mongo";
+import type { Db } from "mongodb";
+import { NO_TOKEN_USAGE, writeAiCall, type AiCallRow } from "../../../../server/repos/ai-calls";
 import { createAutomaticSend } from "../../../../server/repos/sends";
-import { generateGroupReply } from "../../../../server/replies/generate";
+import { generateGroupReply, replyModelConfig, type GeneratedReply } from "../../../../server/replies/generate";
 
 export const runtime = "nodejs";
 
@@ -12,6 +14,20 @@ interface ReplyJobRequest {
   instanceId: string;
   groupJid: string;
   waMessageId: string;
+}
+
+/**
+ * Records one model call, swallowing a failed write. The call has already
+ * happened by the time this runs, so a statistics row the database refused must
+ * not become a second call, a lost reply, or a 5xx to the worker that asked;
+ * it is logged instead.
+ */
+async function recordCall(db: Db, row: AiCallRow): Promise<void> {
+  try {
+    await writeAiCall(db, row);
+  } catch (error) {
+    console.error("model call record failed", error);
+  }
 }
 
 function sameSecret(value: string | null, secret: string | undefined): boolean {
@@ -79,25 +95,50 @@ export async function POST(request: Request) {
     .limit(20)
     .toArray();
 
+  const startedAt = Date.now();
+  let reply: GeneratedReply | null = null;
   try {
-    const text = await generateGroupReply({
+    reply = await generateGroupReply({
       prompt: message.text,
       history: history
         .filter((row) => row.senderJid && row.text && row.timestamp instanceof Date)
         .map((row) => ({ senderJid: row.senderJid!, text: row.text!, timestamp: row.timestamp! }))
         .reverse(),
     });
+  } catch (error) {
+    console.error("automatic reply generation failed", error);
+  }
+
+  // One row per model call, on success and on failure alike (§10): a failed call
+  // is what the console's token figures and success rate are made of, so it is
+  // recorded before the answer is decided. Recording is best-effort — a
+  // statistics write must not turn a call the provider already made into a
+  // second one — and a config with no model has no model to name.
+  await recordCall(db, {
+    organizationId: body.organizationId,
+    instanceId: body.instanceId,
+    groupJid: body.groupJid,
+    kind: "assistant",
+    model: reply?.model ?? replyModelConfig()?.model ?? "",
+    status: reply ? "ok" : "error",
+    latencyMs: Date.now() - startedAt,
+    usage: reply?.usage ?? NO_TOKEN_USAGE,
+    createdAt: new Date(),
+  });
+  if (!reply) return NextResponse.json({ error: "automatic reply generation failed" }, { status: 502 });
+
+  try {
     const send = await createAutomaticSend(db, {
       organizationId: body.organizationId,
       instanceId: body.instanceId,
       groupJid: body.groupJid,
-      text,
+      text: reply.text,
       idempotencyKey: `owner-mention:${body.instanceId}:${body.waMessageId}`,
       replyToMessageId: body.waMessageId,
     });
     return NextResponse.json({ send }, { status: 201, headers: { "cache-control": "no-store" } });
   } catch (error) {
-    console.error("automatic reply generation failed", error);
+    console.error("automatic reply send creation failed", error);
     return NextResponse.json({ error: "automatic reply generation failed" }, { status: 502 });
   }
 }

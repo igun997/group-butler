@@ -732,6 +732,7 @@ type instanceRepo interface {
 	SetStatus(ctx context.Context, orgID, id string, status sessionState, pairingError string) error
 	SetConnected(ctx context.Context, orgID, id, phoneNumber, botJID, botLID string) error
 	BumpCounters(ctx context.Context, orgID, id string, counters map[string]int64) error
+	SetCounter(ctx context.Context, orgID, id, name string, value int64) error
 	SoftDelete(ctx context.Context, orgID, id string) error
 }
 
@@ -919,6 +920,20 @@ func (r *instanceMongo) BumpCounters(ctx context.Context, orgID, id string, coun
 	}
 	if _, err := r.coll.UpdateOne(ctx, liveInstanceFilter(orgID, id), bson.D{{Key: "$inc", Value: increments}}); err != nil {
 		return fmt.Errorf("bump instance counters %s: %w", id, err)
+	}
+	return nil
+}
+
+// SetCounter writes a counter that measures a state rather than a tally of
+// events — `groups` is the membership the last sync observed, so it is set
+// rather than added. Same one-writer rule as BumpCounters: a removed instance is
+// not counted at all.
+func (r *instanceMongo) SetCounter(ctx context.Context, orgID, id, name string, value int64) error {
+	_, err := r.coll.UpdateOne(ctx, liveInstanceFilter(orgID, id), bson.D{
+		{Key: "$set", Value: bson.D{{Key: "runtime.counters." + name, Value: value}}},
+	})
+	if err != nil {
+		return fmt.Errorf("set instance counter %s for %s: %w", name, id, err)
 	}
 	return nil
 }

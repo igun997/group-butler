@@ -75,6 +75,19 @@ func (r *fakeInstanceRepo) BumpCounters(_ context.Context, orgID, id string, cou
 	return nil
 }
 
+func (r *fakeInstanceRepo) SetCounter(_ context.Context, _, id, name string, value int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.counters == nil {
+		r.counters = map[string]map[string]int64{}
+	}
+	if r.counters[id] == nil {
+		r.counters[id] = map[string]int64{}
+	}
+	r.counters[id][name] = value
+	return nil
+}
+
 func (r *fakeInstanceRepo) Create(_ context.Context, row InstanceRow) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -220,6 +233,7 @@ type fakeClient struct {
 	logoutErr   error
 	groups      []*types.GroupInfo
 	groupCalls  int
+	groupErr    error
 	download    []byte
 }
 
@@ -273,7 +287,7 @@ func (c *fakeClient) GetJoinedGroups(context.Context) ([]*types.GroupInfo, error
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.groupCalls++
-	return c.groups, nil
+	return c.groups, c.groupErr
 }
 
 func (c *fakeClient) groupCallCount() int {

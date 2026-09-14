@@ -763,6 +763,15 @@ type mediaJob struct {
 	client whatsmeowMediaClient
 }
 
+// mediaSink is where a finished attachment is reported so it reaches the
+// counters §10 reads. The runner owns download and upload, the manager owns the
+// numbers, and taking the sink in the constructor rather than looking it up
+// later keeps "an outcome nobody counted" a compile error rather than a silent
+// nil.
+type mediaSink interface {
+	recordMedia(ctx context.Context, doc MessageDoc, media Media)
+}
+
 // mediaRunner is the §6.2 bounded queue: MEDIA_CONCURRENCY workers, a bounded
 // buffer, and an overflow that logs rather than growing without bound. It is
 // nil when media is not configured, which the handler treats as "not this
@@ -771,13 +780,14 @@ type mediaRunner struct {
 	limits   *mediaLimits
 	uploader mediaUploader
 	store    mediaStore
+	sink     mediaSink
 	orgID    string
 	workers  int
 	jobs     chan mediaJob
 }
 
-func newMediaRunner(cfg Config, uploader mediaUploader, store mediaStore, orgID string) *mediaRunner {
-	if uploader == nil || store == nil {
+func newMediaRunner(cfg Config, uploader mediaUploader, store mediaStore, orgID string, sink mediaSink) *mediaRunner {
+	if uploader == nil || store == nil || sink == nil {
 		return nil
 	}
 	workers := cfg.MediaConcurrency
@@ -788,6 +798,7 @@ func newMediaRunner(cfg Config, uploader mediaUploader, store mediaStore, orgID 
 		limits:   newMediaLimits(cfg),
 		uploader: uploader,
 		store:    store,
+		sink:     sink,
 		orgID:    orgID,
 		workers:  workers,
 		jobs:     make(chan mediaJob, workers*8),
@@ -844,6 +855,9 @@ func (r *mediaRunner) attempt(ctx context.Context, job mediaJob) {
 	if err := r.store.saveMedia(writeCtx, job.doc, media); err != nil {
 		logf("media %s: persist result: %v", job.doc.WaMessageID, err)
 	}
+	// Counted after the write: the §10 numbers describe media that is recorded,
+	// not a download whose result never reached the database.
+	r.sink.recordMedia(writeCtx, job.doc, media)
 }
 
 // ---- media janitor -------------------------------------------------------
@@ -898,6 +912,9 @@ func (m *manager) janitorSweep(ctx context.Context) error {
 				OrganizationID: candidate.OrganizationID,
 				InstanceID:     candidate.InstanceID,
 				WaMessageID:    candidate.WaMessageID,
+				// The group travels with the retry so the outcome is counted on
+				// the same day row the live path would have used.
+				GroupJID: candidate.GroupJID,
 			},
 			desc:   desc,
 			client: client,

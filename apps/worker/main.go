@@ -99,7 +99,7 @@ func run() error {
 	mgr.ping = func(ctx context.Context) error { return client.Ping(ctx, nil) }
 	// Media is enabled only by present R2 credentials; nil keeps every
 	// attachment `pending` rather than pretending it was stored (R3).
-	mgr.media = mediaRunnerFor(cfg, messages, cfg.OrganizationID)
+	mgr.media = mediaRunnerFor(cfg, messages, cfg.OrganizationID, mgr)
 	if mgr.media != nil {
 		start(func() { mgr.media.run(ctx) })
 	}
@@ -132,12 +132,13 @@ func run() error {
 // interface: a nil *r2Client converted to that interface is *non-nil*, and a
 // runner built from it would start the janitor against an uploader that panics
 // on the first attachment. Nil here means "this build does not store media".
-func mediaRunnerFor(cfg Config, messages mediaStore, orgID string) *mediaRunner {
+// `sink` is the manager, which owns the §10 counters the outcome has to reach.
+func mediaRunnerFor(cfg Config, messages mediaStore, orgID string, sink mediaSink) *mediaRunner {
 	uploader := newR2(cfg)
 	if uploader == nil {
 		return nil
 	}
-	return newMediaRunner(cfg, uploader, messages, orgID)
+	return newMediaRunner(cfg, uploader, messages, orgID, sink)
 }
 
 // awaitShutdown runs the HTTP server until it fails or ctx is cancelled, then

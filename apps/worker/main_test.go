@@ -128,7 +128,8 @@ func TestSignalShutdownDrainsWorkersAndDisconnects(t *testing.T) {
 // would run the media pipeline (and its janitor) with no uploader at all.
 func TestMediaRunnerForIsNilWithoutR2(t *testing.T) {
 	store := &fakeMediaStore{}
-	if runner := mediaRunnerFor(Config{}, store, "org_default"); runner != nil {
+	counters := &manager{}
+	if runner := mediaRunnerFor(Config{}, store, "org_default", counters); runner != nil {
 		t.Fatal("media storage must stay disabled when R2 is not configured")
 	}
 
@@ -146,7 +147,12 @@ func TestMediaRunnerForIsNilWithoutR2(t *testing.T) {
 		MediaConcurrency: 1, MediaMaxBytes: 1 << 20, MediaDownloadTimeout: time.Second,
 		IngestQueueSize: 1, EventQueueSize: 1, EventWorkers: 1,
 	}
-	if runner := mediaRunnerFor(configured, store, "org_default"); runner == nil {
+	if runner := mediaRunnerFor(configured, store, "org_default", counters); runner == nil {
 		t.Fatal("media storage must be enabled when R2 is fully configured")
+	}
+	// A runner with nowhere to report its outcome would persist media that no
+	// console can count, so it is not built at all.
+	if runner := mediaRunnerFor(configured, store, "org_default", nil); runner != nil {
+		t.Fatal("a runner with no counter sink must not be built")
 	}
 }

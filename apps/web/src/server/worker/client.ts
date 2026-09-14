@@ -1,5 +1,5 @@
-import type { GroupSyncSummary, InstanceList, InstanceSnapshot } from "@butler/shared";
-import { GroupSyncSummarySchema, InstanceListSchema, InstanceSnapshotSchema } from "@butler/shared";
+import type { GroupSyncSummary, InstanceList, InstanceSnapshot, SchedulerReport } from "@butler/shared";
+import { GroupSyncSummarySchema, InstanceListSchema, InstanceSnapshotSchema, SchedulerReportSchema } from "@butler/shared";
 import { z } from "zod";
 
 /**
@@ -268,6 +268,15 @@ export function workerFailureResponse(failure: WorkerFailure): Response {
 /** `GET /instances` (§6.5): every instance's live session snapshot. */
 export function listWorkerInstances(): Promise<WorkerResult<InstanceList>> {
   return callWorker({ segments: ["instances"], schema: InstanceListSchema });
+}
+
+/**
+ * `GET /scheduler` (§6.5): the cadence and last outcome of each loop this worker
+ * runs. It answers from the loop registry rather than from stored state, so a
+ * worker with no loop started yet answers an empty list rather than an error.
+ */
+export function getWorkerScheduler(): Promise<WorkerResult<SchedulerReport>> {
+  return callWorker({ segments: ["scheduler"], schema: SchedulerReportSchema });
 }
 
 /** `POST /instances` (§6.5): create the row and begin pairing. */

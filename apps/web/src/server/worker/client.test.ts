@@ -5,6 +5,7 @@ import {
   callWorker,
   createWorkerInstance,
   getWorkerInstance,
+  getWorkerScheduler,
   listWorkerInstances,
   requestWorkerGroupSync,
   requestWorkerPairingCode,
@@ -281,6 +282,30 @@ describe("typed worker endpoints", () => {
       expect(await requestWorkerGroupSync(instance.id)).toEqual({
         ok: false,
         failure: { status: 502, code: "group_sync_failed", message: expect.any(String) },
+      });
+    });
+  });
+
+  test("reads the scheduled loops with their cadence and last pass", async () => {
+    const loops = {
+      loops: [
+        { name: "group-sync", intervalMs: 1_800_000, lastRunAt: "2026-09-14T10:00:00.123Z", lastError: "", runs: 3 },
+        { name: "media-janitor", intervalMs: 300_000, lastRunAt: null, lastError: "", runs: 0 },
+      ],
+    };
+    await withWorker(answer(200, loops), async (worker) => {
+      const result = await getWorkerScheduler();
+
+      expect(result).toEqual({ ok: true, data: loops });
+      expect(worker.requests[0]).toMatchObject({ method: "GET", url: "/scheduler" });
+    });
+  });
+
+  test("rejects a loop report this dashboard cannot read", async () => {
+    await withWorker(answer(200, { loops: [{ name: "group-sync", runs: 1 }] }), async () => {
+      expect(await getWorkerScheduler()).toEqual({
+        ok: false,
+        failure: { status: 502, code: "internal", message: expect.any(String) },
       });
     });
   });

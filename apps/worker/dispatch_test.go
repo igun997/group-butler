@@ -96,3 +96,55 @@ func TestDispatcherDoesNotClaimFutureSchedule(t *testing.T) {
 		t.Fatalf("attempts = %v, want %v", got, want)
 	}
 }
+
+// The send numbers the console shows are written by the dispatch path itself, in
+// both directions: this drives a due claim for a connected instance and one for
+// an instance with no live session, and reads the counters each produced.
+func TestDispatcherCountsBothSendOutcomes(t *testing.T) {
+	dispatcher, mgr, ctx := newTestDispatcher(t)
+	stats := &fakeDayCounters{}
+	repo := newFakeInstanceRepo()
+	mgr.stats = stats
+	mgr.instances = repo
+
+	seed := func(id, instanceID string) {
+		t.Helper()
+		_, err := dispatcher.requests.InsertOne(ctx, bson.M{
+			"id": id, "organizationId": "org_default", "instanceId": instanceID,
+			"groupJid": "120363043123456789@g.us", "text": "Ship it", "status": "approved", "scheduledFor": time.Now().UTC(),
+			"dispatch": bson.M{"attempts": 0, "lockedAt": nil, "lockedBy": nil},
+		})
+		if err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	seed("send_ok", "inst_1")
+	// No session for this id: the dispatcher's own offline classification is the
+	// failure path a real deployment hits on a disconnected phone.
+	seed("send_failed", "inst_gone")
+
+	if err := dispatcher.dispatchDue(ctx, mgr); err != nil {
+		t.Fatalf("dispatchDue: %v", err)
+	}
+
+	if got := repo.counters["inst_1"][runtimeCounterSendOk]; got != 1 {
+		t.Errorf("%s = %d, want 1 for the acknowledged send", runtimeCounterSendOk, got)
+	}
+	if got := repo.counters["inst_gone"][runtimeCounterSendFailed]; got != 1 {
+		t.Errorf("%s = %d, want 1 for the refused send", runtimeCounterSendFailed, got)
+	}
+
+	counters := map[string]int64{}
+	for _, call := range stats.recorded() {
+		if call.groupJID != "120363043123456789@g.us" {
+			t.Errorf("group = %q, want the group the send went to", call.groupJID)
+		}
+		counters[call.counter] += call.count
+	}
+	if counters[dayCounterSendsSent] != 1 {
+		t.Errorf("%s = %d, want 1", dayCounterSendsSent, counters[dayCounterSendsSent])
+	}
+	if counters[dayCounterSendsFailed] != 1 {
+		t.Errorf("%s = %d, want 1", dayCounterSendsFailed, counters[dayCounterSendsFailed])
+	}
+}

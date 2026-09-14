@@ -7,6 +7,7 @@ import {
   InstanceGroupListSchema,
   InstanceListSchema,
   InstanceSnapshotSchema,
+  SchedulerReportSchema,
 } from "../src/worker-contract";
 // Imported through the package entry point, exactly as a consumer (the BFF)
 // does: this is what proves the contract is actually re-exported from ../src/index.
@@ -56,6 +57,15 @@ describe("worker contract schemas", () => {
     // The worker omits pairing material outside a pairing session (omitempty).
     expect(parsed.qr).toBeUndefined();
     expect(parsed.pairingCode).toBeUndefined();
+  });
+
+  test("parses the scheduler report, a never-run loop included", () => {
+    const parsed = SchedulerReportSchema.parse(read("scheduler-loops.json"));
+    expect(parsed.loops).toHaveLength(2);
+    expect(parsed.loops[0]).toMatchObject({ name: "group-sync", intervalMs: 1_800_000, runs: 3, lastError: "" });
+    // A loop that has not finished a pass reports `null`, not the zero time.
+    expect(parsed.loops[1]!.lastRunAt).toBeNull();
+    expect(parsed.loops[1]!.lastError).toBe("the WhatsApp service did not answer");
   });
 });
 
