@@ -136,9 +136,9 @@ need bun
 need go
 
 # Each child gets its own process group (setsid) so one signal reaches `go run`
-# AND the compiled binary it spawns. Output goes through a FIFO so the prefixing
-# happens here — which also covers `go run` compile errors — without putting a
-# child inside a pipeline whose exit status we would lose.
+# and its compiled worker process. Output goes through a FIFO so prefixing also
+# covers Go compilation errors without placing a child in a pipeline whose exit
+# status we would lose.
 RUNDIR="$(mktemp -d "${TMPDIR:-/tmp}/butler-dev.XXXXXX")"
 CHILD_PIDS=()
 LOGGER_PIDS=()
@@ -224,6 +224,10 @@ start_child() {
   CHILD_PIDS+=("$!")
   log "started [$name] pid=$!"
 }
+
+# Run through Go rather than a prebuilt binary. This keeps compilation and
+# supervision in the same child process, and it runs from apps/worker because
+# the dev whatsmeow store is relative to that working directory.
 
 start_child web bun run --cwd "$ROOT/apps/web" dev
 start_child worker bash -c "cd '$ROOT/apps/worker' && exec go run ./..."

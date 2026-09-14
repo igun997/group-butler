@@ -134,10 +134,17 @@ while true; do sleep 0.2; done
 `,
   );
 
+  // `go run ./...` is the worker process itself. It must run from apps/worker so
+  // its relative whatsmeow store remains associated with the dev session.
   write(
     "go",
     `#!/usr/bin/env bash
 echo "go $*" >> "$STUB_STATE/invocations"
+if [[ "\${1:-}" != run || "\${2:-}" != ./... ]]; then
+  echo "stub go: expected 'go run ./...', got: $*" >&2
+  exit 91
+fi
+echo "$PWD" > "$STUB_STATE/worker.cwd"
 echo "$$" > "$STUB_STATE/worker.pid"
 trap 'echo worker-signal >> "$STUB_STATE/child_signals"; exit 143' TERM INT
 echo "[worker] stub worker started"
@@ -298,7 +305,8 @@ describe("dev launcher: --check is validation only", () => {
     expect(res.stdout).toContain("check ok");
     const inv = fx.invocations();
     expect(inv.some((l) => l.includes("bun run --cwd"))).toBe(false);
-    expect(inv.some((l) => l.includes("go run"))).toBe(false);
+    expect(inv.some((l) => l.startsWith("go build"))).toBe(false);
+    expect(inv.some((l) => l.startsWith("worker-bin"))).toBe(false);
     expect(inv.some((l) => l.startsWith("docker") && l.includes(" up "))).toBe(true);
   });
 
@@ -323,10 +331,15 @@ describe("dev launcher: run mode", () => {
     const inv = fx.invocations();
     const upIndex = inv.findIndex((l) => l.startsWith("docker") && l.includes(" up "));
     const webIndex = inv.findIndex((l) => l.startsWith("bun run --cwd"));
-    const workerIndex = inv.findIndex((l) => l.startsWith("go "));
+    const workerIndex = inv.findIndex((l) => l === "go run ./...");
     expect(upIndex).toBeGreaterThanOrEqual(0);
     expect(webIndex).toBeGreaterThan(upIndex);
     expect(workerIndex).toBeGreaterThanOrEqual(0);
+
+    // The worker is run directly through Go, not compiled into a local binary.
+    expect(inv.some((l) => l.startsWith("go build"))).toBe(false);
+    expect(workerIndex).toBeGreaterThan(webIndex);
+    expect(readFileSyncIfPresent(join(fx.state, "worker.cwd"))?.trim()).toBe(join(fx.dir, "apps", "worker"));
 
     // The web app is started through the workspace script with the corrected Bun ordering.
     expect(inv[webIndex]).toContain("bun run --cwd");
