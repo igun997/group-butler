@@ -75,7 +75,7 @@ export function ResourceGate<D, P = unknown>({
             ? "error"
             : "ready";
 
-  let surface: ReactNode = null;
+  let surface: ReactNode;
   if (view.tier === "error") {
     // R-X2: the failure is inline in this panel and keeps its own recovery, and
     // the failed call it re-runs is exactly this read (R-X4).

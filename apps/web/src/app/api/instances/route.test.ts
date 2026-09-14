@@ -1,5 +1,4 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
-import { UnauthorizedError } from "../../../server/auth/owner";
 import { issueSession } from "../../../server/auth/session";
 import { jsonAnswer, truncatedAnswer, withStubWorker } from "../../../server/worker/test-helpers";
 import { GET, POST } from "./route";

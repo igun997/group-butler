@@ -343,29 +343,3 @@ function toastFor(origin: FailureOrigin, copy: ErrorCopy): ToastDisposition {
   if (copy.action === undefined) return "owns";
   return copy.action.also === true ? "also" : "never";
 }
-
-/**
- * Whether the failed call may simply be run again. A read is idempotent by
- * construction; a state transition is not, so only the codes the service
- * refuses *before* changing anything answer true (R-X4). An unrecognised
- * failure never does, and neither does one with a home of its own — its
- * retry belongs to that surface, not to a blind re-issue.
- */
-function readRetryable(signal: FailureSignal): boolean {
-  if (signal.errorClass !== undefined) return signal.errorClass === "transport" || signal.errorClass === "rejected";
-  if (signal.runtimeStatus !== undefined) return false;
-  switch (signal.code) {
-    case "internal":
-    case "store_error":
-    case "encode_error":
-    case "group_sync_failed":
-    case "timeout":
-    case "network":
-    case "offline":
-    case "mongo_unreachable":
-    case "worker_unreachable":
-      return true;
-    default:
-      return false;
-  }
-}

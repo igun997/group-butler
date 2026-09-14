@@ -4,7 +4,6 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { EmptyPlan, ResourceDescriptor, Scope } from "../registry";
 import { resourceCache, resourceKey } from "./cache";
 import { ResourceGate } from "./resource-gate";
-import { useResource } from "./use-resource";
 import {
   STREAM_PATH,
   STREAM_POLL_MS,

@@ -1,7 +1,7 @@
 "use client";
 
 import type { GroupState } from "@butler/shared";
-import { type MouseEvent, type ReactNode, useCallback, useId, useRef, useState } from "react";
+import { type MouseEvent, useCallback, useId, useRef, useState } from "react";
 import type { Scope } from "../ui/registry";
 import { trapTabKey } from "./focus-trap";
 import { GroupNameCell, type GroupNameSource } from "./group-name-cell";

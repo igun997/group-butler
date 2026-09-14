@@ -103,7 +103,7 @@ export interface GridSpan {
  * gives it the lookup and the generics; here it is the key a panel or an action
  * names.
  */
-export interface ResourceRef<D = unknown, P = unknown> {
+export interface ResourceRef {
   readonly id: string;
 }
 
