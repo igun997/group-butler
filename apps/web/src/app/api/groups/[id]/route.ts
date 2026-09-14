@@ -1,0 +1,86 @@
+import { z } from "zod";
+import { UnauthorizedError, requireOwner } from "../../../../server/auth/owner";
+import { getDb } from "../../../../server/mongo";
+import { updateGroupConfig } from "../../../../server/repos/groups";
+
+/**
+ * §7.3 `PATCH /api/groups/[id]`: the group's BFF-owned configuration. `[id]` is
+ * the full `<id>@g.us`, and this is where the dashboard's assign and whitelist
+ * toggles land (P5).
+ *
+ * Two properties are deliberate:
+ *
+ * - **The allowlist is narrow.** Only `assigned` and `whitelisted` (plus the
+ *   optional `instanceId` selector) may be written, and an unknown field is a
+ *   400 rather than something quietly dropped. Nothing here touches the
+ *   worker-owned `observed.*` half of the document, so a config edit can never
+ *   race a rename or a sync into a lost update.
+ * - **No worker call.** These flags are the dashboard's own data, and the
+ *   worker neither reads nor needs them, so a group stays assignable while its
+ *   instance is offline.
+ */
+
+const PatchSchema = z
+  .strictObject({
+    assigned: z.boolean().optional(),
+    whitelisted: z.boolean().optional(),
+    instanceId: z.string().trim().min(1).optional(),
+  })
+  .refine((patch) => patch.assigned !== undefined || patch.whitelisted !== undefined, {
+    message: "assigned or whitelisted is required",
+  });
+
+export async function PATCH(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> },
+): Promise<Response> {
+  let organizationId: string;
+  try {
+    ({ organizationId } = await requireOwner());
+  } catch (error) {
+    if (!(error instanceof UnauthorizedError)) throw error;
+    return Response.json(
+      { error: "unauthorized" },
+      { status: 401, headers: { "cache-control": "no-store" } },
+    );
+  }
+  const noStore = { "cache-control": "no-store" } as const;
+
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return Response.json(
+      { error: "the request body must be JSON", code: "invalid_request" },
+      { status: 400, headers: noStore },
+    );
+  }
+  const patch = PatchSchema.safeParse(body);
+  if (!patch.success) {
+    return Response.json(
+      { error: patch.error.issues[0]?.message ?? "the patch is not valid", code: "invalid_request" },
+      { status: 400, headers: noStore },
+    );
+  }
+
+  const { id } = await params;
+  const db = await getDb();
+  const result = await updateGroupConfig(db, organizationId, id, patch.data);
+
+  switch (result.kind) {
+    case "updated":
+      return Response.json({ group: result.group }, { headers: noStore });
+    case "not_found":
+      // Another organisation's group and a group that is not here are the same
+      // answer, so this route cannot be used to enumerate other tenants.
+      return Response.json({ error: "not found", code: "not_found" }, { status: 404, headers: noStore });
+    case "ambiguous":
+      return Response.json(
+        {
+          error: "this group id exists on more than one instance; send instanceId to choose one",
+          code: "invalid_request",
+        },
+        { status: 409, headers: noStore },
+      );
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "instances": [
+    { "id": "J9tZtOgQ8o5eIr0Amygb2", "label": "Support bot", "mode": "code", "status": "pairing",
+      "phoneNumber": "628990000001", "createdAt": "2026-09-14T01:17:41.497553887Z" },
+    { "id": "V1StGXR8_Z5jdHi6B-myT", "label": "Ops bot", "mode": "qr", "status": "connected",
+      "phoneNumber": "628990000002", "botJid": "628990000002@s.whatsapp.net", "botLid": "100000000000001@lid",
+      "connectedAt": "2026-09-12T09:30:00Z", "lastSeenAt": "2026-09-14T01:05:00Z", "createdAt": "2026-09-01T08:00:00Z" }
+  ]
+}

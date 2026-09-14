@@ -75,7 +75,12 @@ function stamp(value: Date | undefined): string | null {
   return Number.isFinite(time) && time > NO_STAMP_MS ? value.toISOString() : null;
 }
 
-function toRow(doc: GroupDoc): GroupRow {
+/**
+ * One stored group as the dashboard's row. Exported because the mutation route
+ * answers the row it just wrote: the live patch and the read can never drift
+ * apart that way.
+ */
+export function toRow(doc: GroupDoc): GroupRow {
   const observed = doc.observed ?? {};
   const config = doc.config ?? {};
   const subject = observed.subject ?? "";
@@ -136,4 +141,67 @@ async function instanceLabels(db: Db, organizationId: string): Promise<Record<st
   const labels: Record<string, string> = Object.create(null);
   for (const doc of docs) labels[doc._id] = doc.label ?? "";
   return labels;
+}
+
+/**
+ * The BFF-owned fields of `groups.config` a mutation may write (§7.3). The
+ * worker owns `observed.*` and never reads these, so the two writers cannot
+ * overwrite each other's half of the document.
+ */
+export interface GroupConfigPatch {
+  assigned?: boolean;
+  whitelisted?: boolean;
+  /**
+   * Disambiguates a JID that exists on more than one instance of the
+   * organisation. Only ever a selector: it is matched against stored group rows,
+   * never trusted as a scope of its own.
+   */
+  instanceId?: string;
+}
+
+/** The outcome of a config write: one row updated, or why it was refused. */
+export type GroupConfigUpdate =
+  | { kind: "updated"; group: GroupRow }
+  | { kind: "not_found" }
+  | { kind: "ambiguous" };
+
+/**
+ * Writes `assigned`/`whitelisted` on one group of one organisation.
+ *
+ * The group JID is the addressing key, and a JID can legitimately exist under
+ * two instances (the same group joined by two linked accounts). Rather than
+ * silently writing both, this resolves the target first: an unqualified JID that
+ * matches more than one instance is refused, so the caller must say which
+ * instance it means.
+ */
+export async function updateGroupConfig(
+  db: Db,
+  organizationId: string,
+  groupJid: string,
+  patch: GroupConfigPatch,
+): Promise<GroupConfigUpdate> {
+  const groups = db.collection<GroupDoc>(COLLECTIONS.groups);
+  const matched = await groups
+    .find(
+      { organizationId, groupJid, ...(patch.instanceId === undefined ? {} : { instanceId: patch.instanceId }) },
+      { projection: { instanceId: 1 } },
+    )
+    .toArray();
+  if (matched.length === 0) return { kind: "not_found" };
+
+  const instanceIds = new Set(matched.map((doc) => doc.instanceId));
+  if (instanceIds.size > 1) return { kind: "ambiguous" };
+  const [instanceId] = [...instanceIds];
+
+  const changes: Record<string, boolean> = {};
+  if (patch.assigned !== undefined) changes["config.assigned"] = patch.assigned;
+  if (patch.whitelisted !== undefined) changes["config.whitelisted"] = patch.whitelisted;
+
+  const updated = await groups.findOneAndUpdate(
+    { organizationId, instanceId, groupJid },
+    { $set: changes },
+    { returnDocument: "after" },
+  );
+  if (!updated) return { kind: "not_found" };
+  return { kind: "updated", group: toRow(updated) };
 }

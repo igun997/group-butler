@@ -5,11 +5,13 @@ import {
   GroupUpdatedEventSchema,
   GroupSyncSummarySchema,
   InstanceGroupListSchema,
+  InstanceListSchema,
+  InstanceSnapshotSchema,
 } from "../src/worker-contract";
 // Imported through the package entry point, exactly as a consumer (the BFF)
 // does: this is what proves the contract is actually re-exported from ../src/index.
 import * as shared from "../src/index";
-import type { GroupSyncSummary, GroupUpdatedEvent, InstanceGroup } from "../src/index";
+import type { GroupSyncSummary, GroupUpdatedEvent, InstanceGroup, InstanceSnapshot } from "../src/index";
 
 const read = (name: string) => JSON.parse(readFileSync(join(import.meta.dir, "../testdata", name), "utf8"));
 
@@ -38,6 +40,23 @@ describe("worker contract schemas", () => {
     expect(parsed.changes).toEqual(["subject"]);
     expect(parsed.previousName).toBe("Support");
   });
+
+  test("parses a real instances list payload", () => {
+    const parsed = InstanceListSchema.parse(read("instances-list.json"));
+    expect(parsed.instances).toHaveLength(2);
+    expect(parsed.instances[0]!.id).toBe("J9tZtOgQ8o5eIr0Amygb2");
+    expect(parsed.instances[0]!.status).toBe("pairing");
+    expect(parsed.instances[1]!.connectedAt).toBe("2026-09-12T09:30:00Z");
+  });
+
+  test("parses one instance snapshot, pairing material included", () => {
+    const parsed = InstanceSnapshotSchema.parse(read("instance-snapshot.json"));
+    expect(parsed.status).toBe("connected");
+    expect(parsed.botLid).toBe("100000000000001@lid");
+    // The worker omits pairing material outside a pairing session (omitempty).
+    expect(parsed.qr).toBeUndefined();
+    expect(parsed.pairingCode).toBeUndefined();
+  });
 });
 
 describe("worker contract: discrimination and boundaries", () => {
@@ -65,6 +84,14 @@ describe("worker contract: discrimination and boundaries", () => {
     expect(() => InstanceGroupListSchema.parse({ groups: [] })).toThrow();
     expect(() => GroupSyncSummarySchema.parse({ ...read("groups-sync-summary.json"), instanceId: "" })).toThrow();
   });
+
+  test("rejects an instance whose status or pairing mode is outside the vocabulary", () => {
+    const instance = read("instance-snapshot.json");
+    expect(() => InstanceSnapshotSchema.parse({ ...instance, status: "syncing" })).toThrow();
+    expect(() => InstanceSnapshotSchema.parse({ ...instance, mode: "sms" })).toThrow();
+    expect(() => InstanceSnapshotSchema.parse({ ...instance, id: "" })).toThrow();
+    expect(() => InstanceListSchema.parse({ instances: [{ ...instance, status: "unknown" }] })).toThrow();
+  });
 });
 
 describe("worker contract: the package entry point", () => {
@@ -72,9 +99,11 @@ describe("worker contract: the package entry point", () => {
     const groups: InstanceGroup[] = shared.InstanceGroupListSchema.parse(read("groups-list.json")).groups;
     const summary: GroupSyncSummary = shared.GroupSyncSummarySchema.parse(read("groups-sync-summary.json"));
     const event: GroupUpdatedEvent = shared.GroupUpdatedEventSchema.parse(read("group-updated-event.json"));
+    const instance: InstanceSnapshot = shared.InstanceSnapshotSchema.parse(read("instance-snapshot.json"));
 
     expect(groups[0]!.groupJid).toBe("120363043123456789@g.us");
     expect(summary.source).toBe("manual");
     expect(event.type).toBe("group.updated");
+    expect(instance.label).toBe("Ops bot");
   });
 });

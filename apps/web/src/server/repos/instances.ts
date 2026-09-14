@@ -94,3 +94,15 @@ export async function getInstanceRuntime(
   if (!doc) return null;
   return { status: doc.runtime?.status ?? "disconnected", groupSync: groupSyncOf(doc.runtime) };
 }
+
+/**
+ * Whether this instance is the organisation's. It is the tenant boundary the
+ * instance-scoped proxy routes check before they let an id in a path reach the
+ * worker as a control command (§7.3).
+ */
+export async function instanceInOrg(db: Db, organizationId: string, instanceId: string): Promise<boolean> {
+  const found = await db
+    .collection<InstanceDoc>(COLLECTIONS.instances)
+    .countDocuments({ _id: instanceId, organizationId }, { limit: 1 });
+  return found > 0;
+}
