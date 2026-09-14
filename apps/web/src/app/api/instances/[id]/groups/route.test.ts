@@ -92,6 +92,32 @@ describe("GET /api/instances/[id]/groups", () => {
     });
   });
 
+  test("carries the rename ring, so the chip and the sheet read one fact", async () => {
+    await insertGroup({
+      organizationId: "org_default",
+      instanceId: "inst_5",
+      groupJid: "120363048888888888@g.us",
+      subject: "Ops Team 2",
+      subjectSource: "event",
+      subjectUpdatedAt: new Date("2026-09-14T09:00:00Z"),
+      subjectSetBy: "4915112345678",
+      subjectHistory: [
+        { name: "Ops Team", at: new Date("2026-09-13T08:12:00Z"), by: "4915112345678" },
+        { name: "Ops", at: new Date("2026-09-01T08:00:00Z"), by: "" },
+      ],
+    });
+
+    const body = await (await getGroups("inst_5")).json();
+    const [row] = body.groups;
+
+    expect(row.name).toBe("Ops Team 2");
+    expect(row.subjectHistoryCount).toBe(row.subjectHistory.length);
+    expect(row.subjectHistory).toEqual([
+      { name: "Ops Team", at: "2026-09-13T08:12:00.000Z", by: "4915112345678" },
+      { name: "Ops", at: "2026-09-01T08:00:00.000Z", by: null },
+    ]);
+  });
+
   test("never returns another organisation's groups", async () => {
     await insertGroup({
       organizationId: "org_other",

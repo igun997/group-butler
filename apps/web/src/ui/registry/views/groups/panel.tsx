@@ -1,11 +1,12 @@
 "use client";
 
 import type { GroupSyncSummary } from "@butler/shared";
-import { type ReactNode, useCallback, useId, useMemo, useState } from "react";
+import { type ReactNode, useCallback, useId, useMemo, useRef, useState } from "react";
 import { ErrorState } from "../../../../components/error-state";
 import { LiveIndicator } from "../../../../components/live-indicator";
 import { COMPACT_QUERY, useMediaQuery } from "../../../../components/media-query";
 import { utcStamp } from "../../../../components/utc-stamp";
+import { SubjectHistorySheet } from "../../../../components/subject-history-sheet";
 import { WorkspaceHeader } from "../../../../components/workspace-header";
 import { useAction } from "../../../feedback";
 import type { MappedError } from "../../../feedback";
@@ -20,8 +21,17 @@ import {
 } from "../../../resource";
 import type { PanelProps, ResourceDescriptor, Scope } from "../../types";
 import { syncGroupsAction } from "./actions";
-import { GroupsCards, GroupsTable, groupsColumns, rowKey, type GroupRowController, type GroupToggle } from "./columns";
 import {
+  GroupsCards,
+  GroupsTable,
+  groupsColumns,
+  rowKey,
+  type GroupRowController,
+  type GroupRowToggles,
+  type GroupToggle,
+} from "./columns";
+import {
+  SUBJECT_HISTORY_CAP,
   applyGroupRow,
   groupUpdate,
   invalidateGroupsReads,
@@ -76,7 +86,7 @@ interface SyncState {
 }
 
 interface GroupToggles {
-  readonly controller: GroupRowController;
+  readonly controller: GroupRowToggles;
   readonly failure: GroupsFailure | null;
 }
 
@@ -235,7 +245,7 @@ function useGroupToggles(scope: Scope): GroupToggles {
     [pendingKeys, run],
   );
 
-  const controller = useMemo<GroupRowController>(
+  const controller = useMemo<GroupRowToggles>(
     () => ({
       assigned: (row) => toggleFor("assigned", row),
       whitelisted: (row) => toggleFor("whitelisted", row),
@@ -274,6 +284,11 @@ export function GroupsPanel({ scope }: PanelProps) {
   const scopeKey = scopeSegment(scope);
   const headingId = useId();
   const [renamed, setRenamed] = useState<Scoped<GroupRename | null>>(() => ({ scope: scopeKey, value: null }));
+  // R-V4: the sheet is opened from a row's chip and follows that row — the sheet
+  // renders whatever the read currently says about it, so a rename that lands
+  // while it is open is a new entry in it rather than a stale list.
+  const [history, setHistory] = useState<GroupRow | null>(null);
+  const historyTrigger = useRef<HTMLElement | null>(null);
 
   // R-V4: one frame, one pass. The row moves through the cache the gate renders
   // from, the group's own scope label moves with it, and this workspace's line
@@ -296,6 +311,29 @@ export function GroupsPanel({ scope }: PanelProps) {
   );
   const transport = useStreamScope(scope, bindings);
   const bound = useMemo(() => withSyncWayOut(resource, sync), [resource, sync]);
+  const controller = useMemo<GroupRowController>(
+    () => ({
+      ...toggles.controller,
+      showHistory: (row, trigger) => {
+        // The trigger is remembered here, not in the sheet: it is the control that
+        // has to get focus back when the sheet closes (R-A1).
+        historyTrigger.current = trigger;
+        setHistory(row);
+      },
+    }),
+    [toggles.controller],
+  );
+
+  /** Close, and put the operator back where they were — the chip they opened it from. */
+  const closeHistory = useCallback(() => {
+    setHistory(null);
+    const trigger = historyTrigger.current;
+    historyTrigger.current = null;
+    // The row may have been re-rendered under a live patch; a detached control
+    // cannot take focus, and guessing another target is worse than leaving the
+    // browser's own restore in place.
+    if (trigger?.isConnected) trigger.focus();
+  }, []);
 
   return (
     <section className="groups-workspace" aria-labelledby={headingId}>
@@ -309,8 +347,10 @@ export function GroupsPanel({ scope }: PanelProps) {
               transport={transport}
               sync={sync}
               failure={toggles.failure}
-              controller={toggles.controller}
+              controller={controller}
               renameNote={renamed.scope === scopeKey ? renamed.value : null}
+              history={history}
+              onCloseHistory={closeHistory}
             />
           )
         }
@@ -328,6 +368,9 @@ interface GroupsWorkspaceProps {
   failure: GroupsFailure | null;
   controller: GroupRowController;
   renameNote: GroupRename | null;
+  /** The row whose rename history is open, or `null`. */
+  history: GroupRow | null;
+  onCloseHistory: () => void;
 }
 
 /** The loaded workspace: what is in scope, what condition it is in, and the rows. */
@@ -340,8 +383,14 @@ function GroupsWorkspace({
   failure,
   controller,
   renameNote,
+  history,
+  onCloseHistory,
 }: GroupsWorkspaceProps) {
   const syncFailure = sync?.failure ?? null;
+  // The row the sheet is about, as the read currently holds it; if a read no
+  // longer carries it, the sheet keeps showing the row it was opened from.
+  const historyRow =
+    history === null ? null : (data.groups.find((row) => rowKey(row) === rowKey(history)) ?? history);
   const manual = sync?.summary ?? null;
   // Freshness is an instance's own fact: the cross-instance read answers with the
   // rows and no stamp, so the global address says nothing rather than claiming
@@ -376,6 +425,16 @@ function GroupsWorkspace({
       {failure === null ? null : <ErrorState error={failure.error} onRetry={failure.retry} />}
       {syncFailure === null ? null : <ErrorState error={syncFailure.error} onRetry={syncFailure.retry} />}
       <GroupsRows scope={scope} data={data} controller={controller} />
+      {historyRow === null ? null : (
+        <SubjectHistorySheet
+          open
+          groupJid={historyRow.groupJid}
+          name={historyRow.name}
+          history={historyRow.subjectHistory}
+          cap={SUBJECT_HISTORY_CAP}
+          onClose={onCloseHistory}
+        />
+      )}
     </>
   );
 }

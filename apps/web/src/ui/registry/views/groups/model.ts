@@ -35,9 +35,25 @@ export const GROUPS_ALL = "groups.all";
 export const GROUPS_INSTANCE = "groups.instance";
 
 /**
+ * One superseded name as the row carries it: the name WhatsApp had before, its
+ * own stamp for it (`null` when there was none), and who set it.
+ */
+const WireHistoryEntrySchema = z.object({
+  name: z.string().min(1),
+  at: z.string().nullable(),
+  by: z.string().nullable(),
+});
+
+export type GroupSubjectEntry = z.infer<typeof WireHistoryEntrySchema>;
+
+/**
  * The §7.5 wire row, as the BFF's read model answers it. `instanceId` and
  * `instanceLabel` are present only on the cross-instance read (`/api/groups`),
  * which is exactly what the global address needs to show each row's instance.
+ *
+ * The rename ring arrives as entries, not as a count: the read model derives the
+ * count it also sends from this same capped list, so this build reads the list
+ * and what the chip says can never disagree with what the sheet opens.
  *
  * The two closed vocabularies are read out of the shared schemas that own them
  * (`z.enum(schema.options)`) rather than restated: `@butler/shared` pins zod 3
@@ -57,7 +73,7 @@ const WireRowSchema = z.object({
   whitelisted: z.boolean(),
   lastActivityAt: z.string().nullable(),
   messageCount: z.number().int().nonnegative(),
-  subjectHistoryCount: z.number().int().nonnegative(),
+  subjectHistory: z.array(WireHistoryEntrySchema),
   instanceId: z.string().min(1).optional(),
   instanceLabel: z.string().optional(),
 });
@@ -89,8 +105,13 @@ export class GroupsRequestError extends Error {
   }
 }
 
-/** The worker's rename-ring cap (`apps/worker/groupdelta.go` `subjectHistoryMax`). */
-const SUBJECT_HISTORY_CAP = 20;
+/**
+ * The worker's rename-ring cap (`apps/worker/groupdelta.go` `subjectHistoryMax`),
+ * which the read model applies too (`server/repos/groups.ts`). The twin is not
+ * redundant: the BFF's copy bounds what one answer may carry, and this one
+ * bounds what one live frame may add to the ring it already has.
+ */
+export const SUBJECT_HISTORY_CAP = 20;
 
 /** The stable code of an answer this build cannot read (§4.5: raw codes only). */
 const UNREADABLE = "decode_error";
@@ -256,6 +277,21 @@ export interface GroupUpdate {
 }
 
 /**
+ * The rename ring after one frame, mirroring the worker's own append
+ * (`apps/worker/groupdelta.go` `appendSubjectHistory`): the name that was on
+ * screen becomes the newest entry, carrying the stamp and the setter it had, and
+ * the oldest entry falls off at the cap. A name that did not move is not a
+ * rename, and a group whose name was a fallback had nothing to supersede — the
+ * same two rules the worker applies before it pushes anything.
+ */
+function appendHistory(row: GroupRow): GroupSubjectEntry[] {
+  const entry: GroupSubjectEntry = { name: row.name, at: row.nameSetAt, by: row.nameSetBy };
+  const head = row.subjectHistory[0];
+  if (head && head.name === entry.name && head.at === entry.at) return row.subjectHistory;
+  return [entry, ...row.subjectHistory].slice(0, SUBJECT_HISTORY_CAP);
+}
+
+/**
  * One row after one frame. A frame that carries no name is not a rename, so the
  * name already on screen stays — a fallback included — and a name that did not
  * actually move (a resumed stream may repeat its last change) does not falsify
@@ -279,11 +315,9 @@ function applyEvent(row: GroupRow, event: GroupUpdatedEvent): GroupRow {
     // whoever set the last one (draft §5.1 `subjectSetBy`).
     nameSetBy: named ? null : row.nameSetBy,
     state: event.state,
-    // The worker pushes exactly one history entry per real rename, onto a capped
-    // ring (`applySubjectDelta`, `appendSubjectHistory`).
-    subjectHistoryCount: superseded
-      ? Math.min(row.subjectHistoryCount + 1, SUBJECT_HISTORY_CAP)
-      : row.subjectHistoryCount,
+    // The ring keeps the names the group used to have, so the sheet stays true
+    // for a rename that arrives while the operator has it open.
+    subjectHistory: superseded ? appendHistory(row) : row.subjectHistory,
   };
 }
 

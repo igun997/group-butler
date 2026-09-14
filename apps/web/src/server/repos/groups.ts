@@ -6,9 +6,32 @@ import { COLLECTIONS } from "../collections";
 export type GroupNameSource = "sync" | "event" | "fallback";
 
 /**
+ * The worker's rename-ring cap (`apps/worker/groupdelta.go` `subjectHistoryMax`).
+ * The ring is newest-first and the oldest entry falls off, so this is both what
+ * the worker keeps and what a row may carry; the read model applies it too, so a
+ * document written by anything else cannot put more than this in one answer.
+ */
+export const SUBJECT_HISTORY_MAX = 20;
+
+/**
+ * One superseded name, as the dashboard shows it: what the group was called,
+ * WhatsApp's own stamp for it (`null` when there was none), and who set it
+ * (draft §5.1 `subjectHistory`).
+ */
+export interface GroupSubjectEntry {
+  name: string;
+  at: string | null;
+  by: string | null;
+}
+
+/**
  * The §7.5 wire row: one group's identity, current name, provenance and config.
  * The never-blank rule is already applied here, so no consumer ever branches on
  * an empty name.
+ *
+ * `subjectHistory` is the capped ring itself rather than a count of it: the
+ * dashboard renders the entries, so the number it shows and the list it can open
+ * are the same fact and cannot drift apart.
  */
 export interface GroupRow {
   groupJid: string;
@@ -23,6 +46,7 @@ export interface GroupRow {
   lastActivityAt: string | null;
   messageCount: number;
   subjectHistoryCount: number;
+  subjectHistory: GroupSubjectEntry[];
 }
 
 /** The cross-instance row: the same shape plus the instance it belongs to. */
@@ -76,6 +100,30 @@ function stamp(value: Date | undefined): string | null {
 }
 
 /**
+ * The rename ring as the dashboard reads it: newest first, at most
+ * `SUBJECT_HISTORY_MAX` entries, each name non-empty and each stamp RFC3339 or
+ * `null`. A document written before the ring existed carries none, which is an
+ * empty list rather than an error; an entry that is not a name is dropped rather
+ * than rendered as a blank row, and the count follows the list so the two can
+ * never disagree.
+ */
+function historyOf(entries: unknown): GroupSubjectEntry[] {
+  if (!Array.isArray(entries)) return [];
+  const kept: GroupSubjectEntry[] = [];
+  for (const entry of entries.slice(0, SUBJECT_HISTORY_MAX)) {
+    if (entry === null || typeof entry !== "object") continue;
+    const candidate = entry as { name?: unknown; at?: unknown; by?: unknown };
+    if (typeof candidate.name !== "string" || candidate.name.trim() === "") continue;
+    kept.push({
+      name: candidate.name,
+      at: stamp(candidate.at instanceof Date ? candidate.at : undefined),
+      by: typeof candidate.by === "string" && candidate.by.trim() !== "" ? candidate.by : null,
+    });
+  }
+  return kept;
+}
+
+/**
  * One stored group as the dashboard's row. Exported because the mutation route
  * answers the row it just wrote: the live patch and the read can never drift
  * apart that way.
@@ -85,6 +133,7 @@ export function toRow(doc: GroupDoc): GroupRow {
   const config = doc.config ?? {};
   const subject = observed.subject ?? "";
   const nameSource = subject === "" || !observed.subjectSource ? "fallback" : observed.subjectSource;
+  const subjectHistory = historyOf(observed.subjectHistory);
   return {
     groupJid: doc.groupJid,
     name: subject === "" ? `${FALLBACK_PREFIX}${doc.groupJid.split("@")[0] ?? doc.groupJid}` : subject,
@@ -97,7 +146,8 @@ export function toRow(doc: GroupDoc): GroupRow {
     whitelisted: config.whitelisted ?? false,
     lastActivityAt: stamp(observed.lastActivityAt),
     messageCount: observed.messageCount ?? 0,
-    subjectHistoryCount: observed.subjectHistory?.length ?? 0,
+    subjectHistoryCount: subjectHistory.length,
+    subjectHistory,
   };
 }
 

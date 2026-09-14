@@ -13,6 +13,10 @@ export async function insertGroup(input: {
   groupJid: string;
   subject: string;
   subjectSource: string;
+  /** The worker's superseded names, newest first, as the ring stores them. */
+  subjectHistory?: readonly { name: string; at: Date; by: string }[];
+  subjectUpdatedAt?: Date;
+  subjectSetBy?: string;
 }): Promise<void> {
   const db = await getDb();
   await db.collection(COLLECTIONS.groups).updateOne(
@@ -24,6 +28,9 @@ export async function insertGroup(input: {
         "observed.subjectSource": input.subjectSource,
         "observed.state": "active",
         "observed.participantCount": 12,
+        ...(input.subjectHistory === undefined ? {} : { "observed.subjectHistory": [...input.subjectHistory] }),
+        ...(input.subjectUpdatedAt === undefined ? {} : { "observed.subjectUpdatedAt": input.subjectUpdatedAt }),
+        ...(input.subjectSetBy === undefined ? {} : { "observed.subjectSetBy": input.subjectSetBy }),
       },
       $setOnInsert: {
         organizationId: input.organizationId,

@@ -193,6 +193,8 @@ describe("token layer (spec §3.2)", () => {
       "../../components/live-indicator.tsx",
       "../../components/media-query.ts",
       "../../components/utc-stamp.ts",
+      "../../components/provenance.ts",
+      "../../components/subject-history-sheet.tsx",
       "../registry/views/groups/index.tsx",
       "../registry/views/groups/columns.tsx",
       "../registry/views/groups/panel.tsx",

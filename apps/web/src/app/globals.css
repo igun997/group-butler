@@ -1426,3 +1426,167 @@ body > main [role="alert"]:empty {
   font-size: var(--type-caption-size);
   line-height: var(--type-caption-line);
 }
+
+/* ---------------------------------------------------------------------------
+ * P5 — the rename history: the chip that opens it, and the sheet it opens
+ * (R-V4, R-A1, R-M6)
+ *
+ * A rename count is evidence, so it is a control: the chip carries the number as
+ * its visible text and what it opens in its accessible name, and the sheet states
+ * the names the group used to have with whatever is known about each one. The
+ * sheet is a native `dialog`, so the top layer, the `Esc` close and the pointer
+ * containment come from the browser; this section is only its geography and the
+ * bottom-sheet shape it takes below `md`, which is the same shape the scope
+ * spine's sheet already uses.
+ * ------------------------------------------------------------------------- */
+.group-name-cell__renames--action {
+  display: inline-flex;
+  align-items: center;
+  min-block-size: var(--target-min);
+  padding: 0 var(--space-1);
+  font: inherit;
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+  color: var(--muted-foreground);
+  background: transparent;
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+
+.group-name-cell__renames--action:hover {
+  color: var(--foreground);
+  background: var(--muted);
+}
+
+.history-sheet {
+  inline-size: min(var(--surface-max-width), calc(100vw - var(--space-8)));
+  max-block-size: var(--sheet-max-height);
+  padding: 0;
+  color: var(--popover-foreground);
+  background: var(--popover);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-dialog);
+  box-shadow: var(--elevation-28);
+}
+
+.history-sheet::backdrop {
+  background: var(--scrim);
+}
+
+.history-sheet__content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  overflow-y: auto;
+}
+
+.history-sheet__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.history-sheet__identity {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-inline-size: 0;
+}
+
+.history-sheet__title {
+  margin: 0;
+  font-size: var(--type-subtitle-size);
+  line-height: var(--type-subtitle-line);
+  font-weight: var(--type-subtitle-weight);
+}
+
+.history-sheet__subject {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-2);
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+}
+
+.history-sheet__jid {
+  font-family: var(--font-mono);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+  overflow-wrap: anywhere;
+}
+
+.history-sheet__close {
+  min-block-size: var(--target-min);
+  padding: var(--space-1) var(--space-3);
+  font: inherit;
+  font-size: var(--type-body-size);
+  color: var(--foreground);
+  background: var(--background);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+
+.history-sheet__list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* A hairline between entries, which is a separator rather than a state: nothing
+   here encodes anything with an edge (R-A4). */
+.history-sheet__entry {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-2);
+  padding-block-end: var(--space-2);
+  border-block-end: var(--border-width) solid var(--border);
+}
+
+.history-sheet__entry:last-child {
+  padding-block-end: 0;
+  border-block-end: none;
+}
+
+.history-sheet__entry-name {
+  font-size: var(--type-body-size);
+  line-height: var(--type-body-line);
+  overflow-wrap: anywhere;
+}
+
+.history-sheet__entry-provenance,
+.history-sheet__empty,
+.history-sheet__cap {
+  color: var(--muted-foreground);
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+}
+
+.history-sheet__empty,
+.history-sheet__cap {
+  margin: 0;
+}
+
+/* R-M6: on a phone the sheet is a bottom sheet with its own close control, in
+   the same shape the scope spine's switcher takes. */
+@media (max-width: 767px) {
+  .history-sheet {
+    inline-size: 100vw;
+    max-block-size: var(--sheet-max-height);
+    margin-block: auto 0;
+    border-end-start-radius: 0;
+    border-end-end-radius: 0;
+    border-start-start-radius: var(--radius-sheet-top);
+    border-start-end-radius: var(--radius-sheet-top);
+  }
+}

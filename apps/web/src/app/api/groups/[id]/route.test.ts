@@ -93,6 +93,7 @@ describe("PATCH /api/groups/[id]", () => {
         lastActivityAt: null,
         messageCount: 0,
         subjectHistoryCount: 0,
+        subjectHistory: [],
       },
     });
 

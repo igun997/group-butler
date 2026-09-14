@@ -41,4 +41,50 @@ describe("GroupNameCell (R11, R-V4)", () => {
       renderToStaticMarkup(<GroupNameCell name="Ops Team" nameSource="event" renameCount={0} />),
     ).not.toContain("renamed");
   });
+
+  test("the rename count is a control when the surface can open the history (R-V4)", () => {
+    const html = renderToStaticMarkup(
+      <GroupNameCell name="Ops Team" nameSource="event" renameCount={2} onShowHistory={() => undefined} />,
+    );
+
+    expect(html).toContain("<button");
+    expect(html).toContain('aria-haspopup="dialog"');
+    expect(html).toContain("renamed 2×");
+    // The accessible name keeps the visible words and adds what the control does.
+    expect(html).toContain("show the earlier names");
+  });
+
+  test("with no way to open them it stays a number, not a control that does nothing (R-26)", () => {
+    const html = renderToStaticMarkup(<GroupNameCell name="Ops Team" nameSource="event" renameCount={2} />);
+
+    expect(html).not.toContain("<button");
+    expect(html).toContain("renamed 2×");
+  });
+
+  test("states who set the current name, and when (§5.1 subjectSetBy)", () => {
+    const html = renderToStaticMarkup(
+      <GroupNameCell
+        name="Ops Team"
+        nameSource="event"
+        nameSetAt="2026-09-13T08:12:00Z"
+        nameSetBy="4915112345678"
+      />,
+    );
+
+    expect(html).toContain("set by 4915112345678 on 2026-09-13 08:12 UTC");
+  });
+
+  test("attaches no provenance to a name WhatsApp has not given yet", () => {
+    const html = renderToStaticMarkup(
+      <GroupNameCell
+        name="(unnamed group) 120363043999999999"
+        nameSource="fallback"
+        nameSetAt="2026-09-13T08:12:00Z"
+        nameSetBy="4915112345678"
+      />,
+    );
+
+    expect(html).toContain("Name not synced yet");
+    expect(html).not.toContain("set by");
+  });
 });

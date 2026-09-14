@@ -1,6 +1,26 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+
+/**
+ * jsdom ships the `dialog` element without its methods. They are defined with the
+ * spec's observable effect — the `open` state and the `close` event — so the
+ * sheet's own close path runs here; what `Esc` and the focus trap do in a browser
+ * is verified in the browser.
+ */
+function installDialogMethods(): void {
+  const prototype = window.HTMLDialogElement.prototype;
+  if (prototype.showModal !== undefined) return;
+  prototype.showModal = function showModal(this: HTMLDialogElement) {
+    this.open = true;
+  };
+  prototype.close = function close(this: HTMLDialogElement) {
+    this.open = false;
+    this.dispatchEvent(new Event("close"));
+  };
+}
+
+installDialogMethods();
 import { toastQueue } from "../../../feedback";
 import { resourceCache, streamCoordinator, type EventSourceLike } from "../../../resource";
 import type { Scope } from "../../types";
@@ -36,7 +56,10 @@ const ROW = {
   whitelisted: false,
   lastActivityAt: "2026-09-14T07:00:00Z",
   messageCount: 340,
-  subjectHistoryCount: 2,
+  subjectHistory: [
+    { name: "Ops", at: "2026-09-01T08:00:00Z", by: "4915112345678" },
+    { name: "Team", at: null, by: null },
+  ],
 };
 
 const FALLBACK = {
@@ -46,7 +69,7 @@ const FALLBACK = {
   nameSource: "fallback",
   nameSetAt: null,
   nameSetBy: null,
-  subjectHistoryCount: 0,
+  subjectHistory: [],
 };
 
 const SUMMARY = {
@@ -198,7 +221,7 @@ describe("the groups table (R11)", () => {
     const first = within(found[0]!);
     expect(first.getByText(JID)).toBeTruthy();
     expect(first.getByText("Ops Team")).toBeTruthy();
-    expect(first.getByText("renamed 2×")).toBeTruthy();
+    expect(first.getByRole("button", { name: /renamed 2×/ })).toBeTruthy();
     expect(first.getByText("set by 4915112345678 on 2026-09-13 08:12 UTC")).toBeTruthy();
     expect(first.getByText("Active")).toBeTruthy();
     expect(first.getByRole("button", { name: "Not assigned" }).getAttribute("aria-pressed")).toBe("false");
@@ -398,7 +421,7 @@ describe("a rename that arrives live (R-V1, R-V2, R-V4)", () => {
 
     // The row: the name and its provenance moved, and identity did not.
     await waitFor(() => expect(within(row!).getByText("Ops Team 2")).toBeTruthy());
-    expect(within(row!).getByText("renamed 3×")).toBeTruthy();
+    expect(within(row!).getByRole("button", { name: /renamed 3×/ })).toBeTruthy();
     expect(within(row!).queryByText("set by 4915112345678 on 2026-09-13 08:12 UTC")).toBeNull();
     expect(focusLabel()).toBe(`Copy group ID ${JID}`);
 
@@ -444,6 +467,81 @@ describe("a rename that arrives live (R-V1, R-V2, R-V4)", () => {
 
     expect(screen.getByText("Ops Team")).toBeTruthy();
     expect(screen.queryByText(/Renamed:/)).toBeNull();
+  });
+});
+
+describe("the rename history (R-V4, R-A1)", () => {
+  test("the chip opens the names the group used to have, newest first", async () => {
+    routes.push(() => ({ body: groupsPage([ROW, FALLBACK]) }));
+    installStream();
+
+    render(<GroupsPanel scope={INSTANCE} params={{}} />);
+    const [row] = await rows();
+    fireEvent.click(within(row!).getByRole("button", { name: /renamed 2×/ }));
+
+    const sheet = await waitFor(() => {
+      const found = document.querySelector("dialog.history-sheet");
+      expect(found).toBeTruthy();
+      return found!;
+    });
+    expect(within(sheet as HTMLElement).getByText("Ops Team")).toBeTruthy();
+    expect(within(sheet as HTMLElement).getByText(JID)).toBeTruthy();
+    const entries = [...sheet.querySelectorAll(".history-sheet__entry")];
+    expect(entries.map((entry) => entry.textContent)).toEqual([
+      "Opsset by 4915112345678 on 2026-09-01 08:00 UTC",
+      "Team",
+    ]);
+  });
+
+  test("a group that has never been renamed has nothing to open", async () => {
+    routes.push(() => ({ body: groupsPage([FALLBACK]) }));
+    installStream();
+
+    render(<GroupsPanel scope={INSTANCE} params={{}} />);
+    await rows();
+
+    expect(screen.queryByRole("button", { name: /renamed/ })).toBeNull();
+  });
+
+  test("closing the sheet puts focus back on the chip that opened it (R-A1)", async () => {
+    routes.push(() => ({ body: groupsPage([ROW]) }));
+    installStream();
+
+    render(<GroupsPanel scope={INSTANCE} params={{}} />);
+    const [row] = await rows();
+    const chip = within(row!).getByRole("button", { name: /renamed 2×/ });
+    fireEvent.click(chip);
+
+    const sheet = document.querySelector("dialog.history-sheet")!;
+    // The browser closes the dialog on `Esc` and fires `close`; the workspace owns
+    // what happens next, and what happens next is where the operator was.
+    act(() => sheet.dispatchEvent(new Event("close")));
+
+    await waitFor(() => expect(document.querySelector("dialog.history-sheet")).toBeNull());
+    expect(document.activeElement).toBe(chip);
+  });
+
+  test("a rename that lands while the sheet is open is a new entry in it", async () => {
+    routes.push(() => ({ body: groupsPage([ROW]) }));
+    const stream = installStream();
+
+    render(<GroupsPanel scope={INSTANCE} params={{}} />);
+    const [row] = await rows();
+    fireEvent.click(within(row!).getByRole("button", { name: /renamed 2×/ }));
+    await waitFor(() => expect(document.querySelector("dialog.history-sheet")).toBeTruthy());
+
+    act(() => stream.emit("group.updated", RENAME));
+
+    await waitFor(() => {
+      const entries = [...document.querySelectorAll(".history-sheet__entry")];
+      expect(entries.map((entry) => entry.textContent)).toEqual([
+        "Ops Teamset by 4915112345678 on 2026-09-13 08:12 UTC",
+        "Opsset by 4915112345678 on 2026-09-01 08:00 UTC",
+        "Team",
+      ]);
+    });
+    // And the sheet still names the group by what it is called now.
+    expect(within(document.querySelector("dialog.history-sheet") as HTMLElement).getByText("Ops Team 2")).toBeTruthy();
   });
 });
 

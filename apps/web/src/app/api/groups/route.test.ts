@@ -4,6 +4,7 @@ import { UnauthorizedError } from "../../../server/auth/owner";
 import { issueSession } from "../../../server/auth/session";
 import { closeDb } from "../../../server/mongo";
 import { insertGroup, insertInstance } from "../../../server/repos/test-helpers";
+import { SUBJECT_HISTORY_MAX } from "../../../server/repos/groups";
 import { GET } from "./route";
 
 /** Same request-scoped cookie seam as the per-instance group route test. */
@@ -85,6 +86,60 @@ describe("GET /api/groups", () => {
     const body = await (await GET()).json();
 
     expect(body.groups.map((g: { groupJid: string }) => g.groupJid)).not.toContain("120363043777777777@g.us");
+  });
+
+  test("exposes each group's capped rename ring, newest first", async () => {
+    const long = Array.from({ length: 25 }, (_, index) => ({
+      name: `Name ${index + 1}`,
+      at: new Date(`2026-09-${String((index % 28) + 1).padStart(2, "0")}T08:00:00Z`),
+      by: "4915112345678",
+    }));
+    await insertGroup({
+      organizationId: "org_default",
+      instanceId: "inst_3",
+      groupJid: "120363046666666666@g.us",
+      subject: "Current name",
+      subjectSource: "event",
+      subjectUpdatedAt: new Date("2026-09-14T08:00:00Z"),
+      subjectSetBy: "4915000000000",
+      subjectHistory: long,
+    });
+
+    const body = await (await GET()).json();
+    const row = body.groups.find((g: { groupJid: string }) => g.groupJid === "120363046666666666@g.us");
+
+    // The worker's cap, applied by the read model as well: a document holding
+    // more than the ring keeps cannot put more than the ring into one answer.
+    expect(row.subjectHistory).toHaveLength(SUBJECT_HISTORY_MAX);
+    expect(row.subjectHistoryCount).toBe(SUBJECT_HISTORY_MAX);
+    expect(row.subjectHistory[0]).toEqual({
+      name: "Name 1",
+      at: "2026-09-01T08:00:00.000Z",
+      by: "4915112345678",
+    });
+    expect(row.subjectHistory.at(-1)).toMatchObject({ name: "Name 20" });
+  });
+
+  test("an entry with no stamp or no setter is stated as unknown, not as a date", async () => {
+    await insertGroup({
+      organizationId: "org_default",
+      instanceId: "inst_4",
+      groupJid: "120363047777777777@g.us",
+      subject: "Current",
+      subjectSource: "event",
+      subjectHistory: [
+        { name: "Earlier", at: new Date("0001-01-01T00:00:00Z"), by: "" },
+        { name: "", at: new Date("2026-09-02T08:00:00Z"), by: "4915112345678" },
+      ],
+    });
+
+    const body = await (await GET()).json();
+    const row = body.groups.find((g: { groupJid: string }) => g.groupJid === "120363047777777777@g.us");
+
+    // The zero stamp means "no stamp" and the name-less entry is not a rename,
+    // so neither is rendered as a fact nobody observed.
+    expect(row.subjectHistory).toEqual([{ name: "Earlier", at: null, by: null }]);
+    expect(row.subjectHistoryCount).toBe(1);
   });
 
   test("answers 401 for a request with no session", async () => {

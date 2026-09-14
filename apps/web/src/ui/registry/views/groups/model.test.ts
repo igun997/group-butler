@@ -4,6 +4,7 @@ import type { Scope } from "../../types";
 import {
   GROUPS_ALL,
   GROUPS_INSTANCE,
+  SUBJECT_HISTORY_CAP,
   applyGroupRow,
   groupUpdate,
   groupsKey,
@@ -29,6 +30,11 @@ import {
 const INSTANCE: Scope = { kind: "instance", instanceId: "inst_1" };
 const GLOBAL: Scope = { kind: "global" };
 
+const HISTORY = [
+  { name: "Ops", at: "2026-09-01T08:00:00.000Z", by: "4915112345678" },
+  { name: "Team", at: null, by: null },
+];
+
 const ROW: GroupRow = {
   groupJid: "120363043123456789@g.us",
   name: "Ops Team",
@@ -41,7 +47,7 @@ const ROW: GroupRow = {
   whitelisted: false,
   lastActivityAt: "2026-09-14T07:00:00Z",
   messageCount: 340,
-  subjectHistoryCount: 2,
+  subjectHistory: HISTORY,
 };
 
 const FALLBACK: GroupRow = {
@@ -50,7 +56,7 @@ const FALLBACK: GroupRow = {
   nameSource: "fallback",
   nameSetAt: null,
   nameSetBy: null,
-  subjectHistoryCount: 0,
+  subjectHistory: [],
 };
 
 const SUMMARY = {
@@ -288,7 +294,12 @@ describe("one group.updated frame (R-V1, R-V2, R-V4)", () => {
       name: "Ops Team 2",
       nameSource: "event",
       nameSetAt: "2026-09-14T09:00:00Z",
-      subjectHistoryCount: 3,
+      // The name that was on screen becomes the newest entry, with the stamp and
+      // the setter it had; the ring keeps its own tail.
+      subjectHistory: [
+        { name: "Ops Team", at: "2026-09-13T08:12:00Z", by: "4915112345678" },
+        ...HISTORY,
+      ],
     });
     expect(update.renamed).toEqual({
       scope: { kind: "group", instanceId: "inst_1", groupJid: ROW.groupJid },
@@ -312,7 +323,7 @@ describe("one group.updated frame (R-V1, R-V2, R-V4)", () => {
     expect(update.data.groups[0]).toMatchObject({
       name: FALLBACK.name,
       nameSource: "fallback",
-      subjectHistoryCount: 0,
+      subjectHistory: [],
     });
     expect(update.renamed).toBeNull();
   });
@@ -320,7 +331,7 @@ describe("one group.updated frame (R-V1, R-V2, R-V4)", () => {
   test("a fallback name resolves when a real one arrives", () => {
     const update = groupUpdate({ groups: [FALLBACK], syncedAt: null }, frame(RENAMED), INSTANCE);
 
-    expect(update.data.groups[0]).toMatchObject({ name: "Ops Team 2", nameSource: "event", subjectHistoryCount: 0 });
+    expect(update.data.groups[0]).toMatchObject({ name: "Ops Team 2", nameSource: "event", subjectHistory: [] });
   });
 
   test("a frame that moved nothing keeps the same value, so nothing re-renders", () => {
@@ -341,7 +352,7 @@ describe("one group.updated frame (R-V1, R-V2, R-V4)", () => {
       name: "Ops Team",
       nameSource: "sync",
       nameSetBy: "4915112345678",
-      subjectHistoryCount: 2,
+      subjectHistory: HISTORY,
     });
     expect(update.renamed).toBeNull();
   });
@@ -376,11 +387,30 @@ describe("one group.updated frame (R-V1, R-V2, R-V4)", () => {
     expect(groupUpdate(before, frame({ type: "group.updated" }), INSTANCE).data).toBe(before);
   });
 
-  test("the rename ring moves by one and stops at the worker's cap", () => {
-    const full = { ...ROW, subjectHistoryCount: 20 };
+  test("the ring keeps its tail when it is full, so the newest rename is still shown", () => {
+    const full = {
+      ...ROW,
+      subjectHistory: Array.from({ length: SUBJECT_HISTORY_CAP }, (_, index) => ({
+        name: `Old ${index}`,
+        at: null,
+        by: null,
+      })),
+    };
 
     const update = groupUpdate({ groups: [full], syncedAt: null }, frame(RENAMED), INSTANCE);
 
-    expect(update.data.groups[0]!.subjectHistoryCount).toBe(20);
+    const history = update.data.groups[0]!.subjectHistory;
+    expect(history).toHaveLength(SUBJECT_HISTORY_CAP);
+    expect(history[0]).toEqual({ name: "Ops Team", at: ROW.nameSetAt, by: ROW.nameSetBy });
+    expect(history.at(-1)).toEqual({ name: `Old ${SUBJECT_HISTORY_CAP - 2}`, at: null, by: null });
+  });
+
+  test("a replayed rename does not push the same entry twice", () => {
+    const already = { ...ROW, subjectHistory: [{ name: ROW.name, at: ROW.nameSetAt, by: ROW.nameSetBy }, ...HISTORY] };
+    const counted = { ...already, subjectHistoryCount: already.subjectHistory.length };
+
+    const update = groupUpdate({ groups: [already], syncedAt: null }, frame(RENAMED), INSTANCE);
+
+    expect(update.data.groups[0]!.subjectHistory).toBe(counted.subjectHistory);
   });
 });

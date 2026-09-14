@@ -35,10 +35,16 @@ export interface GroupToggle {
   run(): void;
 }
 
-/** What a rendering of a row needs to draw its two toggles. */
-export interface GroupRowController {
+/** The two config writes a row can make. The workspace owns which rows are busy. */
+export interface GroupRowToggles {
   assigned(row: GroupRow): GroupToggle;
   whitelisted(row: GroupRow): GroupToggle;
+}
+
+/** What a rendering of a row needs: its two toggles, and its history chip. */
+export interface GroupRowController extends GroupRowToggles {
+  /** Opens the group's rename history, from the control that asked (R-V4, R-A1). */
+  showHistory(row: GroupRow, trigger: HTMLElement | null): void;
 }
 
 export interface GroupColumn {
@@ -68,13 +74,14 @@ export function groupsColumns(scope: Scope): readonly GroupColumn[] {
     {
       id: "name",
       label: "Name",
-      render: (row) => (
+      render: (row, controller) => (
         <GroupNameCell
           name={row.name}
           nameSource={row.nameSource}
-          renameCount={row.subjectHistoryCount}
+          renameCount={row.subjectHistory.length}
           nameSetAt={row.nameSetAt}
           nameSetBy={row.nameSetBy}
+          onShowHistory={(trigger) => controller.showHistory(row, trigger)}
         />
       ),
     },
