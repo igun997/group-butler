@@ -28,6 +28,9 @@ type ingestQueue struct {
 	flushEvery time.Duration
 	flushMax   int
 	afterSave  func([]MessageDoc)
+	// onStored receives the documents a flush created, which is what the counters
+	// count: a redelivery updates a document rather than creating one.
+	onStored func(context.Context, []MessageDoc)
 }
 
 // newIngestQueue builds a queue of the configured size. A non-positive size
@@ -48,6 +51,16 @@ func (q *ingestQueue) setAfterSave(fn func([]MessageDoc)) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.afterSave = fn
+}
+
+// setOnStored registers the sink for the messages a flush actually created. It is
+// separate from `afterSave` because the two want different things: the reply
+// path wants the batch that was observed, while the counters want only what was
+// new, and a redelivery is neither a message nor a reason to answer again.
+func (q *ingestQueue) setOnStored(fn func(context.Context, []MessageDoc)) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.onStored = fn
 }
 
 // Enqueue accepts one parsed message without blocking on the buffer. Overflow is
@@ -131,14 +144,26 @@ func (q *ingestQueue) Run(ctx context.Context, store *messageStore) {
 		// shutdown path ctx is already cancelled and the write must still land.
 		flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ingestFlushTimeout)
 		defer cancel()
-		if err := store.Save(flushCtx, batch); err != nil {
+		stored, err := store.Save(flushCtx, batch)
+		if err != nil {
 			// Retrying forever would grow the batch without bound, so the batch
 			// is dropped and counted — the same visible degradation as an
 			// overflow, and the unique index makes any later replay a no-op.
 			logf("ingest flush failed, dropping %d messages: %v", len(batch), err)
 			q.dropped.Add(int64(len(batch)))
-		} else if q.afterSave != nil {
-			q.afterSave(batch)
+		} else {
+			// Only what the store created is new; a redelivery is not a message.
+			// The counters get their own deadline, for the same reason the flush
+			// does: on the shutdown path ctx is already cancelled and the count
+			// must still land.
+			if q.onStored != nil && len(stored) > 0 {
+				counterCtx, cancelCounters := context.WithTimeout(context.WithoutCancel(ctx), ingestFlushTimeout)
+				q.onStored(counterCtx, stored)
+				cancelCounters()
+			}
+			if q.afterSave != nil {
+				q.afterSave(batch)
+			}
 		}
 		batch = nil
 	}
@@ -173,13 +198,15 @@ func newMessageStore(db *mongo.Database) *messageStore {
 	return &messageStore{coll: db.Collection(collMessages)}
 }
 
-// Save upserts a batch of parsed messages. The upsert filter is the unique
-// index key, so re-delivered events collapse onto the document they already
-// created (§6.2).
-func (s *messageStore) Save(ctx context.Context, docs []MessageDoc) error {
+// Save upserts a batch of parsed messages and returns the ones that were actually
+// new. The upsert filter is the unique index key, so re-delivered events collapse
+// onto the document they already created (§6.2) — and only this call site knows
+// which writes created a document rather than updating one, which is why the
+// counters are fed from here rather than from the batch that went in.
+func (s *messageStore) Save(ctx context.Context, docs []MessageDoc) ([]MessageDoc, error) {
 	if len(docs) == 0 {
 		// The driver rejects an empty bulk write, and an empty flush is normal.
-		return nil
+		return nil, nil
 	}
 	writes := make([]mongo.WriteModel, 0, len(docs))
 	for _, doc := range docs {
@@ -199,10 +226,15 @@ func (s *messageStore) Save(ctx context.Context, docs []MessageDoc) error {
 	}
 	// Unordered: one rejected document must not stop the rest of the batch, and
 	// the unique index makes a retry of the whole batch safe.
-	if _, err := s.coll.BulkWrite(ctx, writes, options.BulkWrite().SetOrdered(false)); err != nil {
-		return fmt.Errorf("save messages: %w", err)
+	result, err := s.coll.BulkWrite(ctx, writes, options.BulkWrite().SetOrdered(false))
+	if err != nil {
+		return nil, fmt.Errorf("save messages: %w", err)
 	}
-	return nil
+	stored := make([]MessageDoc, 0, len(result.UpsertedIDs))
+	for index := range result.UpsertedIDs {
+		stored = append(stored, docs[index])
+	}
+	return stored, nil
 }
 
 // mediaCandidate is one attachment the janitor may retry (§6.3.5): the identity

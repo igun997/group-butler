@@ -31,6 +31,8 @@ type fakeInstanceRepo struct {
 	connected map[string]bool
 	deleted   map[string]bool
 	ops       []string
+	// counters is what BumpCounters added, per instance and counter name.
+	counters map[string]map[string]int64
 }
 
 // record keeps the order of the writes the worker issued, which is how a test
@@ -56,6 +58,21 @@ func newFakeInstanceRepo(rows ...InstanceRow) *fakeInstanceRepo {
 		r.rows[row.ID] = row
 	}
 	return r
+}
+
+func (r *fakeInstanceRepo) BumpCounters(_ context.Context, orgID, id string, counters map[string]int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.counters == nil {
+		r.counters = map[string]map[string]int64{}
+	}
+	if r.counters[id] == nil {
+		r.counters[id] = map[string]int64{}
+	}
+	for name, count := range counters {
+		r.counters[id][name] += count
+	}
+	return nil
 }
 
 func (r *fakeInstanceRepo) Create(_ context.Context, row InstanceRow) error {

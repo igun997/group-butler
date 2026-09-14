@@ -744,7 +744,7 @@ func (j receiptJob) persist(ctx context.Context, m *manager) error {
 	if m.stats == nil {
 		return nil
 	}
-	return m.stats.bumpReceipt(ctx, m.orgID, j.instanceID, j.groupJID, j.at)
+	return m.stats.bump(ctx, m.orgID, j.instanceID, j.groupJID, dayCounterReceipts, 1, j.at)
 }
 
 // ---- media runner --------------------------------------------------------

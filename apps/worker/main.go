@@ -92,6 +92,9 @@ func run() error {
 	mgr.stats = newStatsStore(db)
 	mgr.audit = newAuditStore(db)
 	queue.setAfterSave(mgr.deliverSavedReplies)
+	// What a flush created lands in the day counters and the instance counters,
+	// which is what the console's usage section reads (§10).
+	queue.setOnStored(mgr.recordStored)
 	// The health probe reports the database the worker is actually using.
 	mgr.ping = func(ctx context.Context) error { return client.Ping(ctx, nil) }
 	// Media is enabled only by present R2 credentials; nil keeps every

@@ -46,7 +46,7 @@ func TestFlushIngestUpsertsIdempotently(t *testing.T) {
 	// A previous run may have left the message behind; the guarantee, not the
 	// starting state, is what the test asserts.
 	_, _ = db.Collection(collMessages).DeleteMany(ctx, map[string]any{"waMessageId": "3EB0A1"})
-	if err := store.Save(ctx, []MessageDoc{doc, doc}); err != nil {
+	if _, err := store.Save(ctx, []MessageDoc{doc, doc}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 	count, err := db.Collection(collMessages).CountDocuments(ctx, map[string]any{"waMessageId": "3EB0A1"})
@@ -269,7 +269,7 @@ func TestSaveMessageEnvelopeRoundTrip(t *testing.T) {
 		t.Fatalf("parseInbound: %v", err)
 	}
 	store := newMessageStore(db)
-	if err := store.Save(ctx, []MessageDoc{doc}); err != nil {
+	if _, err := store.Save(ctx, []MessageDoc{doc}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
@@ -347,7 +347,7 @@ func TestSaveMessageEnvelopeRoundTrip(t *testing.T) {
 	if !second.ReceivedAt.After(doc.ReceivedAt) {
 		t.Fatal("the redelivery was not observed later; the test would not detect a rewritten receivedAt")
 	}
-	if err := store.Save(ctx, []MessageDoc{second}); err != nil {
+	if _, err := store.Save(ctx, []MessageDoc{second}); err != nil {
 		t.Fatalf("Save(redelivery): %v", err)
 	}
 	var again storedMessage
@@ -401,7 +401,7 @@ func TestPendingMediaScanAndAttemptCounting(t *testing.T) {
 			WaMessageID: id, Kind: KindImage, Media: media,
 			Raw: RawMessage{Message: map[string]any{"imageMessage": map[string]any{}}, Truncated: truncated},
 		}
-		if err := store.Save(ctx, []MessageDoc{doc}); err != nil {
+		if _, err := store.Save(ctx, []MessageDoc{doc}); err != nil {
 			t.Fatalf("seed %s: %v", id, err)
 		}
 		if attempts > 0 {
@@ -452,5 +452,46 @@ func TestPendingMediaScanAndAttemptCounting(t *testing.T) {
 	}
 	if got := ids(); len(got) != 0 {
 		t.Fatalf("candidates after the budget was spent = %v, want none", got)
+	}
+}
+
+// Messages the store already holds are not new messages: WhatsApp redelivers
+// after a reconnect, and counting redelivery would inflate every figure the
+// console reports. The store is the only component that knows which writes were
+// actually new, so it is the component that reports them.
+func TestSaveReportsOnlyTheMessagesItStored(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), integrationTimeout)
+	defer cancel()
+	client, db, err := connectMongo(ctx, testMongoURI(t), "group_butler_test")
+	if err != nil {
+		t.Fatalf("connectMongo: %v", err)
+	}
+	defer func() { _ = client.Disconnect(ctx) }()
+	if err := ensureIngestIndexes(ctx, db); err != nil {
+		t.Fatalf("ensureIngestIndexes: %v", err)
+	}
+	store := newMessageStore(db)
+	first := MessageDoc{
+		OrganizationID: "org_default", InstanceID: "inst_1", GroupJID: "120363043123456789@g.us",
+		WaMessageID: "3EB0A1", Kind: KindText, Text: "hello", TextSearch: "hello", Media: Media{Status: MediaNone},
+	}
+	second := first
+	second.WaMessageID = "3EB0A2"
+	_, _ = db.Collection(collMessages).DeleteMany(ctx, map[string]any{"waMessageId": bson.M{"$in": []string{"3EB0A1", "3EB0A2"}}})
+
+	stored, err := store.Save(ctx, []MessageDoc{first, second})
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if len(stored) != 2 {
+		t.Fatalf("stored = %d, want both new messages reported", len(stored))
+	}
+
+	again, err := store.Save(ctx, []MessageDoc{first, second})
+	if err != nil {
+		t.Fatalf("Save again: %v", err)
+	}
+	if len(again) != 0 {
+		t.Fatalf("stored = %d, want nothing reported for a redelivery", len(again))
 	}
 }

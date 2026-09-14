@@ -79,22 +79,39 @@ func (f *fakeGroupStore) loadObserved(context.Context, string, string) (map[stri
 	return nil, nil
 }
 
-type fakeReceiptWriter struct {
+// fakeDayCounters records every live-counter write, so a test can assert both how
+// many writes a batch cost and what each one carried.
+type fakeDayCounters struct {
 	mu    sync.Mutex
-	calls int
+	calls []dayCounterCall
 }
 
-func (f *fakeReceiptWriter) bumpReceipt(context.Context, string, string, string, time.Time) error {
+type dayCounterCall struct {
+	orgID      string
+	instanceID string
+	groupJID   string
+	counter    string
+	count      int64
+	at         time.Time
+}
+
+func (f *fakeDayCounters) bump(_ context.Context, orgID, instanceID, groupJID, counter string, count int64, at time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls++
+	f.calls = append(f.calls, dayCounterCall{orgID, instanceID, groupJID, counter, count, at})
 	return nil
 }
 
-func (f *fakeReceiptWriter) count() int {
+func (f *fakeDayCounters) count() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.calls
+	return len(f.calls)
+}
+
+func (f *fakeDayCounters) recorded() []dayCounterCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]dayCounterCall(nil), f.calls...)
 }
 
 type okJob struct{}
@@ -126,7 +143,7 @@ func testConfig() Config {
 
 // testManagerWithDeps builds a manager whose persistence dependencies are fakes,
 // so event routing is provable without Mongo or a socket.
-func testManagerWithDeps(groups groupStoreAPI, stats receiptWriter, persist *persistQueue) *manager {
+func testManagerWithDeps(groups groupStoreAPI, stats dayCounters, persist *persistQueue) *manager {
 	mgr := newManager(testConfig(), groups, newFakeInstanceRepo(), newFakePairingStore(), nil, &fakeDeviceStore{})
 	if stats != nil {
 		mgr.stats = stats
@@ -225,7 +242,7 @@ func TestGroupDeltaIsRoutedOffTheCallback(t *testing.T) {
 }
 
 func TestReceiptIsRoutedOffTheCallback(t *testing.T) {
-	stats := &fakeReceiptWriter{}
+	stats := &fakeDayCounters{}
 	persist := newPersistQueue(8, 1)
 	mgr := testManagerWithDeps(newFakeGroupStore(), stats, persist)
 	s := testSession(mgr, newFakeClient())

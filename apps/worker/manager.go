@@ -252,9 +252,12 @@ type groupStoreAPI interface {
 	loadObserved(ctx context.Context, orgID, instanceID string) (map[string]Observed, error)
 }
 
-// receiptWriter is the §10 live-counter write for one receipt.
-type receiptWriter interface {
-	bumpReceipt(ctx context.Context, orgID, instanceID, groupJID string, at time.Time) error
+// dayCounters is the §10 live-counter write: one `$inc` on a day's row, keyed by
+// organization, instance, group and day. A receipt and a stored message are the
+// same write under a different counter name, which is why this is one method
+// rather than one per event.
+type dayCounters interface {
+	bump(ctx context.Context, orgID, instanceID, groupJID, counter string, count int64, at time.Time) error
 }
 
 // manager owns every live session, its auth device and its pairing material
@@ -267,7 +270,7 @@ type manager struct {
 	groups    groupStoreAPI
 	instances instanceRepo
 	pairing   pairingStore
-	stats     receiptWriter
+	stats     dayCounters
 	audit     *auditStore
 	ingest    *ingestQueue
 	media     *mediaRunner
@@ -728,6 +731,7 @@ type instanceRepo interface {
 	List(ctx context.Context, orgID string) ([]InstanceRow, error)
 	SetStatus(ctx context.Context, orgID, id string, status sessionState, pairingError string) error
 	SetConnected(ctx context.Context, orgID, id, phoneNumber, botJID, botLID string) error
+	BumpCounters(ctx context.Context, orgID, id string, counters map[string]int64) error
 	SoftDelete(ctx context.Context, orgID, id string) error
 }
 
@@ -901,6 +905,24 @@ func (r *instanceMongo) SoftDelete(ctx context.Context, orgID, id string) error 
 	return nil
 }
 
+// BumpCounters adds to an instance's live counters (§5.1). It is the only writer
+// of `runtime.counters`: the fields are summed by `$inc`, so two events landing at
+// once add up instead of overwriting each other, and a removed instance is not
+// counted at all.
+func (r *instanceMongo) BumpCounters(ctx context.Context, orgID, id string, counters map[string]int64) error {
+	if len(counters) == 0 {
+		return nil
+	}
+	increments := bson.D{}
+	for name, count := range counters {
+		increments = append(increments, bson.E{Key: "runtime.counters." + name, Value: count})
+	}
+	if _, err := r.coll.UpdateOne(ctx, liveInstanceFilter(orgID, id), bson.D{{Key: "$inc", Value: increments}}); err != nil {
+		return fmt.Errorf("bump instance counters %s: %w", id, err)
+	}
+	return nil
+}
+
 // pairingSession is the §5.1 `pairingSessions` document: transient pairing
 // material kept outside `instances` so the TTL index can never delete an
 // instance.
@@ -982,10 +1004,10 @@ func newStatsStore(db *mongo.Database) *statsStore {
 	return &statsStore{coll: db.Collection(collStatsDaily)}
 }
 
-// bumpReceipt records one inbound receipt for the instance/group/day. A receipt
-// is live-only: it is evidence of delivery, not a message, so it has its own
-// counter rather than inflating `messagesIn`.
-func (s *statsStore) bumpReceipt(ctx context.Context, orgID, instanceID, groupJID string, at time.Time) error {
+// bump adds to one counter on the instance/group/day row. A receipt is live-only —
+// evidence of delivery, not a message — so it has its own counter rather than
+// inflating `messages`, and every other §10 counter arrives here the same way.
+func (s *statsStore) bump(ctx context.Context, orgID, instanceID, groupJID, counter string, count int64, at time.Time) error {
 	day := at.UTC().Format("2006-01-02")
 	_, err := s.coll.UpdateOne(ctx,
 		bson.D{
@@ -995,7 +1017,7 @@ func (s *statsStore) bumpReceipt(ctx context.Context, orgID, instanceID, groupJI
 			{Key: "groupJid", Value: groupJID},
 		},
 		bson.D{
-			{Key: "$inc", Value: bson.D{{Key: "counters.receipts", Value: 1}}},
+			{Key: "$inc", Value: bson.D{{Key: "counters." + counter, Value: count}}},
 			{Key: "$set", Value: bson.D{{Key: "updatedAt", Value: at}}},
 			{Key: "$setOnInsert", Value: bson.D{
 				{Key: "organizationId", Value: orgID},
