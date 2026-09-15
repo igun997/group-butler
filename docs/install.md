@@ -86,10 +86,22 @@ an `AUTH_SECRET` shorter than 32 characters.
 `master` and on `v*` tags. To run them:
 
 ```bash
+# The packages are private, because the repository is: every pull needs a
+# credential. `gh auth token` is the quickest on a machine that has the gh CLI
+# logged in, but it is a session token that rotates — for a server or CI, use a
+# classic PAT with `read:packages` instead.
+gh auth token | docker login ghcr.io -u <owner> --password-stdin
+
 cp apps/web/.env.production.example   infra/prod/.env.web      # fill every blank
 cp apps/worker/.env.production.example infra/prod/.env.worker  # fill every blank
 BUTLER_GHCR_OWNER=<owner> docker compose -f infra/prod/docker-compose.ghcr.yml up -d
 ```
+
+A pull that answers **`unauthorized`** is a missing credential, not a missing
+image: a private package answers that way for every tag, including tags that do
+not exist. `docker login` writes to the invoking user's `~/.docker/config.json`,
+so `sudo docker pull` uses root's and does not see yours — and a tool that sets
+`DOCKER_CONFIG` has a client of its own.
 
 `infra/prod/docker-compose.ghcr.yml` is pull-only: it builds nothing and starts no
 database (the worker reaches yours through `MONGODB_URI`). It publishes only the web
@@ -138,4 +150,5 @@ bun run test:worker                           # cd apps/worker && go test ./... 
 | `OWNER_PASSWORD_HASH is empty` | `bun run prod` refuses the development plaintext password; run `bun run auth:hash` |
 | `/api/health` reports `worker: unreachable` | the worker is not running, or `WORKER_URL` points at loopback from inside a container |
 | `EADDRINUSE` on 3000 or 4000 | the development stack is still up; stop it before `bun run prod` |
+| `unauthorized` pulling `ghcr.io/…` | the client has no GHCR credential: log in as the user that runs docker (`sudo` uses root's config), or pull a tag that exists — a private package says `unauthorized` either way |
 | The console says a model call failed | `AI_*` is wrong, or the endpoint answered with an error envelope — the reply is retried once and then recorded as a provider fault |
