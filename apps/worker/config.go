@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"go.mau.fi/whatsmeow/types"
@@ -19,12 +20,22 @@ const (
 	// refuses to boot while WORKER_SECRET is missing or still this value.
 	devWorkerSecret = "dev-secret"
 
+	// devMemoryCallbackSecret is documented for local wiring only. Production
+	// refuses it so an internet-facing callback cannot share a public secret.
+	devMemoryCallbackSecret = "dev-memory-callback-secret"
+
 	devMongoURI = "mongodb://127.0.0.1:27017/group_butler?replicaSet=rs0"
 
 	// devWhatsmeowURI mirrors the value root `.env.example` supplies, so the
 	// fallback stays inside the git-ignored apps/worker/.localdata/. Deployment
 	// sets the mounted-volume path explicitly (apps/worker/.env.production.example).
 	devWhatsmeowURI = "file:./.localdata/whatsmeow.db?_foreign_keys=on"
+
+	// fallbackCountryCode is the country a national-form owner number is
+	// expanded with when DEFAULT_COUNTRY_CODE is unusable. It is the BFF's
+	// FALLBACK_COUNTRY_CODE: if the two sides expand the same number with
+	// different codes, the reply gate compares two different people.
+	fallbackCountryCode = "62"
 )
 
 // Config is the worker's whole runtime configuration, read from the
@@ -44,13 +55,26 @@ type Config struct {
 	R2Bucket       string
 	R2PublicURL    string
 
-	// OwnerWhatsAppJID enables automatic replies to the dashboard owner. The
-	// callback credentials deliver only qualifying owner mentions to the BFF.
-	// These three settings are all-or-none so partial configuration cannot
-	// silently change the bot's authorization boundary.
+	// OwnerWhatsAppJID is an optional, informational owner identity: it is
+	// normalized at startup when set and ignored when not. It does not gate
+	// anything — the BFF authorizes a mention's sender against the owner list it
+	// stores in Mongo, which is the same list the dashboard edits. The reply
+	// callback pair below is what actually delivers a mention, so those two are
+	// required together and nothing else is.
 	OwnerWhatsAppJID    string
 	ReplyCallbackURL    string
 	ReplyCallbackSecret string
+
+	// DefaultCountryCode is the country an operator leaves off when they write
+	// their own number in national form (`0899…`), shared with the BFF. A
+	// mismatch expands the same digits into different people, so the reply gate
+	// would never see the owner.
+	DefaultCountryCode string
+
+	MemoryCallbackURL      string
+	MemoryCallbackSecret   string
+	MemoryBatchEvery       time.Duration
+	MemoryBatchConcurrency int
 
 	IngestQueueSize int
 	IngestFlush     time.Duration
@@ -134,6 +158,10 @@ func loadConfig() (Config, error) {
 		SendMaxAttempts:    envInt("SEND_MAX_ATTEMPTS", 3),
 		HistorySyncMaxDays: envInt("HISTORY_SYNC_MAX_DAYS", 30),
 
+		MemoryCallbackURL:      os.Getenv("MEMORY_CALLBACK_URL"),
+		MemoryCallbackSecret:   os.Getenv("MEMORY_CALLBACK_SECRET"),
+		MemoryBatchConcurrency: envInt("MEMORY_BATCH_CONCURRENCY", 2),
+
 		AIBaseURL: os.Getenv("AI_BASE_URL"),
 		AIAPIKey:  os.Getenv("AI_API_KEY"),
 		AIModel:   os.Getenv("AI_MODEL"),
@@ -141,6 +169,7 @@ func loadConfig() (Config, error) {
 		OwnerWhatsAppJID:    os.Getenv("OWNER_WHATSAPP_JID"),
 		ReplyCallbackURL:    os.Getenv("REPLY_CALLBACK_URL"),
 		ReplyCallbackSecret: os.Getenv("REPLY_CALLBACK_SECRET"),
+		DefaultCountryCode:  os.Getenv("DEFAULT_COUNTRY_CODE"),
 
 		LogLevel: env("LOG_LEVEL", "info"),
 	}
@@ -155,6 +184,7 @@ func loadConfig() (Config, error) {
 		{"GROUP_SYNC_INTERVAL", &cfg.GroupSyncInterval, 30 * time.Minute},
 		{"GROUP_STALE_AFTER", &cfg.GroupStaleAfter, 6 * time.Hour},
 		{"DISPATCH_INTERVAL", &cfg.DispatchInterval, 5 * time.Second},
+		{"MEMORY_BATCH_INTERVAL", &cfg.MemoryBatchEvery, 30 * time.Second},
 	} {
 		v, err := envDuration(d.key, d.def)
 		if err != nil {
@@ -183,6 +213,9 @@ func loadConfig() (Config, error) {
 		case devWorkerSecret:
 			return Config{}, errors.New("WORKER_SECRET must not be the development default when ENVIRONMENT=production")
 		}
+		if cfg.MemoryCallbackSecret == devMemoryCallbackSecret {
+			return Config{}, errors.New("MEMORY_CALLBACK_SECRET must not be the development default when ENVIRONMENT=production")
+		}
 	}
 
 	// Every gate above has passed, so this is the configuration the worker will
@@ -209,6 +242,7 @@ func (c *Config) validate() error {
 		{"GROUP_SYNC_INTERVAL", c.GroupSyncInterval},
 		{"GROUP_STALE_AFTER", c.GroupStaleAfter},
 		{"DISPATCH_INTERVAL", c.DispatchInterval},
+		{"MEMORY_BATCH_INTERVAL", c.MemoryBatchEvery},
 	} {
 		if v.value <= 0 {
 			return fmt.Errorf("%s must be positive, got %s", v.key, v.value)
@@ -229,10 +263,14 @@ func (c *Config) validate() error {
 		{"MEDIA_MAX_ATTEMPTS", int64(c.MediaMaxAttempts)},
 		{"HISTORY_SYNC_MAX_DAYS", int64(c.HistorySyncMaxDays)},
 		{"SEND_MAX_ATTEMPTS", int64(c.SendMaxAttempts)},
+		{"MEMORY_BATCH_CONCURRENCY", int64(c.MemoryBatchConcurrency)},
 	} {
 		if v.value <= 0 {
 			return fmt.Errorf("%s must be positive, got %d", v.key, v.value)
 		}
+	}
+	if err := c.validateMemoryCallback(); err != nil {
+		return err
 	}
 	if err := c.validateOwnerReply(); err != nil {
 		return err
@@ -240,9 +278,9 @@ func (c *Config) validate() error {
 	return nil
 }
 
-func (c *Config) validateOwnerReply() error {
+func (c *Config) validateMemoryCallback() error {
 	configured := 0
-	for _, value := range []string{c.OwnerWhatsAppJID, c.ReplyCallbackURL, c.ReplyCallbackSecret} {
+	for _, value := range []string{c.MemoryCallbackURL, c.MemoryCallbackSecret} {
 		if value != "" {
 			configured++
 		}
@@ -250,21 +288,106 @@ func (c *Config) validateOwnerReply() error {
 	if configured == 0 {
 		return nil
 	}
-	if configured != 3 {
-		return errors.New("OWNER_WHATSAPP_JID, REPLY_CALLBACK_URL, and REPLY_CALLBACK_SECRET must be configured together")
+	if configured != 2 {
+		return errors.New("MEMORY_CALLBACK_URL and MEMORY_CALLBACK_SECRET must be configured together")
 	}
+	callback, err := url.ParseRequestURI(c.MemoryCallbackURL)
+	if err != nil || callback.Host == "" || (callback.Scheme != "http" && callback.Scheme != "https") {
+		return fmt.Errorf("MEMORY_CALLBACK_URL must be an absolute HTTP(S) URL, got %q", c.MemoryCallbackURL)
+	}
+	return nil
+}
 
-	owner, err := types.ParseJID(c.OwnerWhatsAppJID)
-	if err != nil || owner.Server != types.DefaultUserServer || phoneDigitsFromJID(owner) == "" {
-		return fmt.Errorf("OWNER_WHATSAPP_JID must be a WhatsApp user JID, got %q", c.OwnerWhatsAppJID)
+// validateOwnerReply gates owner-mention delivery.
+//
+// The callback pair is what actually delivers a mention: `deliverSavedReplies`
+// posts to `REPLY_CALLBACK_URL` and returns immediately when it is empty, so
+// those two are required together and nothing else is.
+//
+// Who counts as an owner is deliberately not decided here. The BFF authorizes
+// the sender of a mention against the `organizations` document it owns — the
+// same list the dashboard's owner editor writes — so `OWNER_WHATSAPP_JID` is
+// optional: normalized when the deployment sets it, ignored when it does not.
+func (c *Config) validateOwnerReply() error {
+	if (c.ReplyCallbackURL == "") != (c.ReplyCallbackSecret == "") {
+		return errors.New("REPLY_CALLBACK_URL and REPLY_CALLBACK_SECRET must be configured together")
 	}
-	c.OwnerWhatsAppJID = types.NewJID(phoneDigitsFromJID(owner), types.DefaultUserServer).String()
+	if c.OwnerWhatsAppJID != "" {
+		owner := ownerPhoneDigits(c.OwnerWhatsAppJID, c.DefaultCountryCode)
+		if owner == "" {
+			return fmt.Errorf("OWNER_WHATSAPP_JID must be a WhatsApp user JID, got %q", c.OwnerWhatsAppJID)
+		}
+		c.OwnerWhatsAppJID = types.NewJID(owner, types.DefaultUserServer).String()
+	}
+	if c.ReplyCallbackURL == "" {
+		return nil
+	}
 
 	callback, err := url.ParseRequestURI(c.ReplyCallbackURL)
 	if err != nil || callback.Host == "" || (callback.Scheme != "http" && callback.Scheme != "https") {
 		return fmt.Errorf("REPLY_CALLBACK_URL must be an absolute HTTP(S) URL, got %q", c.ReplyCallbackURL)
 	}
 	return nil
+}
+
+// ownerPhoneDigits reduces an operator-written owner number to the bare E.164
+// digits the reply gate compares, mirroring the BFF's normalizeAuthorizedJid
+// (apps/web/src/server/authorized-jids.ts) so the two sides agree on whose
+// message it is. An operator writes their own number the way their phone shows
+// it — national form, `0899…` — so a leading zero run is replaced with the
+// deployment country code; a leading `00` is the other way people write
+// international, so those two digits are dropped instead. A value naming
+// anything but a user server (a group JID, say) is not a phone number, and
+// neither is anything outside E.164's 7..15 digits; both yield "".
+func ownerPhoneDigits(value, countryCode string) string {
+	user := strings.TrimSpace(value)
+	if i := strings.IndexByte(user, '@'); i >= 0 {
+		if server := user[i+1:]; server != types.DefaultUserServer && server != types.LegacyUserServer {
+			return ""
+		}
+		user = user[:i]
+	}
+	// A device suffix (`:12`, or the `user.agent:device` spelling) identifies a
+	// session, not a different account.
+	if i := strings.IndexAny(user, ".:"); i >= 0 {
+		user = user[:i]
+	}
+
+	digits := digitsOnly(user)
+	switch {
+	case strings.HasPrefix(digits, "00"):
+		digits = digits[2:]
+	case strings.HasPrefix(digits, "0"):
+		digits = usableCountryCode(countryCode) + strings.TrimLeft(digits, "0")
+	}
+	// `^[1-9][0-9]{6,14}$`, on a string that is already all digits.
+	if len(digits) < 7 || len(digits) > 15 || digits[0] == '0' {
+		return ""
+	}
+	return digits
+}
+
+// usableCountryCode is the dialling code a national-form number is expanded
+// with: DEFAULT_COUNTRY_CODE when it reads as 1..4 digits with no leading zero,
+// else the fallback. A typo in the environment must not turn every national
+// number the operator enters into a rejected one.
+func usableCountryCode(configured string) string {
+	code := digitsOnly(configured)
+	if len(code) == 0 || len(code) > 4 || code[0] == '0' {
+		return fallbackCountryCode
+	}
+	return code
+}
+
+// digitsOnly drops everything that is not an ASCII digit, the way `+62
+// 899-6926-184` is read as the number it spells.
+func digitsOnly(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < '0' || r > '9' {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 // env returns the variable, falling back to def when it is unset or empty.

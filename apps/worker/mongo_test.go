@@ -22,7 +22,7 @@ func testMongoURI(t *testing.T) string {
 	return env("TEST_MONGODB_URI", "mongodb://127.0.0.1:27017/?replicaSet=rs0")
 }
 
-func TestWorkerIndexesCoverIngestAndDispatch(t *testing.T) {
+func TestWorkerIndexesCoverIngestAndMemoryContracts(t *testing.T) {
 	indexes := ingestIndexes()
 	cases := []struct {
 		coll   string
@@ -30,35 +30,75 @@ func TestWorkerIndexesCoverIngestAndDispatch(t *testing.T) {
 		keys   []string
 		unique bool
 	}{
-		{coll: collMessages, name: "uniq_message", keys: []string{"organizationId", "instanceId", "waMessageId"}, unique: true},
-		{coll: collGroups, name: "uniq_group", keys: []string{"organizationId", "instanceId", "groupJid"}, unique: true},
-		{coll: collSendRequests, name: "send_due", keys: []string{"status", "scheduledFor"}, unique: false},
-	}
-	if len(indexes) != len(cases) {
-		t.Fatalf("worker index set covers %d collections, want %d", len(indexes), len(cases))
+		{collMessages, "uniq_message", []string{"organizationId", "instanceId", "waMessageId"}, true},
+		{collMessages, "memory_batch_scan", []string{"organizationId", "instanceId", "groupJid", "flags.revoked", "timestamp", "waMessageId"}, false},
+		{collGroups, "uniq_group", []string{"organizationId", "instanceId", "groupJid"}, true},
+		{collSendRequests, "send_due", []string{"status", "scheduledFor"}, false},
+		{collMemoryBatches, "uniq_memory_batch_range", []string{"organizationId", "instanceId", "groupJid", "first.timestamp", "first.waMessageId", "last.timestamp", "last.waMessageId"}, true},
+		{collMemoryBatches, "uniq_memory_batch_predecessor", []string{"organizationId", "instanceId", "groupJid", "predecessor"}, true},
+		{collMemoryBatches, "memory_batch_claim", []string{"organizationId", "state", "nextAttemptAt", "lease.expiresAt", "createdAt"}, false},
+		{collMemoryBatches, "memory_batch_group_history", []string{"organizationId", "instanceId", "groupJid", "completedAt"}, false},
+		{collMemorySummaries, "uniq_memory_summary_batch", []string{"organizationId", "batchId"}, true},
+		{collMemorySummaries, "memory_summary_recent", []string{"organizationId", "instanceId", "groupJid", "period.to"}, false},
+		{collMemorySummaries, "memory_summary_text", []string{"summary", "topics", "decisions", "openQuestions", "actionItems"}, false},
+		{collMemoryFacts, "uniq_memory_fact_in_batch", []string{"organizationId", "batchId", "kind", "textSearch"}, true},
+		{collMemoryFacts, "memory_fact_recent", []string{"organizationId", "instanceId", "groupJid", "kind", "occurredAt"}, false},
+		{collMemoryFacts, "memory_fact_text", []string{"text", "subject"}, false},
+		{collMemoryFacts, "memory_fact_summary", []string{"organizationId", "summaryId"}, false},
+		{collAgentReplyRuns, "uniq_agent_reply_source", []string{"organizationId", "instanceId", "groupJid", "waMessageId"}, true},
+		{collAgentReplyRuns, "agent_reply_recovery", []string{"organizationId", "state", "lease.expiresAt"}, false},
 	}
 	for _, tc := range cases {
-		t.Run(tc.coll, func(t *testing.T) {
-			specs := indexes[tc.coll]
-			if len(specs) != 1 {
-				t.Fatalf("expected exactly one %s index in the worker set, got %d", tc.coll, len(specs))
+		t.Run(tc.coll+"/"+tc.name, func(t *testing.T) {
+			var found *indexSpec
+			for i := range indexes[tc.coll] {
+				if indexes[tc.coll][i].Name == tc.name {
+					found = &indexes[tc.coll][i]
+					break
+				}
 			}
-			if specs[0].Unique != tc.unique {
-				t.Errorf("%s unique = %t, want %t", tc.coll, specs[0].Unique, tc.unique)
+			if found == nil {
+				t.Fatalf("missing %s index %q", tc.coll, tc.name)
 			}
-			if specs[0].Name != tc.name {
-				t.Errorf("%s index name = %q, want %q", tc.coll, specs[0].Name, tc.name)
+			if found.Unique != tc.unique {
+				t.Errorf("%s unique = %t, want %t", tc.name, found.Unique, tc.unique)
 			}
-			got := specs[0].Keys
-			if len(got) != len(tc.keys) {
-				t.Fatalf("%s index keys = %v, want %v", tc.coll, got, tc.keys)
+			if len(found.Keys) != len(tc.keys) {
+				t.Fatalf("%s keys = %v, want %v", tc.name, found.Keys, tc.keys)
 			}
 			for i := range tc.keys {
-				if got[i] != tc.keys[i] {
-					t.Errorf("%s index key %d = %q, want %q (key order defines the index)", tc.coll, i, got[i], tc.keys[i])
+				if found.Keys[i] != tc.keys[i] {
+					t.Errorf("%s key %d = %q, want %q", tc.name, i, found.Keys[i], tc.keys[i])
 				}
 			}
 		})
+	}
+}
+
+func TestMemoryIndexSemanticsPreserveDirectionsTextAndPartialGuard(t *testing.T) {
+	indexes := ingestIndexes()
+	var predecessor, history, summaryText *indexSpec
+	for i := range indexes[collMemoryBatches] {
+		switch indexes[collMemoryBatches][i].Name {
+		case "uniq_memory_batch_predecessor":
+			predecessor = &indexes[collMemoryBatches][i]
+		case "memory_batch_group_history":
+			history = &indexes[collMemoryBatches][i]
+		}
+	}
+	for i := range indexes[collMemorySummaries] {
+		if indexes[collMemorySummaries][i].Name == "memory_summary_text" {
+			summaryText = &indexes[collMemorySummaries][i]
+		}
+	}
+	if predecessor == nil || !predecessor.Unique || !predecessor.Partial {
+		t.Fatalf("predecessor index = %#v, want a unique partial generation guard", predecessor)
+	}
+	if history == nil || len(history.Directions) != 4 || history.Directions[3] != -1 {
+		t.Fatalf("history directions = %#v, want completedAt descending", history)
+	}
+	if summaryText == nil || !summaryText.Text {
+		t.Fatalf("summary text index = %#v, want text key semantics", summaryText)
 	}
 }
 

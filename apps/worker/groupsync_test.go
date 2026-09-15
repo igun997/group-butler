@@ -71,6 +71,9 @@ func TestSyncGroupReconciliation_MarksAbsentGroupsLeft(t *testing.T) {
 	if summary.Total != 2 || summary.Unchanged != 2 {
 		t.Errorf("Total/Unchanged = %d/%d, want 2/2", summary.Total, summary.Unchanged)
 	}
+	if summary.GroupsLeft != 1 {
+		t.Errorf("GroupsLeft = %d, want 1: the gauge counts the groups we are known to have left", summary.GroupsLeft)
+	}
 	doc := store.FindOne(ctx, "org_default", "inst_1", "120363043000000003@g.us")
 	if doc == nil {
 		t.Fatal("group C disappeared: absence must mark state, not delete the row")

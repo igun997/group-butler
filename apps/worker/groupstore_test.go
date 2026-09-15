@@ -49,7 +49,7 @@ func TestUpsertGroupFromSync_PreservesConfig(t *testing.T) {
 	// The BFF owns config.*: simulate an owner assigning and whitelisting it.
 	if _, err := store.collection().UpdateOne(ctx,
 		map[string]any{"instanceId": "inst_1", "groupJid": info.JID.String()},
-		map[string]any{"$set": map[string]any{"config.assigned": true, "config.whitelisted": true, "config.notes": "keep me"}},
+		map[string]any{"$set": map[string]any{"config.assigned": true, "config.whitelisted": true, "config.configVersion": int64(7), "config.notes": "keep me"}},
 	); err != nil {
 		t.Fatalf("seed config: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestUpsertGroupFromSync_PreservesConfig(t *testing.T) {
 	if doc == nil {
 		t.Fatal("group missing after upsert")
 	}
-	want := groupConfig{Assigned: true, Whitelisted: true, Active: true, Notes: "keep me", Tags: []string{}}
+	want := groupConfig{Assigned: true, Whitelisted: true, ConfigVersion: 7, Active: true, Notes: "keep me", Tags: []string{}}
 	if !reflect.DeepEqual(doc.Config, want) {
 		t.Fatalf("config = %+v, want %+v (the worker must never write config.*)", doc.Config, want)
 	}
@@ -97,7 +97,7 @@ func TestUpsertGroupFromSync_SeedsDefaultsOnInsert(t *testing.T) {
 	if doc.Observed.State != GroupActive {
 		t.Errorf("state = %q, want active", doc.Observed.State)
 	}
-	want := groupConfig{Active: true, Tags: []string{}}
+	want := groupConfig{ConfigVersion: 0, Active: true, Tags: []string{}}
 	if !reflect.DeepEqual(doc.Config, want) {
 		t.Errorf("config = %+v, want the BFF defaults %+v", doc.Config, want)
 	}

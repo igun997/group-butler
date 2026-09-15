@@ -9,9 +9,10 @@ import (
 // when it starts, so `/scheduler` reports what is actually running rather than a
 // list maintained somewhere else that can drift.
 const (
-	loopGroupSync    = "group-sync"
-	loopMediaJanitor = "media-janitor"
-	loopSendDispatch = "send-dispatch"
+	loopGroupSync     = "group-sync"
+	loopMediaJanitor  = "media-janitor"
+	loopSendDispatch  = "send-dispatch"
+	loopMemoryBatches = "memory-batches"
 )
 
 // loopReport is one scheduled loop as the console shows it: what it is, how often

@@ -12,16 +12,20 @@ import (
 
 // Collection names (docs/architecture-draft.md §5.1).
 const (
-	collInstances      = "instances"
-	collGroups         = "groups"
-	collMessages       = "messages"
-	collSendRequests   = "sendRequests"
-	collAiCalls        = "aiCalls"
-	collStatsDaily     = "statsDaily"
-	collAuditLog       = "auditLog"
-	collPairingSession = "pairingSessions"
-	collAppSettings    = "appSettings"
-	collOrganizations  = "organizations"
+	collInstances       = "instances"
+	collGroups          = "groups"
+	collMessages        = "messages"
+	collMemoryBatches   = "memoryBatches"
+	collMemorySummaries = "memorySummaries"
+	collMemoryFacts     = "memoryFacts"
+	collAgentReplyRuns  = "agentReplyRuns"
+	collSendRequests    = "sendRequests"
+	collAiCalls         = "aiCalls"
+	collStatsDaily      = "statsDaily"
+	collAuditLog        = "auditLog"
+	collPairingSession  = "pairingSessions"
+	collAppSettings     = "appSettings"
+	collOrganizations   = "organizations"
 )
 
 // mongoPing is the connection handshake as a seam: connectMongo's failure path
@@ -55,9 +59,12 @@ func connectMongo(ctx context.Context, uri, dbName string) (*mongo.Client, *mong
 // driver's IndexModel hides its keys behind `any`, so the worker keeps the
 // names it asked for and translates to the driver shape in one place.
 type indexSpec struct {
-	Keys   []string
-	Unique bool
-	Name   string
+	Keys       []string
+	Directions []int
+	Unique     bool
+	Text       bool
+	Partial    bool
+	Name       string
 }
 
 // ingestIndexes is the SUBSET of the canonical index set (bootstrap.ts) that
@@ -65,21 +72,37 @@ type indexSpec struct {
 // where a redelivered message would be duplicated.
 func ingestIndexes() map[string][]indexSpec {
 	return map[string][]indexSpec{
-		collMessages: {{
-			Keys:   []string{"organizationId", "instanceId", "waMessageId"},
-			Unique: true,
-			Name:   "uniq_message",
-		}},
-		collGroups: {{
-			Keys:   []string{"organizationId", "instanceId", "groupJid"},
-			Unique: true,
-			Name:   "uniq_group",
-		}},
-		collSendRequests: {{
-			Keys:   []string{"status", "scheduledFor"},
-			Unique: false,
-			Name:   "send_due",
-		}},
+		collMessages: {
+			{Keys: []string{"organizationId", "instanceId", "waMessageId"}, Unique: true, Name: "uniq_message"},
+			{Keys: []string{"organizationId", "instanceId", "groupJid", "flags.revoked", "timestamp", "waMessageId"}, Name: "memory_batch_scan"},
+		},
+		collGroups: {
+			{Keys: []string{"organizationId", "instanceId", "groupJid"}, Unique: true, Name: "uniq_group"},
+		},
+		collSendRequests: {
+			{Keys: []string{"status", "scheduledFor"}, Name: "send_due"},
+		},
+		collMemoryBatches: {
+			{Keys: []string{"organizationId", "instanceId", "groupJid", "first.timestamp", "first.waMessageId", "last.timestamp", "last.waMessageId"}, Unique: true, Name: "uniq_memory_batch_range"},
+			{Keys: []string{"organizationId", "instanceId", "groupJid", "predecessor"}, Unique: true, Partial: true, Name: "uniq_memory_batch_predecessor"},
+			{Keys: []string{"organizationId", "state", "nextAttemptAt", "lease.expiresAt", "createdAt"}, Name: "memory_batch_claim"},
+			{Keys: []string{"organizationId", "instanceId", "groupJid", "completedAt"}, Directions: []int{1, 1, 1, -1}, Name: "memory_batch_group_history"},
+		},
+		collMemorySummaries: {
+			{Keys: []string{"organizationId", "batchId"}, Unique: true, Name: "uniq_memory_summary_batch"},
+			{Keys: []string{"organizationId", "instanceId", "groupJid", "period.to"}, Directions: []int{1, 1, 1, -1}, Name: "memory_summary_recent"},
+			{Keys: []string{"summary", "topics", "decisions", "openQuestions", "actionItems"}, Text: true, Name: "memory_summary_text"},
+		},
+		collMemoryFacts: {
+			{Keys: []string{"organizationId", "batchId", "kind", "textSearch"}, Unique: true, Name: "uniq_memory_fact_in_batch"},
+			{Keys: []string{"organizationId", "instanceId", "groupJid", "kind", "occurredAt"}, Directions: []int{1, 1, 1, 1, -1}, Name: "memory_fact_recent"},
+			{Keys: []string{"text", "subject"}, Text: true, Name: "memory_fact_text"},
+			{Keys: []string{"organizationId", "summaryId"}, Name: "memory_fact_summary"},
+		},
+		collAgentReplyRuns: {
+			{Keys: []string{"organizationId", "instanceId", "groupJid", "waMessageId"}, Unique: true, Name: "uniq_agent_reply_source"},
+			{Keys: []string{"organizationId", "state", "lease.expiresAt"}, Name: "agent_reply_recovery"},
+		},
 	}
 }
 
@@ -88,12 +111,23 @@ func ensureIngestIndexes(ctx context.Context, db *mongo.Database) error {
 		models := make([]mongo.IndexModel, 0, len(specs))
 		for _, spec := range specs {
 			keys := make(bson.D, 0, len(spec.Keys))
-			for _, key := range spec.Keys {
-				keys = append(keys, bson.E{Key: key, Value: 1})
+			for i, key := range spec.Keys {
+				if spec.Text {
+					keys = append(keys, bson.E{Key: key, Value: "text"})
+					continue
+				}
+				direction := 1
+				if len(spec.Directions) > i {
+					direction = spec.Directions[i]
+				}
+				keys = append(keys, bson.E{Key: key, Value: direction})
 			}
 			opts := options.Index().SetName(spec.Name)
 			if spec.Unique {
 				opts = opts.SetUnique(true)
+			}
+			if spec.Partial {
+				opts = opts.SetPartialFilterExpression(bson.D{{Key: "predecessor", Value: bson.D{{Key: "$exists", Value: true}}}})
 			}
 			models = append(models, mongo.IndexModel{Keys: keys, Options: opts})
 		}

@@ -31,6 +31,12 @@ type SyncSummary struct {
 	MarkedLeft      int        `json:"markedLeft"`
 	SubjectRejected int        `json:"subjectRejected"`
 	Unchanged       int        `json:"unchanged"`
+	// GroupsLeft is the stored gauge this pass leaves behind — how many groups
+	// the instance is known to have left — not a count of this pass's changes,
+	// which is `MarkedLeft`. It is persisted to `runtime.groupSync.groupsLeft`
+	// and is deliberately not on the wire, so the §6.6.6 JSON contract every BFF
+	// parses is unchanged.
+	GroupsLeft int `json:"-"`
 }
 
 // runGroupSync performs the authoritative membership snapshot (§6.6.5):
@@ -93,25 +99,31 @@ func runGroupSync(ctx context.Context, client groupClient, store groupStoreAPI, 
 			return finish(), err
 		}
 	}
-	if !prune {
-		return finish(), nil
+	if prune {
+		// The baseline is read only after the snapshot succeeded: deriving
+		// absence from a half-applied sync would mark groups left that simply
+		// came later in the response.
+		baseline, err := store.KnownGroupJIDs(ctx, orgID, instanceID)
+		if err != nil {
+			return finish(), err
+		}
+		for _, jid := range baseline {
+			if returned[jid] {
+				continue
+			}
+			if err := store.MarkLeft(ctx, orgID, instanceID, jid, GroupLeft); err != nil {
+				return finish(), err
+			}
+			summary.MarkedLeft++
+		}
 	}
-	// The baseline is read only after the snapshot succeeded: deriving absence
-	// from a half-applied sync would mark groups left that simply came later in
-	// the response.
-	baseline, err := store.KnownGroupJIDs(ctx, orgID, instanceID)
+	// The stored gauge is read last, after any absence reconciliation, so it
+	// describes the state this pass leaves behind rather than the one it found.
+	left, err := store.CountLeft(ctx, orgID, instanceID)
 	if err != nil {
 		return finish(), err
 	}
-	for _, jid := range baseline {
-		if returned[jid] {
-			continue
-		}
-		if err := store.MarkLeft(ctx, orgID, instanceID, jid, GroupLeft); err != nil {
-			return finish(), err
-		}
-		summary.MarkedLeft++
-	}
+	summary.GroupsLeft = left
 	return finish(), nil
 }
 

@@ -91,6 +91,11 @@ func run() error {
 	mgr := newManager(cfg, newGroupStore(db), newInstanceMongo(db), newPairingMongo(db), queue, authStore)
 	mgr.stats = newStatsStore(db)
 	mgr.audit = newAuditStore(db)
+	// The direct-chat gate reads the owner list the BFF owns, cached for
+	// ownerListTTL: a message never waits on a Mongo round trip for an answer
+	// the worker already has, and a list the operator changes is picked up
+	// without a restart.
+	mgr.owners = newOwnerStore(db, cfg.DefaultCountryCode)
 	queue.setAfterSave(mgr.deliverSavedReplies)
 	// What a flush created lands in the day counters and the instance counters,
 	// which is what the console's usage section reads (§10).
@@ -111,6 +116,8 @@ func run() error {
 	// loop (MEDIA_JANITOR_INTERVAL) own their own cadence.
 	start(func() { mgr.runGroupSyncScheduler(ctx) })
 	start(func() { mgr.runMediaJanitor(ctx) })
+	memoryBatches := newMemoryBatchWorker(db, cfg)
+	start(func() { memoryBatches.Run(ctx, mgr.newTicker, mgr.loops) })
 	dispatcher := newSendDispatcher(db, cfg)
 	start(func() { dispatcher.run(ctx, mgr) })
 

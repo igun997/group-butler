@@ -17,11 +17,12 @@ import (
 // list is here so a drift in the config shape is a compile-time fact instead of
 // a silent loss in a round-trip test.
 type groupConfig struct {
-	Assigned    bool     `bson:"assigned"`
-	Whitelisted bool     `bson:"whitelisted"`
-	Active      bool     `bson:"active"`
-	Notes       string   `bson:"notes"`
-	Tags        []string `bson:"tags"`
+	Assigned      bool     `bson:"assigned"`
+	Whitelisted   bool     `bson:"whitelisted"`
+	ConfigVersion int64    `bson:"configVersion"`
+	Active        bool     `bson:"active"`
+	Notes         string   `bson:"notes"`
+	Tags          []string `bson:"tags"`
 }
 
 // groupDoc is a whole `groups` document as read back: the identity triple, the
@@ -248,6 +249,22 @@ func (s *groupStore) KnownGroupJIDs(ctx context.Context, orgID, instanceID strin
 		jids = append(jids, jid)
 	}
 	return jids, nil
+}
+
+// CountLeft is how many groups this instance is currently known to have left or
+// lost. It is the gauge §5.1 keeps next to `groupsObserved`, so a dashboard can
+// say "12 observed, 1 left" without re-deriving the second number from the list
+// it renders.
+func (s *groupStore) CountLeft(ctx context.Context, orgID, instanceID string) (int, error) {
+	count, err := s.coll.CountDocuments(ctx, bson.D{
+		{Key: "organizationId", Value: orgID},
+		{Key: "instanceId", Value: instanceID},
+		{Key: "observed.state", Value: bson.D{{Key: "$in", Value: bson.A{GroupLeft, GroupDeleted}}}},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("count left groups for %s/%s: %w", orgID, instanceID, err)
+	}
+	return int(count), nil
 }
 
 // loadObserved reads every stored observation for one instance in a single

@@ -71,6 +71,10 @@ func (f *fakeGroupStore) KnownGroupJIDs(context.Context, string, string) ([]stri
 	return nil, nil
 }
 
+func (f *fakeGroupStore) CountLeft(context.Context, string, string) (int, error) {
+	return 0, nil
+}
+
 func (f *fakeGroupStore) ListForInstance(context.Context, string, string) ([]groupListRow, *string, error) {
 	return nil, nil, nil
 }
@@ -301,12 +305,15 @@ func TestHistorySyncIsRoutedOffTheCallback(t *testing.T) {
 	}
 }
 
-func TestInboundMessageJobPersistsOnlyAssignedGroups(t *testing.T) {
+// The ingestion gate is the privacy boundary for group content, and it must
+// agree with the two readers downstream of it (the BFF reply route and the
+// memory-batch builder), both of which require *both* flags. A group the
+// operator merely assigned but never granted, or granted but never assigned,
+// must not have a single message written.
+func TestInboundMessageJobPersistsOnlyAssignedAndWhitelistedGroups(t *testing.T) {
 	groupJID := types.NewJID("120363043123456789", types.GroupServer).String()
 	groups := newFakeGroupStore()
-	ingest := newIngestQueue(2, time.Hour, 10)
 	mgr := testManagerWithDeps(groups, nil, nil)
-	mgr.ingest = ingest
 	s := testSession(mgr, newFakeClient())
 	evt := &events.Message{
 		Info: types.MessageInfo{
@@ -325,23 +332,39 @@ func TestInboundMessageJobPersistsOnlyAssignedGroups(t *testing.T) {
 		t.Fatalf("parseInbound: %v", err)
 	}
 
-	t.Run("unassigned", func(t *testing.T) {
-		groups.docs[groupJID] = &groupDoc{Config: groupConfig{Assigned: false}}
+	for _, tt := range []struct {
+		name        string
+		assigned    bool
+		whitelisted bool
+		want        int
+	}{
+		{"neither flag", false, false, 0},
+		{"assigned only", true, false, 0},
+		{"whitelisted only", false, true, 0},
+		{"assigned and whitelisted", true, true, 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ingest := newIngestQueue(4, time.Hour, 10)
+			mgr.ingest = ingest
+			groups.docs[groupJID] = &groupDoc{Config: groupConfig{Assigned: tt.assigned, Whitelisted: tt.whitelisted}}
+			if err := (inboundMessageJob{session: s, evt: evt, doc: doc}).persist(context.Background(), mgr); err != nil {
+				t.Fatalf("persist: %v", err)
+			}
+			if ingest.Depth() != tt.want {
+				t.Fatalf("ingest depth = %d, want %d (assigned=%v whitelisted=%v)", ingest.Depth(), tt.want, tt.assigned, tt.whitelisted)
+			}
+		})
+	}
+
+	t.Run("no group row at all", func(t *testing.T) {
+		ingest := newIngestQueue(4, time.Hour, 10)
+		mgr.ingest = ingest
+		delete(groups.docs, groupJID)
 		if err := (inboundMessageJob{session: s, evt: evt, doc: doc}).persist(context.Background(), mgr); err != nil {
 			t.Fatalf("persist: %v", err)
 		}
 		if ingest.Depth() != 0 {
-			t.Fatal("unassigned group message reached the ingest queue")
-		}
-	})
-
-	t.Run("assigned", func(t *testing.T) {
-		groups.docs[groupJID] = &groupDoc{Config: groupConfig{Assigned: true}}
-		if err := (inboundMessageJob{session: s, evt: evt, doc: doc}).persist(context.Background(), mgr); err != nil {
-			t.Fatalf("persist: %v", err)
-		}
-		if ingest.Depth() != 1 {
-			t.Fatalf("assigned group ingest depth = %d, want 1", ingest.Depth())
+			t.Fatal("a message for a group this instance has no row for reached the ingest queue")
 		}
 	})
 }

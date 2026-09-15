@@ -34,15 +34,20 @@ type deviceStore interface {
 
 // whatsmeowClient is every whatsmeow method the worker uses, in one place
 // (§6.1). *whatsmeow.Client satisfies it as-is, and nothing else in the project
-// reaches into the library outside these methods.
+// reaches into the library outside these methods. It is the read surface plus
+// the write surface plus the lifecycle surface, because one session owns one
+// client: the narrower interfaces are what each *caller* is allowed to reach for.
 type whatsmeowClient interface {
 	groupClient
+	groupAdminClient
 	whatsmeowMediaClient
 
 	AddEventHandler(handler whatsmeow.EventHandler) uint32
 	RemoveEventHandler(id uint32) bool
 	Connect() error
 	Disconnect()
+	IsConnected() bool
+	IsLoggedIn() bool
 	Logout(ctx context.Context) error
 	GetQRChannel(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error)
 	PairPhone(ctx context.Context, phone string, showPushNotification bool, clientType whatsmeow.PairClientType, clientDisplayName string) (string, error)
@@ -223,6 +228,178 @@ func (m *manager) failPairing(s *session, cause error) {
 			logf("instance %s: audit pairing failure: %v", s.id, err)
 		}
 	}
+}
+
+// repairPairing restarts pairing for an instance whose credential is gone, dead
+// or discarded (POST /instances/{id}/pair). It refuses a linked account: the only
+// way to pair a second device is to unlink the one WhatsApp already honours, and
+// doing that behind the owner's back would drop a working link.
+//
+// The stale credential is invalidated before the new device is created — unlink
+// what is still authenticated, delete the stored device row, then clear the
+// persisted material and the recorded failure. A device left behind would be
+// picked up by the boot restore and back the instance with a credential the owner
+// already replaced.
+func (m *manager) repairPairing(ctx context.Context, id string) (instanceSnapshot, error) {
+	row, err := m.instances.Get(ctx, m.orgID, id)
+	if err != nil {
+		return instanceSnapshot{}, err
+	}
+	if row == nil {
+		return instanceSnapshot{}, errInstanceNotFound
+	}
+	if s := m.get(id); s != nil {
+		switch s.snapshot().Status {
+		case stateConnected:
+			return instanceSnapshot{}, errAlreadyConnected
+		case statePairing:
+			// The attempt the caller can already see is the one it asked for: a
+			// second device would race the first QR for the same phone scan.
+			return m.getInstance(ctx, id)
+		}
+		if err := m.dropStaleCredential(ctx, s); err != nil {
+			return instanceSnapshot{}, err
+		}
+	}
+	if err := m.deleteAuthDevice(ctx, *row); err != nil {
+		return instanceSnapshot{}, err
+	}
+	if err := m.pairing.Clear(ctx, m.orgID, id); err != nil {
+		return instanceSnapshot{}, fmt.Errorf("%w: clear pairing material: %v", errCleanupFailed, err)
+	}
+	if err := m.markStatus(ctx, id, statePairing, ""); err != nil {
+		return instanceSnapshot{}, err
+	}
+	if _, err := m.beginPairing(*row); err != nil {
+		// The row exists but nothing is pairing: record why, so the dashboard
+		// shows the failure instead of a stuck "pairing".
+		if markErr := m.markStatus(context.WithoutCancel(ctx), id, stateError, err.Error()); markErr != nil {
+			logf("instance %s: record pairing error: %v", id, markErr)
+		}
+		return instanceSnapshot{}, err
+	}
+	return m.getInstance(ctx, id)
+}
+
+// dropStaleCredential tears down the session a re-pair replaces: an authenticated
+// client is logged out — whatsmeow only drops the device from the store once
+// WhatsApp acknowledged the unlink — and the socket is closed either way, so
+// nothing survives to reconnect behind the new pairing attempt.
+func (m *manager) dropStaleCredential(ctx context.Context, s *session) error {
+	s.mu.Lock()
+	client := s.client
+	s.mu.Unlock()
+	if client != nil {
+		if client.IsLoggedIn() {
+			if err := client.Logout(ctx); err != nil && !errors.Is(err, whatsmeow.ErrNotLoggedIn) {
+				// The account is still linked: pairing over it would leave two
+				// companion devices for one phone.
+				return fmt.Errorf("%w: %v", errLogoutFailed, err)
+			}
+		}
+		client.Disconnect()
+	}
+	m.discard(s)
+	return nil
+}
+
+// verifyConnection reports what an instance's connection actually is instead of
+// repeating the status the last event happened to leave behind
+// (POST /instances/{id}/check). It asks the client, and when there is no client
+// it rebuilds one from the instance's own auth device, so a socket that silently
+// died — or a credential WhatsApp revoked — cannot keep answering `connected`.
+func (m *manager) verifyConnection(ctx context.Context, id string) (instanceSnapshot, error) {
+	row, err := m.instances.Get(ctx, m.orgID, id)
+	if err != nil {
+		return instanceSnapshot{}, err
+	}
+	if row == nil {
+		return instanceSnapshot{}, errInstanceNotFound
+	}
+	if s := m.get(id); s != nil {
+		return m.verifySession(ctx, s)
+	}
+	return m.verifyStoredCredential(ctx, *row)
+}
+
+// verifySession draws the conclusion a live client supports: an authenticated
+// client with a live socket is connected, an authenticated one whose socket is
+// down is reconnected, and one with no credential left has lost the link.
+func (m *manager) verifySession(ctx context.Context, s *session) (instanceSnapshot, error) {
+	s.mu.Lock()
+	client, status := s.client, s.status
+	s.mu.Unlock()
+	if client == nil {
+		return m.getInstance(ctx, s.id)
+	}
+	if status == statePairing && !client.IsLoggedIn() {
+		// Pairing is in flight: IsLoggedIn is false by design until the phone
+		// confirms, so "logged_out" would be a lie and clearing the material
+		// would cancel the attempt the dashboard is showing.
+		return m.getInstance(ctx, s.id)
+	}
+	switch {
+	case client.IsLoggedIn() && client.IsConnected():
+		return m.conclude(ctx, s.id, stateConnected, "")
+	case client.IsLoggedIn():
+		if err := client.Connect(); err != nil {
+			return m.conclude(ctx, s.id, stateError, err.Error())
+		}
+		return m.conclude(ctx, s.id, stateConnected, "")
+	default:
+		return m.concludeLoggedOut(ctx, s.id)
+	}
+}
+
+// verifyStoredCredential rebuilds the live session when the instance has none. It
+// is the single-instance form of restoreInstances: it never borrows a device
+// another instance holds, and a row whose credential is gone concludes
+// `logged_out` instead of pretending to reconnect.
+func (m *manager) verifyStoredCredential(ctx context.Context, row InstanceRow) (instanceSnapshot, error) {
+	device, err := m.deviceForPhone(ctx, row.PhoneNumber)
+	if err != nil {
+		return instanceSnapshot{}, err
+	}
+	if device == nil || device.GetJID().IsEmpty() {
+		// No device, or a device row that never registered: there is nothing to
+		// log in with, so the link does not exist whatever the row says.
+		return m.concludeLoggedOut(ctx, row.ID)
+	}
+	if deviceOwnedByOther(m.liveDevices(), row.ID, device.GetJID()) {
+		// One linked account never backs two instances (§6.1).
+		return m.conclude(ctx, row.ID, stateError,
+			fmt.Sprintf("device %s is already linked to another instance", device.GetJID()))
+	}
+	s, err := m.openSession(row, device)
+	if err != nil {
+		return m.conclude(ctx, row.ID, stateError, err.Error())
+	}
+	s.setStatus(stateDisconnected, "")
+	if err := s.client.Connect(); err != nil {
+		m.discard(s)
+		return m.conclude(ctx, row.ID, stateError, err.Error())
+	}
+	return m.conclude(ctx, row.ID, stateConnected, "")
+}
+
+// conclude persists the status a check proved and answers with the instance as it
+// reads afterwards, so the caller is never handed the status the check just
+// disproved.
+func (m *manager) conclude(ctx context.Context, id string, status sessionState, reason string) (instanceSnapshot, error) {
+	if err := m.markStatus(ctx, id, status, reason); err != nil {
+		return instanceSnapshot{}, err
+	}
+	return m.getInstance(ctx, id)
+}
+
+// concludeLoggedOut ends the link: the credential is gone, so the material of any
+// dead pairing attempt goes with it — a leftover QR would otherwise keep the
+// instance reading as an attempt it can no longer make.
+func (m *manager) concludeLoggedOut(ctx context.Context, id string) (instanceSnapshot, error) {
+	if err := m.pairing.Clear(ctx, m.orgID, id); err != nil {
+		return instanceSnapshot{}, fmt.Errorf("%w: clear pairing material: %v", errCleanupFailed, err)
+	}
+	return m.conclude(ctx, id, stateLoggedOut, "")
 }
 
 // requestPairingCode produces (or re-requests) the phone pairing code for a
@@ -566,11 +743,13 @@ func (m *manager) runGroupSyncOnce(ctx context.Context, s *session, source SyncS
 	summary, err := runGroupSync(ctx, client, m.groups, m.orgID, s.id, source, m.cfg.GroupSyncPrune)
 	if err != nil {
 		logf("instance %s: group sync (%s): %v", s.id, source, err)
+		m.recordGroupSyncError(ctx, s.id, err.Error())
 		return err
 	}
 	// Only a snapshot that arrived describes the membership; a refused sync must
-	// leave the last observed total standing rather than counting the refusal.
-	m.recordGroups(ctx, s.id, summary.Total)
+	// leave the last observed total standing rather than reporting the refusal as
+	// an empty membership.
+	m.recordGroupSync(ctx, s.id, summary)
 	logf("instance %s: group sync (%s): %d group(s), %d added, %d marked left",
 		s.id, source, summary.Total, summary.Added, summary.MarkedLeft)
 	return nil

@@ -19,8 +19,15 @@ import (
 // leaves those routes answering 404, which keeps the group surface testable on
 // its own.
 type api struct {
-	store      groupStoreAPI
-	clientFor  func(instanceID string) groupClient
+	store     groupStoreAPI
+	clientFor func(instanceID string) groupClient
+	// adminFor resolves the same live client as `clientFor`, but as the write
+	// surface the group-admin route needs: the reads a dashboard performs are
+	// safe, so the two capabilities are kept apart by their types.
+	adminFor func(instanceID string) groupAdminClient
+	// botFor resolves the linked account's own JIDs, which is how a group read
+	// answers whether the bot itself is an admin.
+	botFor     func(instanceID string) botIdentity
 	manager    *manager
 	orgID      string
 	secret     string
@@ -235,7 +242,7 @@ func (a *api) auth(next http.HandlerFunc) http.HandlerFunc {
 
 // handleInstanceSubresource routes `/instances[/{id}[/{subresource}]]`. The
 // first segment selects the lifecycle surface or, for a known instance, one of
-// its subresources (groups, pairing-code).
+// its subresources (groups, pairing-code, pair, check).
 func (a *api) handleInstanceSubresource(w http.ResponseWriter, r *http.Request) {
 	tail := splitPath(r.URL.Path)
 	switch {
@@ -251,6 +258,18 @@ func (a *api) handleInstanceSubresource(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		a.handlePairingCode(w, r, tail[0])
+	case len(tail) == 2 && tail[0] != "" && tail[1] == "pair":
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST /instances/{id}/pair")
+			return
+		}
+		a.handleRepairPairing(w, r, tail[0])
+	case len(tail) == 2 && tail[0] != "" && tail[1] == "check":
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST /instances/{id}/check")
+			return
+		}
+		a.handleCheckConnection(w, r, tail[0])
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "unknown worker route")
 	}
@@ -328,6 +347,30 @@ func (a *api) handlePairingCode(w http.ResponseWriter, r *http.Request, instance
 	writeJSON(w, http.StatusOK, snap)
 }
 
+// handleRepairPairing starts pairing again for an instance whose link is gone or
+// broken (§6.5 POST /instances/{id}/pair). The body is empty: which instance and
+// which mode are already persisted.
+func (a *api) handleRepairPairing(w http.ResponseWriter, r *http.Request, instanceID string) {
+	snap, err := a.manager.repairPairing(r.Context(), instanceID)
+	if err != nil {
+		a.writeInstanceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, snap)
+}
+
+// handleCheckConnection answers what an instance's connection actually is (§6.5
+// POST /instances/{id}/check). It is a query in POST clothing because it may
+// reconnect: a truthful answer can require opening a socket.
+func (a *api) handleCheckConnection(w http.ResponseWriter, r *http.Request, instanceID string) {
+	snap, err := a.manager.verifyConnection(r.Context(), instanceID)
+	if err != nil {
+		a.writeInstanceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, snap)
+}
+
 // writeInstanceError maps the manager's sentinel errors to the §6.5 stable
 // codes the BFF turns into UI messages.
 func (a *api) writeInstanceError(w http.ResponseWriter, err error) {
@@ -336,7 +379,7 @@ func (a *api) writeInstanceError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, errLabelConflict):
 		writeError(w, http.StatusConflict, "label_conflict", err.Error())
-	case errors.Is(err, errWrongMode), errors.Is(err, errPairingNotReady):
+	case errors.Is(err, errWrongMode), errors.Is(err, errPairingNotReady), errors.Is(err, errAlreadyConnected):
 		writeError(w, http.StatusConflict, "invalid_state", err.Error())
 	case errors.Is(err, errLogoutFailed), errors.Is(err, errDeviceDeleteFailed), errors.Is(err, errCleanupFailed):
 		// Recoverable: nothing was soft-deleted, so the owner may retry.
@@ -352,7 +395,14 @@ func (a *api) writeInstanceError(w http.ResponseWriter, err error) {
 // BFF, but an unbounded body would still be a memory-exhaustion primitive, so
 // the limit is part of the contract rather than an assumption.
 func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, controlBodyMaxBytes))
+	return decodeBodyLimited(w, r, dst, controlBodyMaxBytes)
+}
+
+// decodeBodyLimited is decodeBody for the routes whose body is larger than a
+// create/pairing request — the group-admin photo, whose size is bounded by the
+// photo's own limit instead.
+func decodeBodyLimited(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64) bool {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes))
 	if err := decoder.Decode(dst); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", "malformed JSON body")
 		return false
@@ -360,8 +410,10 @@ func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 	return true
 }
 
-// controlBodyMaxBytes bounds every control-plane request body. The largest
-// documented body is a create/pairing request, which is a few hundred bytes.
+// controlBodyMaxBytes bounds every control-plane request body that is not a
+// group-admin write. The largest of those is a create/pairing request, which is
+// a few hundred bytes; the admin route carries an image and has its own limit
+// (groupAdminBodyMaxBytes).
 const controlBodyMaxBytes = 8 * 1024
 
 // handleGroupSubresource routes `/instances/{id}/groups[/…]`.
@@ -385,6 +437,24 @@ func (a *api) handleGroupSubresource(w http.ResponseWriter, r *http.Request, ins
 			return
 		}
 		a.handleGroupByJID(w, r, instanceID, rest[0])
+	case len(rest) == 2 && rest[0] != "" && rest[1] == "info":
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "GET /instances/{id}/groups/{groupJid}/info")
+			return
+		}
+		a.handleGroupInfo(w, r, instanceID, rest[0])
+	case len(rest) == 2 && rest[0] != "" && rest[1] == "participants":
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "GET /instances/{id}/groups/{groupJid}/participants")
+			return
+		}
+		a.handleGroupParticipants(w, r, instanceID, rest[0])
+	case len(rest) == 2 && rest[0] != "" && rest[1] == "admin":
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST /instances/{id}/groups/{groupJid}/admin")
+			return
+		}
+		a.handleGroupAdmin(w, r, instanceID, rest[0])
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "unknown worker route")
 	}
@@ -425,14 +495,20 @@ func (a *api) handleGroupSync(w http.ResponseWriter, r *http.Request, instanceID
 	}
 	summary, err := runGroupSync(r.Context(), client, a.store, a.orgID, instanceID, SyncOnManual, a.prune)
 	if err != nil {
+		// A manual sync that was refused is recorded like a timer-driven one, so
+		// the dashboard's "last sync error" reflects the failure the operator
+		// just triggered instead of the last success.
+		if a.manager != nil {
+			a.manager.recordGroupSyncError(r.Context(), instanceID, err.Error())
+		}
 		writeError(w, http.StatusBadGateway, "group_sync_failed", err.Error())
 		return
 	}
 	// A manual sync describes the membership just as a timer-driven one does, so
-	// it moves the same counter. The harness that wires this handler without a
-	// manager (the group surface on its own) has no counters to move.
+	// it moves the same summary. The harness that wires this handler without a
+	// manager (the group surface on its own) has no summary to move.
 	if a.manager != nil {
-		a.manager.recordGroups(r.Context(), instanceID, summary.Total)
+		a.manager.recordGroupSync(r.Context(), instanceID, summary)
 	}
 	writeJSON(w, http.StatusOK, syncResponse{OK: true, InstanceID: instanceID, SyncSummary: summary})
 }

@@ -203,23 +203,46 @@ func TestRecordSendCountsBothOutcomes(t *testing.T) {
 
 // ---- groups --------------------------------------------------------------
 
-// `groups` describes the membership the last sync observed, so it is a gauge
-// and not a tally: adding the snapshot's size on every pass would grow with the
-// number of syncs and answer nothing.
-func TestRecordGroupsSetsTheObservedTotal(t *testing.T) {
+// `runtime.groupSync` describes the membership the last sync observed, so it is
+// a gauge and not a tally: overwriting the summary on every pass is what keeps
+// "Observed" equal to the snapshot, not to the number of syncs that ran.
+func TestRecordGroupSyncSetsTheObservedSummary(t *testing.T) {
 	stats := &fakeDayCounters{}
 	repo := newFakeInstanceRepo()
 	mgr := testManagerWithDeps(newFakeGroupStore(), stats, nil)
 	mgr.instances = repo
 
-	mgr.recordGroups(context.Background(), "inst_1", 12)
-	mgr.recordGroups(context.Background(), "inst_1", 4)
+	mgr.recordGroupSync(context.Background(), "inst_1", SyncSummary{Total: 12, GroupsLeft: 1})
+	mgr.recordGroupSync(context.Background(), "inst_1", SyncSummary{Total: 4, GroupsLeft: 2})
 
-	if got := repo.counters["inst_1"][runtimeCounterGroups]; got != 4 {
-		t.Fatalf("%s = %d, want the last snapshot's total", runtimeCounterGroups, got)
+	got := repo.groupSync["inst_1"]
+	if got.GroupsObserved != 4 || got.GroupsLeft != 2 {
+		t.Fatalf("groupSync = %+v, want the last snapshot's total and left count", got)
+	}
+	if got.LastSyncAt.IsZero() {
+		t.Error("a recorded summary must carry when it ran")
 	}
 	if got := stats.count(); got != 0 {
 		t.Fatalf("day bumps = %d, want none: §10 counts groups per instance, not per day", got)
+	}
+}
+
+// A refused sync says nothing about membership, so it moves only `lastError`:
+// the dashboard must keep showing the last snapshot's total rather than reading
+// a timed-out IQ as "we left every group" (§6.6.5 rule 4).
+func TestRecordGroupSyncErrorKeepsTheLastMembership(t *testing.T) {
+	repo := newFakeInstanceRepo()
+	mgr := testManagerWithDeps(newFakeGroupStore(), nil, nil)
+	mgr.instances = repo
+
+	mgr.recordGroupSync(context.Background(), "inst_1", SyncSummary{Total: 12, GroupsLeft: 1})
+	mgr.recordGroupSyncError(context.Background(), "inst_1", "iq timeout")
+
+	if got := repo.groupSync["inst_1"].GroupsObserved; got != 12 {
+		t.Fatalf("groupsObserved = %d, want the last snapshot's total", got)
+	}
+	if got := repo.groupSyncError["inst_1"]; got != "iq timeout" {
+		t.Fatalf("lastError = %q, want the refusal", got)
 	}
 }
 
@@ -233,5 +256,6 @@ func TestRecordCountersTolerateMissingDependencies(t *testing.T) {
 	ctx := context.Background()
 	mgr.recordMedia(ctx, MessageDoc{InstanceID: "inst_1", GroupJID: "group_a@g.us"}, Media{Status: MediaStored})
 	mgr.recordSend(ctx, "inst_1", "group_a@g.us", true, time.Now())
-	mgr.recordGroups(ctx, "inst_1", 3)
+	mgr.recordGroupSync(ctx, "inst_1", SyncSummary{Total: 3})
+	mgr.recordGroupSyncError(ctx, "inst_1", "iq timeout")
 }

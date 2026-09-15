@@ -273,7 +273,7 @@ func TestMediaJanitorRetryCountsTheStoredAttachment(t *testing.T) {
 // A sync's number describes the membership the snapshot held, so only a snapshot
 // that arrived moves it: a refused call must leave the last observed total
 // standing, never record the refusal as an empty membership (§6.6.5, R11).
-func TestGroupSyncCountsTheGroupsAPassObserved(t *testing.T) {
+func TestGroupSyncRecordsTheGroupsAPassObserved(t *testing.T) {
 	client := newFakeClient()
 	client.groups = []*types.GroupInfo{
 		groupInfo("120363043123456789", "Ops Team", 12),
@@ -290,16 +290,19 @@ func TestGroupSyncCountsTheGroupsAPassObserved(t *testing.T) {
 	if err := mgr.runGroupSyncOnce(context.Background(), s, SyncOnTimer); err != nil {
 		t.Fatalf("runGroupSyncOnce: %v", err)
 	}
-	if got := repo.counters["inst_1"][runtimeCounterGroups]; got != 2 {
-		t.Fatalf("%s = %d, want the 2 groups the snapshot held", runtimeCounterGroups, got)
+	if got := repo.groupSync["inst_1"].GroupsObserved; got != 2 {
+		t.Fatalf("groupsObserved = %d, want the 2 groups the snapshot held", got)
 	}
 
 	client.groupErr = errors.New("group sync: get joined groups: iq refused")
 	if err := mgr.runGroupSyncOnce(context.Background(), s, SyncOnTimer); err == nil {
 		t.Fatal("a refused sync must be reported")
 	}
-	if got := repo.counters["inst_1"][runtimeCounterGroups]; got != 2 {
-		t.Errorf("%s = %d, want the last snapshot's total", runtimeCounterGroups, got)
+	if got := repo.groupSync["inst_1"].GroupsObserved; got != 2 {
+		t.Errorf("groupsObserved = %d, want the last snapshot's total", got)
+	}
+	if got := repo.groupSyncError["inst_1"]; got == "" {
+		t.Error("a refused sync must record why it failed")
 	}
 	if got := stats.count(); got != 0 {
 		t.Errorf("day bumps = %d, want none: §10 keeps groups per instance, not per day", got)

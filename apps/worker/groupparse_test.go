@@ -6,18 +6,19 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
 // parseNotification runs the REAL whatsmeow parser over a fixture node.
-// whatsmeow.NewClient(nil, …) is safe for parsing: NewClient initialises
-// groupCache and only nil-checks the device store on network paths
-// (client.go:240-270), and DangerousInternals() exposes parseGroupNotification
-// (internals.go:270).
+// whatsmeow.NewClient requires a device store: it reads the store's identity to
+// decide whether the client is paired (`cli.paired.Store(deviceStore.ID != nil)`),
+// so an empty store is what a parser-only test needs — nothing here reaches a
+// network path. DangerousInternals() exposes parseGroupNotification.
 func parseNotification(t *testing.T, node waBinary.Node) any {
 	t.Helper()
-	cli := whatsmeow.NewClient(nil, waLog.Noop)
+	cli := whatsmeow.NewClient(&store.Device{}, waLog.Noop)
 	evt, _, _, err := cli.DangerousInternals().ParseGroupNotification(nodePtr(t, node))
 	if err != nil {
 		t.Fatalf("ParseGroupNotification: %v", err)
@@ -114,7 +115,7 @@ func TestParseGroupSyncResponse(t *testing.T) {
 	if len(children) != 1 {
 		t.Fatalf("fixture carries %d groups, want 1", len(children))
 	}
-	cli := whatsmeow.NewClient(nil, waLog.Noop)
+	cli := whatsmeow.NewClient(&store.Device{}, waLog.Noop)
 	info, err := cli.DangerousInternals().ParseGroupNode(nodePtr(t, children[0]))
 	if err != nil {
 		t.Fatalf("ParseGroupNode: %v", err)

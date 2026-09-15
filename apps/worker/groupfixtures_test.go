@@ -32,7 +32,7 @@ func assertFixtureFidelity(t *testing.T, name string, node waBinary.Node) {
 	if err != nil {
 		t.Fatalf("read %s: %v", name, err)
 	}
-	if got, want := node.XMLString(), strings.TrimSpace(string(raw)); got != want {
+	if got, want := node.String(), strings.TrimSpace(string(raw)); got != want {
 		t.Fatalf("fixture %s drifted from the captured transcript\n got: %s\nwant: %s", name, got, want)
 	}
 }

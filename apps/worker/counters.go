@@ -22,7 +22,6 @@ const (
 	runtimeCounterMediaUnparsed = "mediaUnparsed"
 	runtimeCounterSendOk        = "sendOk"
 	runtimeCounterSendFailed    = "sendFailed"
-	runtimeCounterGroups        = "groups"
 )
 
 // recordStored writes a flush's new messages into both places §10 reads.
@@ -101,16 +100,34 @@ func (m *manager) recordSend(ctx context.Context, instanceID, groupJID string, o
 	m.bumpRuntime(ctx, instanceID, map[string]int64{runtimeCounter: 1})
 }
 
-// recordGroups records how many groups a full sync observed. `groups` is a
-// gauge rather than a tally — the snapshot *is* the membership — so the value is
-// set: adding the total on every pass would grow with the number of syncs and
-// answer nothing. §10 keeps this per instance, not per day.
-func (m *manager) recordGroups(ctx context.Context, instanceID string, total int) {
+// recordGroupSync records the membership a successful full sync observed into
+// the §5.1 `runtime.groupSync` summary the dashboard reads — `groupsObserved`,
+// `groupsLeft` and `lastSyncAt`. It is a gauge rather than a tally: the snapshot
+// *is* the membership, so it is set, never added. §10 keeps this per instance,
+// not per day.
+func (m *manager) recordGroupSync(ctx context.Context, instanceID string, summary SyncSummary) {
 	if m.instances == nil {
 		return
 	}
-	if err := m.instances.SetCounter(ctx, m.orgID, instanceID, runtimeCounterGroups, int64(total)); err != nil {
-		logf("%s counter for %s: %v", runtimeCounterGroups, instanceID, err)
+	if err := m.instances.SetGroupSync(ctx, m.orgID, instanceID, groupSyncState{
+		GroupsObserved: summary.Total,
+		GroupsLeft:     summary.GroupsLeft,
+		LastSyncAt:     now().UTC(),
+	}); err != nil {
+		logf("group sync summary for %s: %v", instanceID, err)
+	}
+}
+
+// recordGroupSyncError records that a full sync was refused. It moves only
+// `lastError`: a snapshot that never arrived says nothing about membership, so
+// the last observed total and stamp stand and a timed-out IQ is never mistaken
+// for "we left every group" (§6.6.5 rule 4).
+func (m *manager) recordGroupSyncError(ctx context.Context, instanceID, message string) {
+	if m.instances == nil {
+		return
+	}
+	if err := m.instances.SetGroupSyncError(ctx, m.orgID, instanceID, message); err != nil {
+		logf("group sync error for %s: %v", instanceID, err)
 	}
 }
 

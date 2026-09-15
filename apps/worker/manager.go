@@ -49,6 +49,10 @@ var (
 	errWrongMode        = errors.New("instance is not in code-pairing mode")
 	errPairingNotReady  = errors.New("pairing is not ready for a code yet")
 
+	// Re-pairing a linked account is refused, not performed: pairing a fresh
+	// device means unlinking the one WhatsApp already honours.
+	errAlreadyConnected = errors.New("instance is already connected; re-pairing would unlink the account")
+
 	// Cleanup errors are recoverable: DELETE failed, but the instance and its
 	// credentials are still in the state they were, so the owner can retry.
 	errLogoutFailed       = errors.New("logout failed")
@@ -85,11 +89,7 @@ func phoneDigitsFromJID(jid types.JID) string {
 	if jid.Server != types.DefaultUserServer {
 		return ""
 	}
-	user := jid.User
-	if i := strings.IndexAny(user, ":."); i >= 0 {
-		user = user[:i]
-	}
-	return user
+	return nonADUser(jid)
 }
 
 // normalizePhone strips a JID suffix and surrounding space from a stored phone
@@ -238,6 +238,32 @@ func (s *session) setStatus(status sessionState, pairingError string) {
 	s.mu.Unlock()
 }
 
+// reportedStatus is the status a read reports for a live session. The field on
+// the session is what the events left behind — `events.Disconnected` deliberately
+// records nothing, because auto-reconnect is whatsmeow's job — so a session that
+// is still in the map is asked directly. Only a session that claims `connected`
+// has that claim checked: `pairing`, a recorded failure and a session that has
+// not authenticated yet are the session's own state, not a statement about the
+// socket.
+func (s *session) reportedStatus() sessionState {
+	s.mu.Lock()
+	status, client := s.status, s.client
+	s.mu.Unlock()
+	if client == nil || status != stateConnected {
+		return status
+	}
+	switch {
+	case !client.IsLoggedIn():
+		// The credential is revoked or refused: the link is gone, not merely
+		// offline.
+		return stateLoggedOut
+	case !client.IsConnected():
+		return stateDisconnected
+	default:
+		return stateConnected
+	}
+}
+
 // groupStoreAPI is every `groups` write and read the worker performs. It is an
 // interface so the event-handler routing (what runs off the whatsmeow callback)
 // is provable without Mongo, and *groupStore satisfies it as-is.
@@ -248,6 +274,7 @@ type groupStoreAPI interface {
 	UpsertFromSync(ctx context.Context, orgID, instanceID string, info *types.GroupInfo, source SyncSource) error
 	MarkLeft(ctx context.Context, orgID, instanceID, groupJID string, state GroupState) error
 	KnownGroupJIDs(ctx context.Context, orgID, instanceID string) ([]string, error)
+	CountLeft(ctx context.Context, orgID, instanceID string) (int, error)
 	ListForInstance(ctx context.Context, orgID, instanceID string) ([]groupListRow, *string, error)
 	loadObserved(ctx context.Context, orgID, instanceID string) (map[string]Observed, error)
 }
@@ -275,6 +302,12 @@ type manager struct {
 	ingest    *ingestQueue
 	media     *mediaRunner
 	devices   deviceStore
+
+	// owners is the BFF-owned reply-owner list, read through a TTL cache. It is
+	// the only thing that lets a direct message into storage: a nil list (a
+	// manager built without one, which is every test that is not about direct
+	// chats) authorizes nobody, so the direct-chat path fails closed.
+	owners ownerAllowlist
 
 	// persist carries Mongo work that originates on the whatsmeow event loop
 	// onto its own bounded workers, so the protocol goroutine never waits on the
@@ -409,10 +442,10 @@ func (m *manager) liveDevices() map[string]types.JID {
 	return out
 }
 
-// groupClient returns the live client for an instance, or nil when the
-// instance has no connected session. The group endpoints answer 409 on nil
-// rather than pretending an empty membership arrived (§6.6.6).
-func (m *manager) groupClient(instanceID string) groupClient {
+// liveClient is the one liveness rule the group surfaces share: a session that
+// is connected and owns a client. A session that exists but is pairing, errored
+// or disconnected has no client any route may call.
+func (m *manager) liveClient(instanceID string) whatsmeowClient {
 	s := m.get(instanceID)
 	if s == nil {
 		return nil
@@ -425,12 +458,47 @@ func (m *manager) groupClient(instanceID string) groupClient {
 	return s.client
 }
 
+// groupClient returns the live client for an instance, or nil when the
+// instance has no connected session. The group endpoints answer 409 on nil
+// rather than pretending an empty membership arrived (§6.6.6).
+func (m *manager) groupClient(instanceID string) groupClient {
+	if client := m.liveClient(instanceID); client != nil {
+		return client
+	}
+	return nil
+}
+
+// groupAdminClient returns the same live client as the write surface the
+// group-admin route needs. It is the same session and the same liveness rule:
+// the two names exist so a read path cannot reach a write by accident.
+func (m *manager) groupAdminClient(instanceID string) groupAdminClient {
+	if client := m.liveClient(instanceID); client != nil {
+		return client
+	}
+	return nil
+}
+
+// botIdentity is the linked account's own addressing, which is how the live
+// group read reports whether the bot itself is an admin. It comes from the
+// session rather than the stored row because a connected session is the only
+// place those JIDs are known to be current.
+func (m *manager) botIdentity(instanceID string) botIdentity {
+	s := m.get(instanceID)
+	if s == nil {
+		return botIdentity{}
+	}
+	snapshot := s.snapshot()
+	return botIdentity{JID: jidOrEmpty(snapshot.BotJID), LID: jidOrEmpty(snapshot.BotLID)}
+}
+
 // api builds the control-plane handler with the manager's dependencies and
 // live-client lookup (§6.5).
 func (m *manager) api() *api {
 	return &api{
 		store:      m.groups,
 		clientFor:  m.groupClient,
+		adminFor:   m.groupAdminClient,
+		botFor:     m.botIdentity,
 		manager:    m,
 		orgID:      m.orgID,
 		secret:     m.secret,
@@ -521,7 +589,11 @@ func (m *manager) mergedSnapshot(ctx context.Context, row InstanceRow) instanceS
 	}
 	if s := m.get(row.ID); s != nil {
 		live := s.snapshot()
-		snap.Status = string(live.Status)
+		// The client is the truth while the session is live: a cached
+		// `connected` for a socket that quietly died would otherwise be served
+		// to the dashboard as fact.
+		status := s.reportedStatus()
+		snap.Status = string(status)
 		for _, v := range []struct {
 			dst *string
 			src string
@@ -543,7 +615,7 @@ func (m *manager) mergedSnapshot(ctx context.Context, row InstanceRow) instanceS
 			t := live.LastSeenAt
 			snap.LastSeenAt = &t
 		}
-		if live.Status == statePairing {
+		if status == statePairing {
 			snap.QR = live.QRDataURL
 			snap.PairingCode = live.PairingCode
 		}
@@ -732,8 +804,20 @@ type instanceRepo interface {
 	SetStatus(ctx context.Context, orgID, id string, status sessionState, pairingError string) error
 	SetConnected(ctx context.Context, orgID, id, phoneNumber, botJID, botLID string) error
 	BumpCounters(ctx context.Context, orgID, id string, counters map[string]int64) error
-	SetCounter(ctx context.Context, orgID, id, name string, value int64) error
+	SetGroupSync(ctx context.Context, orgID, id string, sync groupSyncState) error
+	SetGroupSyncError(ctx context.Context, orgID, id, message string) error
 	SoftDelete(ctx context.Context, orgID, id string) error
+}
+
+// groupSyncState is the worker-owned §5.1 `instances.runtime.groupSync` summary
+// the dashboard reads: how many groups the last full sync observed, how many are
+// currently known to be gone, and when it ran. It is the one place a sync's
+// membership number is reported, so the console's "Observed" count and the
+// instance list can never disagree with what was actually seen.
+type groupSyncState struct {
+	GroupsObserved int
+	GroupsLeft     int
+	LastSyncAt     time.Time
 }
 
 type instanceMongo struct {
@@ -924,16 +1008,36 @@ func (r *instanceMongo) BumpCounters(ctx context.Context, orgID, id string, coun
 	return nil
 }
 
-// SetCounter writes a counter that measures a state rather than a tally of
-// events — `groups` is the membership the last sync observed, so it is set
-// rather than added. Same one-writer rule as BumpCounters: a removed instance is
-// not counted at all.
-func (r *instanceMongo) SetCounter(ctx context.Context, orgID, id, name string, value int64) error {
+// SetGroupSync writes the §5.1 `runtime.groupSync` summary a successful full
+// sync observed: the membership it held, how many groups are currently known to
+// be gone, and when it ran. `lastError` is cleared, because this write only
+// happens after a snapshot arrived. Same one-writer rule as BumpCounters: a
+// removed instance is not written at all.
+func (r *instanceMongo) SetGroupSync(ctx context.Context, orgID, id string, sync groupSyncState) error {
 	_, err := r.coll.UpdateOne(ctx, liveInstanceFilter(orgID, id), bson.D{
-		{Key: "$set", Value: bson.D{{Key: "runtime.counters." + name, Value: value}}},
+		{Key: "$set", Value: bson.D{
+			{Key: "runtime.groupSync.groupsObserved", Value: sync.GroupsObserved},
+			{Key: "runtime.groupSync.groupsLeft", Value: sync.GroupsLeft},
+			{Key: "runtime.groupSync.lastSyncAt", Value: sync.LastSyncAt},
+			{Key: "runtime.groupSync.lastError", Value: nil},
+		}},
 	})
 	if err != nil {
-		return fmt.Errorf("set instance counter %s for %s: %w", name, id, err)
+		return fmt.Errorf("set instance group sync %s: %w", id, err)
+	}
+	return nil
+}
+
+// SetGroupSyncError records a refused sync and nothing else. The last observed
+// total, the left count and the stamp all stand: a call that failed says nothing
+// about membership, and overwriting them would report "we left every group" on
+// the dashboard because an IQ timed out (§6.6.5 rule 4).
+func (r *instanceMongo) SetGroupSyncError(ctx context.Context, orgID, id, message string) error {
+	_, err := r.coll.UpdateOne(ctx, liveInstanceFilter(orgID, id), bson.D{
+		{Key: "$set", Value: bson.D{{Key: "runtime.groupSync.lastError", Value: message}}},
+	})
+	if err != nil {
+		return fmt.Errorf("set instance group sync error %s: %w", id, err)
 	}
 	return nil
 }

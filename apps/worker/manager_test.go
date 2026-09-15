@@ -33,6 +33,12 @@ type fakeInstanceRepo struct {
 	ops       []string
 	// counters is what BumpCounters added, per instance and counter name.
 	counters map[string]map[string]int64
+	// pairingErrors is the last `runtime.pairingError` each SetStatus wrote.
+	pairingErrors map[string]string
+	// groupSync is the last §5.1 summary SetGroupSync wrote, per instance, and
+	// groupSyncError the last refused-sync message (§6.6.5 rule 4).
+	groupSync      map[string]groupSyncState
+	groupSyncError map[string]string
 }
 
 // record keeps the order of the writes the worker issued, which is how a test
@@ -75,16 +81,26 @@ func (r *fakeInstanceRepo) BumpCounters(_ context.Context, orgID, id string, cou
 	return nil
 }
 
-func (r *fakeInstanceRepo) SetCounter(_ context.Context, _, id, name string, value int64) error {
+func (r *fakeInstanceRepo) SetGroupSync(_ context.Context, _, id string, sync groupSyncState) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.counters == nil {
-		r.counters = map[string]map[string]int64{}
+	if r.groupSync == nil {
+		r.groupSync = map[string]groupSyncState{}
 	}
-	if r.counters[id] == nil {
-		r.counters[id] = map[string]int64{}
+	r.groupSync[id] = sync
+	// The real write clears `lastError`, because this only happens after a
+	// snapshot arrived.
+	delete(r.groupSyncError, id)
+	return nil
+}
+
+func (r *fakeInstanceRepo) SetGroupSyncError(_ context.Context, _, id, message string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.groupSyncError == nil {
+		r.groupSyncError = map[string]string{}
 	}
-	r.counters[id][name] = value
+	r.groupSyncError[id] = message
 	return nil
 }
 
@@ -124,10 +140,20 @@ func (r *fakeInstanceRepo) List(context.Context, string) ([]InstanceRow, error) 
 	return out, nil
 }
 
-func (r *fakeInstanceRepo) SetStatus(_ context.Context, _, id string, status sessionState, _ string) error {
+func (r *fakeInstanceRepo) SetStatus(_ context.Context, _, id string, status sessionState, pairingError string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.statuses[id] = status
+	if r.pairingErrors == nil {
+		r.pairingErrors = map[string]string{}
+	}
+	r.pairingErrors[id] = pairingError
+	// The real write moves `runtime.status` and `runtime.pairingError`, so a read
+	// after it returns the transition rather than the row the caller started from.
+	row := r.rows[id]
+	row.Status = status
+	row.PairingError = pairingError
+	r.rows[id] = row
 	r.record("setStatus:" + string(status))
 	return nil
 }
@@ -192,11 +218,15 @@ type fakeDeviceStore struct {
 	device    *store.Device
 	deleted   []*store.Device
 	deleteErr error
+	// created counts the devices handed out, so a test can prove that a second
+	// pairing request did not link a second device.
+	created int
 }
 
 func (d *fakeDeviceStore) NewDevice() *store.Device {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.created++
 	return d.device
 }
 
@@ -231,14 +261,21 @@ type fakeClient struct {
 	qr          chan whatsmeow.QRChannelItem
 	pairCode    string
 	logoutErr   error
+	connectErr  error
 	groups      []*types.GroupInfo
 	groupCalls  int
 	groupErr    error
 	download    []byte
+	// loggedIn/connected are the two facts the check endpoint and every read
+	// derive the reported status from.
+	loggedIn  bool
+	connected bool
 }
 
+// newFakeClient is a linked, connected client: the state of an instance that is
+// working, so a test only has to say what is broken.
 func newFakeClient() *fakeClient {
-	return &fakeClient{qr: make(chan whatsmeow.QRChannelItem, 4)}
+	return &fakeClient{qr: make(chan whatsmeow.QRChannelItem, 4), loggedIn: true, connected: true}
 }
 
 func (c *fakeClient) AddEventHandler(whatsmeow.EventHandler) uint32 { return 1 }
@@ -246,7 +283,13 @@ func (c *fakeClient) RemoveEventHandler(uint32) bool                { return tru
 func (c *fakeClient) Connect() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.connectErr != nil {
+		return c.connectErr
+	}
 	c.connects++
+	// A successful Connect leaves the socket up, which is what IsConnected
+	// reports from then on.
+	c.connected = true
 	return nil
 }
 func (c *fakeClient) Disconnect() {
@@ -260,7 +303,17 @@ func (c *fakeClient) Logout(context.Context) error {
 	c.logouts++
 	return c.logoutErr
 }
-func (c *fakeClient) IsConnected() bool { return true }
+func (c *fakeClient) IsConnected() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.connected
+}
+
+func (c *fakeClient) IsLoggedIn() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.loggedIn
+}
 func (c *fakeClient) GetQRChannel(context.Context) (<-chan whatsmeow.QRChannelItem, error) {
 	return c.qr, nil
 }

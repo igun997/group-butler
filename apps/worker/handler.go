@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,9 +56,11 @@ func handleEvent(s *session, evt any) {
 }
 
 // onMessage keeps the WhatsApp callback free of I/O. Group discovery metadata
-// is queued for every group, but message contents, sender identity, and media
-// cross the persistence boundary only after the worker has confirmed that the
-// group is assigned.
+// is queued for every group, and every message is queued for the persistence
+// worker; which of them may be stored is decided there, because the two
+// decisions it depends on — is the group assigned, is the sender a direct-chat
+// owner — are Mongo reads, and this goroutine is shared with the protocol
+// handshake.
 func (m *manager) onMessage(s *session, evt *events.Message) {
 	doc, err := parseInbound(evt, m.orgID, s.id)
 	if err != nil {
@@ -65,10 +68,9 @@ func (m *manager) onMessage(s *session, evt *events.Message) {
 		return
 	}
 	s.touch(now().UTC())
-	if !doc.IsGroup {
-		return
+	if doc.IsGroup {
+		m.ensureGroupKnown(s.id, doc.GroupJID, doc.Timestamp)
 	}
-	m.ensureGroupKnown(s.id, doc.GroupJID, doc.Timestamp)
 	m.enqueuePersist(inboundMessageJob{session: s, evt: evt, doc: doc})
 }
 
@@ -112,6 +114,9 @@ func (m *manager) onHistorySync(s *session, evt *events.HistorySync) {
 			}
 			doc.Historical = true
 			if !doc.IsGroup {
+				// Backfill is a record of what already happened, not an
+				// instruction: a direct chat is stored as it arrives, and an
+				// owner's old messages stay out of the worker.
 				continue
 			}
 			m.ensureGroupKnown(s.id, doc.GroupJID, doc.Timestamp)
@@ -224,6 +229,11 @@ func (m *manager) attachMedia(s *session, evt *events.Message, doc MessageDoc) {
 // inboundMessageJob owns the policy decision that message data may enter
 // storage. Group discovery is intentionally separate: it may retain group
 // metadata, but never a direct-chat or unassigned-group message.
+//
+// A direct chat has no group to be assigned, so the only question it has to
+// answer is who sent it: the organization's owner list is the whole gate, and a
+// sender it does not name is dropped here, before a single field of the message
+// reaches storage.
 type inboundMessageJob struct {
 	session *session
 	evt     *events.Message
@@ -231,11 +241,24 @@ type inboundMessageJob struct {
 }
 
 func (j inboundMessageJob) persist(ctx context.Context, m *manager) error {
-	if !j.doc.IsGroup || m.groups == nil {
+	// Both gates below compare identities against phone numbers (the group's
+	// scope, and for a direct chat the organization's owner list), while
+	// WhatsApp may address the sender by their LID. Resolve it first so every
+	// later decision and the stored row speak the same identity.
+	resolveSenderIdentity(ctx, j.session, &j.doc)
+	if !j.doc.IsGroup {
+		return j.persistDirect(ctx, m)
+	}
+	if m.groups == nil {
 		return nil
 	}
 	group := m.groups.FindOne(ctx, j.doc.OrganizationID, j.doc.InstanceID, j.doc.GroupJID)
-	if group == nil || !group.Config.Assigned {
+	// Both flags are required, and this gate must agree with the two readers
+	// downstream of it: the BFF reply route and the memory-batch builder each
+	// demand `assigned && whitelisted`. Assignment alone is not a grant to read
+	// the group's content, and a grant is meaningless for a group that is not
+	// assigned to this instance.
+	if group == nil || !group.Config.Assigned || !group.Config.Whitelisted {
 		return nil
 	}
 	if m.replyCandidate(j.doc, j.session) {
@@ -248,18 +271,239 @@ func (j inboundMessageJob) persist(ctx context.Context, m *manager) error {
 	return nil
 }
 
-func (m *manager) replyCandidate(doc MessageDoc, s *session) bool {
-	if doc.FromMe || doc.Text == "" || s == nil {
+// resolveSenderIdentity rewrites LID-addressed identities into the phone JIDs
+// they belong to, keeping the LID each one arrived under in `SenderLID`.
+//
+// WhatsApp addresses a participant either way — an older group by phone, a
+// migrated one by LID — and the two are the same person. The owner list, the
+// group scope and every operator-facing surface are written in phone numbers, so
+// a LID left in `SenderJID` is an identity nothing downstream can match: that is
+// what made an authorized owner's mention answer `authorized mention source was
+// not found`.
+//
+// A direct chat's address is the same person, so it is resolved with the sender:
+// an owner who writes in is one conversation, and the reply has to go back to an
+// address the send path accepts.
+//
+// A lookup that misses or fails leaves the row exactly as it arrived. The
+// message is evidence, and losing it because a mapping is not yet known would be
+// worse than an identity the operator cannot yet match.
+func resolveSenderIdentity(ctx context.Context, s *session, doc *MessageDoc) {
+	if s == nil || s.device == nil || doc == nil || doc.SenderJID == "" {
+		return
+	}
+	if s.device.LIDs == nil {
+		// A device without the LID table (a fresh store, a test fixture) has no
+		// mapping to consult; GetAltJID panics on it rather than answering.
+		return
+	}
+	sender, err := types.ParseJID(doc.SenderJID)
+	if err != nil || sender.Server != types.HiddenUserServer {
+		return
+	}
+	alt, err := s.device.GetAltJID(ctx, sender.ToNonAD())
+	if err != nil || alt.IsEmpty() || alt.Server != types.DefaultUserServer {
+		return
+	}
+	doc.SenderLID = doc.SenderJID
+	doc.SenderJID = alt.String()
+	// The direct chat is this person: address the reply to the same phone JID
+	// rather than to the LID the message happened to arrive under.
+	if !doc.IsGroup && doc.ChatJID != "" && doc.ChatJID != alt.String() {
+		chat, err := types.ParseJID(doc.ChatJID)
+		if err == nil && chat.Server == types.HiddenUserServer && chat.ToNonAD().String() == sender.ToNonAD().String() {
+			doc.ChatJID = alt.String()
+			doc.GroupJID = alt.String()
+		}
+	}
+}
+
+// persistDirect stores one direct message from an authorized owner.
+//
+// The row reuses the message shape — and therefore every query, index and
+// retention rule — with the chat JID as its group key and `isGroup` false, so
+// the group-keyed reads (batches, summaries, the console's group view) cannot
+// pick it up. Media rides the same pipeline as a group attachment: the runner
+// and the janitor address a message by organization/instance/message id, so
+// reusing them costs nothing and keeps one retry path.
+func (j inboundMessageJob) persistDirect(ctx context.Context, m *manager) error {
+	if !m.authorizedOwner(ctx, j.doc, j.evt) {
+		return nil
+	}
+	j.doc.GroupJID = j.doc.ChatJID
+	if m.replyCandidate(j.doc, j.session) {
+		j.doc.AutoReplyCandidate = true
+	}
+	if m.ingest != nil {
+		m.ingest.Enqueue(j.doc)
+	}
+	m.attachMedia(j.session, j.evt, j.doc)
+	return nil
+}
+
+// authorizedOwner reports whether the sender of a direct chat is one of the
+// organization's owners.
+//
+// It is deliberately the *only* authorization the worker performs, and it
+// authorizes storage, not answering: the BFF still decides what an owner may
+// make the bot do. A list that cannot be read, or is empty, authorizes nobody —
+// the failure mode of a privacy gate must be "dropped", never "anyone".
+func (m *manager) authorizedOwner(ctx context.Context, doc MessageDoc, evt *events.Message) bool {
+	if m.owners == nil {
 		return false
 	}
-	bot := s.deviceJID().ToNonAD()
-	for _, raw := range doc.Mentions {
-		mentioned, err := types.ParseJID(raw)
-		if err == nil && mentioned.ToNonAD() == bot {
+	owners, err := m.owners.allowedPhones(ctx, doc.OrganizationID)
+	if err != nil {
+		logf("owner list for %s unreadable, dropping direct message %s: %v", doc.OrganizationID, doc.WaMessageID, err)
+		return false
+	}
+	for _, jid := range directChatSenderIdentities(doc, evt) {
+		phone := ownerPhoneDigits(jid.String(), m.cfg.DefaultCountryCode)
+		if phone == "" {
+			continue
+		}
+		if _, ok := owners[phone]; ok {
 			return true
 		}
 	}
 	return false
+}
+
+// directChatSenderIdentities is every address that names the sender of a direct
+// chat. An account is addressed either by phone number or by LID, and whatsmeow
+// puts the other form in SenderAlt, so a LID-addressed owner still has the phone
+// JID the owner list holds. A LID itself is not offered: it is a different
+// namespace, and `ownerPhoneDigits` refuses it, so nothing can match one by
+// coincidence.
+func directChatSenderIdentities(doc MessageDoc, evt *events.Message) []types.JID {
+	identities := make([]types.JID, 0, 2)
+	if jid, err := types.ParseJID(doc.SenderJID); err == nil && !jid.IsEmpty() {
+		identities = append(identities, jid)
+	}
+	if evt != nil && !evt.Info.SenderAlt.IsEmpty() {
+		identities = append(identities, evt.Info.SenderAlt)
+	}
+	return identities
+}
+
+// replyCandidate decides whether one stored message addresses the bot.
+//
+// It is deliberately not an authorization decision: who may drive the bot is the
+// owner list the BFF owns, and the worker cannot see it. This answers only "was
+// the bot spoken to", and the BFF answers "by whom" before anything is sent.
+//
+// A direct chat answers itself: the bot is one end of it, so there is no mention
+// to look for and any text the owner sends is addressed to the bot. The identity
+// match below is the group rule, and only a group message needs it.
+func (m *manager) replyCandidate(doc MessageDoc, s *session) bool {
+	if doc.FromMe || doc.Text == "" {
+		return false
+	}
+	if !doc.IsGroup {
+		return true
+	}
+	if s == nil {
+		return false
+	}
+	identities := botMentionIdentities(s)
+	for _, raw := range doc.Mentions {
+		mentioned, err := types.ParseJID(raw)
+		if err != nil {
+			continue
+		}
+		if _, ok := identities[types.NewJID(nonADUser(mentioned), mentioned.Server).String()]; ok {
+			return true
+		}
+	}
+	// An operator usually types the bot's number rather than picking it from
+	// WhatsApp's mention list, and typed text carries no structured mention.
+	return mentionsPhoneInText(doc.Text, s.snapshot().PhoneNumber, m.cfg.DefaultCountryCode)
+}
+
+// botMentionIdentities is every non-AD way WhatsApp names this account. The same
+// account appears as a phone JID and as a LID, and a group that has migrated to
+// LIDs mentions the LID, so matching only the phone JID would leave the bot
+// deaf in exactly those groups. An unpaired session has no identities, which
+// makes nothing a candidate rather than everything.
+func botMentionIdentities(s *session) map[string]struct{} {
+	ids := make(map[string]struct{}, 2)
+	add := func(user, server string) {
+		if user == "" {
+			return
+		}
+		ids[types.NewJID(user, server).String()] = struct{}{}
+	}
+	if jid := s.deviceJID(); !jid.IsEmpty() {
+		add(nonADUser(jid), jid.Server)
+	}
+	if lid := s.snapshot().BotLID; lid != "" {
+		if parsed, err := types.ParseJID(lid); err == nil {
+			add(nonADUser(parsed), parsed.Server)
+		}
+	}
+	return ids
+}
+
+// nonADUser is the account part of a JID with any device suffix removed. The
+// suffix can live *inside* the user field (`628990000009:5`), which is why the
+// worker strips it by hand rather than trusting JID.ToNonAD: a JID parsed from
+// the wire or built from an instance row carries the suffix as user text.
+func nonADUser(jid types.JID) string {
+	user := jid.User
+	if i := strings.IndexAny(user, ".:"); i >= 0 {
+		user = user[:i]
+	}
+	return user
+}
+
+// mentionScanWindow bounds how far past an `@` the typed-number scan reads. It
+// is longer than a phone number with separators can be, and short enough that a
+// stray `@` cannot swallow the rest of a message.
+const mentionScanWindow = 32
+
+// mentionsPhoneInText reports whether the text addresses the bot's phone number
+// directly, as in `@628990000009` or `@+62 899-000-0009`.
+//
+// Only the characters that make up a formatted phone number may follow the `@`:
+// digits plus the separators people type. Scanning stops at the first letter, so
+// a number mentioned later in the same sentence is not attributed to the `@`,
+// and the digits must equal the bot's number exactly, so a longer number that
+// merely starts with it is somebody else. The national form is expanded with the
+// deployment country code, because that is how an operator writes their own
+// bot's number.
+func mentionsPhoneInText(text, phone, countryCode string) bool {
+	phone = normalizePhone(phone)
+	if phone == "" {
+		return false
+	}
+	national := ""
+	if code := usableCountryCode(countryCode); code != "" && strings.HasPrefix(phone, code) {
+		national = "0" + strings.TrimPrefix(phone, code)
+	}
+	for i := range len(text) {
+		if text[i] != '@' {
+			continue
+		}
+		end := i + 1 + mentionScanWindow
+		if end > len(text) {
+			end = len(text)
+		}
+		j := i + 1
+		for j < end && (isPhoneRune(text[j])) {
+			j++
+		}
+		digits := digitsOnly(text[i+1 : j])
+		if digits == phone || (national != "" && digits == national) {
+			return true
+		}
+	}
+	return false
+}
+
+// isPhoneRune is what an operator may put inside a typed phone number: its
+// digits and the separators a phone book uses. Anything else ends the number.
+func isPhoneRune(c byte) bool {
+	return (c >= '0' && c <= '9') || c == '+' || c == '-' || c == ' ' || c == '.' || c == '(' || c == ')'
 }
 
 // persistJob is one unit of Mongo work that originated on the whatsmeow event

@@ -76,6 +76,7 @@ func setDevEnv(t *testing.T) {
 		"AI_BASE_URL",
 		"AI_API_KEY",
 		"AI_MODEL",
+		"DEFAULT_COUNTRY_CODE",
 		"OWNER_WHATSAPP_JID",
 		"REPLY_CALLBACK_URL",
 		"REPLY_CALLBACK_SECRET",
@@ -98,8 +99,45 @@ func setDevEnv(t *testing.T) {
 		"GROUP_SYNC_PRUNE",
 		"DISPATCH_INTERVAL",
 		"SEND_MAX_ATTEMPTS",
+		"MEMORY_CALLBACK_URL",
+		"MEMORY_CALLBACK_SECRET",
+		"MEMORY_BATCH_INTERVAL",
+		"MEMORY_BATCH_CONCURRENCY",
 	} {
 		t.Setenv(key, "")
+	}
+}
+
+func TestLoadConfigRequiresCompleteMemoryCallbackCredentials(t *testing.T) {
+	setDevEnv(t)
+	t.Setenv("MEMORY_CALLBACK_URL", "http://127.0.0.1:3000/api/internal/memory-batches")
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("loadConfig accepted a memory callback URL without its bearer secret")
+	}
+
+	setDevEnv(t)
+	t.Setenv("MEMORY_CALLBACK_SECRET", "test-secret")
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("loadConfig accepted a memory callback secret without its URL")
+	}
+
+	setDevEnv(t)
+	t.Setenv("MEMORY_CALLBACK_URL", "https://memory.example.test/batches")
+	t.Setenv("MEMORY_CALLBACK_SECRET", "test-secret")
+	if _, err := loadConfig(); err != nil {
+		t.Fatalf("loadConfig rejected complete memory callback credentials: %v", err)
+	}
+}
+
+func TestLoadConfigProductionRejectsDevelopmentMemoryCallbackSecret(t *testing.T) {
+	setDevEnv(t)
+	t.Setenv("ENVIRONMENT", productionEnv)
+	t.Setenv("WORKER_SECRET", "production-secret-from-the-secret-store")
+	t.Setenv("WHATSMEOW_DB_URI", "file:/data/whatsmeow.db?_foreign_keys=on")
+	t.Setenv("MEMORY_CALLBACK_URL", "https://memory.example.test/batches")
+	t.Setenv("MEMORY_CALLBACK_SECRET", devMemoryCallbackSecret)
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("loadConfig accepted the documented development memory callback secret in production")
 	}
 }
 
@@ -311,12 +349,51 @@ func TestLoadConfigLeavesRawCapsUntouchedWhenItRejects(t *testing.T) {
 	})
 }
 
-func TestLoadConfig_RejectsIncompleteOwnerReplyConfiguration(t *testing.T) {
+// The owner identity does not gate delivery: the BFF authorizes the sender of a
+// mention against the list it owns in Mongo, so an identity on its own must not
+// stop the worker from starting.
+func TestLoadConfig_AcceptsOwnerIdentityWithoutCallbackCredentials(t *testing.T) {
 	setDevEnv(t)
 	t.Setenv("OWNER_WHATSAPP_JID", "628990000001@s.whatsapp.net")
 
-	if _, err := loadConfig(); err == nil {
-		t.Fatal("loadConfig accepted an owner reply identity without callback credentials")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.OwnerWhatsAppJID != "628990000001@s.whatsapp.net" {
+		t.Errorf("OwnerWhatsAppJID = %q, want the canonical JID", cfg.OwnerWhatsAppJID)
+	}
+	if cfg.ReplyCallbackURL != "" {
+		t.Errorf("ReplyCallbackURL = %q, want it unset", cfg.ReplyCallbackURL)
+	}
+}
+
+// The callback pair is the delivery switch, so half of it is a misconfiguration
+// rather than a partial feature.
+func TestLoadConfig_RejectsHalfATooCallbackPair(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		setURL bool
+	}{
+		{"url without secret", true},
+		{"secret without url", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			setDevEnv(t)
+			if tt.setURL {
+				t.Setenv("REPLY_CALLBACK_URL", "http://127.0.0.1:3000/api/internal/reply-jobs")
+			} else {
+				t.Setenv("REPLY_CALLBACK_SECRET", "reply-callback-secret")
+			}
+
+			_, err := loadConfig()
+			if err == nil {
+				t.Fatal("loadConfig accepted half a reply callback pair")
+			}
+			if want := "REPLY_CALLBACK_URL and REPLY_CALLBACK_SECRET must be configured together"; !strings.Contains(err.Error(), want) {
+				t.Errorf("error = %q, want it to contain %q", err, want)
+			}
+		})
 	}
 }
 
@@ -335,5 +412,75 @@ func TestLoadConfig_LoadsOwnerReplyConfiguration(t *testing.T) {
 	}
 	if cfg.ReplyCallbackURL != "http://127.0.0.1:3000/api/internal/reply-jobs" {
 		t.Errorf("ReplyCallbackURL = %q", cfg.ReplyCallbackURL)
+	}
+}
+
+// TestLoadConfig_NormalizesOwnerPhoneSpellings pins the worker to the BFF's
+// normalization (apps/web/src/server/authorized-jids.ts). The reply gate
+// compares JIDs, so a number the operator can enter in the dashboard must
+// survive the worker's startup validation as the same canonical JID.
+func TestLoadConfig_NormalizesOwnerPhoneSpellings(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		countryCode string
+		configured  string
+		want        string
+	}{
+		{"national form takes the deployment country code", "", "08996926184", "628996926184@s.whatsapp.net"},
+		{"international form is already canonical", "", "628996926184", "628996926184@s.whatsapp.net"},
+		{"punctuation and spacing are not part of the number", "", "+62 899-6926-184", "628996926184@s.whatsapp.net"},
+		{"the 00 prefix is the other way to write international", "", "00628996926184", "628996926184@s.whatsapp.net"},
+		{"a device JID reduces to the same account", "", "628996926184:12@s.whatsapp.net", "628996926184@s.whatsapp.net"},
+		{"the legacy user server names the same account", "", "628996926184@c.us", "628996926184@s.whatsapp.net"},
+		{"the configured country code expands the national form", "44", "08996926184", "448996926184@s.whatsapp.net"},
+		{"an unusable country code falls back to the deployment default", "not-a-code", "08996926184", "628996926184@s.whatsapp.net"},
+		{"a country code is read as digits, not as written", " 62 ", "08996926184", "628996926184@s.whatsapp.net"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			setDevEnv(t)
+			t.Setenv("DEFAULT_COUNTRY_CODE", tt.countryCode)
+			t.Setenv("OWNER_WHATSAPP_JID", tt.configured)
+			t.Setenv("REPLY_CALLBACK_URL", "http://127.0.0.1:3000/api/internal/reply-jobs")
+			t.Setenv("REPLY_CALLBACK_SECRET", "reply-callback-secret")
+
+			cfg, err := loadConfig()
+			if err != nil {
+				t.Fatalf("loadConfig(OWNER_WHATSAPP_JID=%q, DEFAULT_COUNTRY_CODE=%q): %v", tt.configured, tt.countryCode, err)
+			}
+			if cfg.OwnerWhatsAppJID != tt.want {
+				t.Errorf("OwnerWhatsAppJID = %q, want %q", cfg.OwnerWhatsAppJID, tt.want)
+			}
+		})
+	}
+}
+
+// TestLoadConfig_RejectsUnusableOwnerPhoneValues keeps the loud failure for
+// values that cannot be the owner's phone — the same set the BFF refuses. A
+// typo must stop the worker instead of silently disabling replies, and the
+// message must keep naming the setting.
+func TestLoadConfig_RejectsUnusableOwnerPhoneValues(t *testing.T) {
+	for _, configured := range []string{
+		"0",
+		"12",
+		"0899",
+		"abc",
+		"62 899 626 184 99 88 77 66 55", // longer than E.164 allows
+		"@s.whatsapp.net",
+		"120363043123456@g.us", // a group id is not a phone number
+	} {
+		t.Run(configured, func(t *testing.T) {
+			setDevEnv(t)
+			t.Setenv("OWNER_WHATSAPP_JID", configured)
+			t.Setenv("REPLY_CALLBACK_URL", "http://127.0.0.1:3000/api/internal/reply-jobs")
+			t.Setenv("REPLY_CALLBACK_SECRET", "reply-callback-secret")
+
+			_, err := loadConfig()
+			if err == nil {
+				t.Fatalf("loadConfig accepted OWNER_WHATSAPP_JID=%q", configured)
+			}
+			if want := "OWNER_WHATSAPP_JID must be a WhatsApp user JID"; !strings.Contains(err.Error(), want) {
+				t.Errorf("error = %q, want it to contain %q", err, want)
+			}
+		})
 	}
 }
