@@ -522,6 +522,7 @@ describe("owner direct message replies", () => {
       "group_info",
       "group_leave",
       "group_members",
+      "group_messages",
       "group_participants",
       "monitored_groups",
       "media_describe_video",
@@ -531,10 +532,49 @@ describe("owner direct message replies", () => {
       "media_transcribe_audio",
       "group_rename",
       "group_set_announce",
+      "group_send",
       "group_set_locked",
       "group_set_photo",
       "message_revoke",
+      "cancel_scheduled",
+      "scheduled_sends",
     ].sort());
+  });
+
+  /**
+   * The complaint that produced this: the owner said "cari pesan dari indra", and
+   * the assistant asked which group — having listed the only group it monitors two
+   * messages earlier. Its own answers were never in the conversation it was given,
+   * because an outgoing message is a send row and the capture only writes what
+   * arrives, so it read a monologue of requests with no record of what it had said.
+   */
+  test("carries the assistant's own replies, not only what arrived", async () => {
+    const db = await getDb();
+    await db.collection(COLLECTIONS.sendRequests).insertOne({
+      organizationId: job.organizationId,
+      instanceId: job.instanceId,
+      groupJid: job.groupJid,
+      text: "Satu grup dimonitor: Test Grrup. Mau saya ringkas?",
+      idempotencyKey: "earlier-reply",
+      status: "sent",
+      scheduledFor: new Date("2026-09-14T15:00:30Z"),
+      approval: { state: "approved", approvedBy: "assistant" },
+      dispatch: { attempts: 1, lockedAt: null, lockedBy: null, waMessageId: "3EB0EARLIER", errorClass: null },
+      createdAt: new Date("2026-09-14T15:00:30Z"),
+      updatedAt: new Date("2026-09-14T15:00:30Z"),
+    });
+
+    const response = await request();
+
+    expect(response.status).toBe(201);
+    const prompt = String(generate.mock.calls.at(-1)?.[0]?.prompt ?? "");
+    expect(prompt).toContain("Satu grup dimonitor: Test Grrup. Mau saya ringkas?");
+    expect(prompt).toContain("Assistant");
+    // A send that has not gone out yet is not something it said.
+    await db.collection(COLLECTIONS.sendRequests).updateOne({ idempotencyKey: "earlier-reply" }, { $set: { status: "scheduled" } });
+    generate.mockClear();
+    await request({ ...job, waMessageId: "3EB0SECOND" });
+    expect(String(generate.mock.calls.at(-1)?.[0]?.prompt ?? "")).not.toContain("Satu grup dimonitor: Test Grrup. Mau saya ringkas?");
   });
 
   test("refuses a chat kind that is not a boolean", async () => {
@@ -593,11 +633,15 @@ describe("reply agent media wiring", () => {
     expect(response.status).toBe(201);
     const [call] = generate.mock.calls;
     expect(Object.keys(call?.[0]?.tools ?? {}).sort()).toEqual([
+      // Sorted, because that is what the assertion compares against.
+      "cancel_scheduled",
       "group_info",
       "group_leave",
       "group_members",
+      "group_messages",
       "group_participants",
       "group_rename",
+      "group_send",
       "group_set_announce",
       "group_set_locked",
       "group_set_photo",
@@ -608,6 +652,7 @@ describe("reply agent media wiring", () => {
       "media_transcribe_audio",
       "message_revoke",
       "monitored_groups",
+      "scheduled_sends",
     ]);
     // The assembled prompt is scoped evidence, so a link the group sent is one
     // the answer may cite...

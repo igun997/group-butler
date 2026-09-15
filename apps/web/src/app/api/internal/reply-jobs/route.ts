@@ -189,24 +189,88 @@ export async function POST(request: Request) {
     .sort({ timestamp: -1 })
     .limit(20)
     .toArray();
-  // The query is newest-first; the prompt carries the same group's messages in
-  // chronological order, oldest first.
-  const contextMessages: ReplyContextMessage[] = [];
-  for (let index = history.length - 1; index >= 0; index -= 1) {
-    const row = history[index];
-    if (!row || typeof row.senderJid !== "string" || !(row.timestamp instanceof Date)) continue;
-    const kind = typeof row.media?.kind === "string" && row.media.kind !== "" ? row.media.kind : null;
-    contextMessages.push({
-      senderJid: row.senderJid,
-      // The name the group sees, when WhatsApp told us one.
-      senderName: typeof row.pushName === "string" && row.pushName.trim() !== "" ? row.pushName : null,
-      text: typeof row.text === "string" ? row.text : "",
-      timestamp: row.timestamp,
-      // Named so the reply can read it: a media tool is addressed by message id.
-      waMessageId: typeof row.waMessageId === "string" ? row.waMessageId : null,
-      attachment: kind === null ? null : { kind, fileName: row.media?.fileName ?? null },
-    });
+  // What the assistant itself said is not in `messages`: an outgoing message is a
+  // send row, and the capture only ever writes what arrives. Left out, the model
+  // reads a monologue of the owner's requests with no record of its own answers —
+  // it cannot follow "and check that" or "the group I asked about", because from
+  // where it sits nothing was ever said back. So the window is the chat's inbound
+  // messages merged with the sends that actually went out, read together in the
+  // order they happened.
+  const said = await db
+    .collection<{ text?: string; scheduledFor?: Date; createdAt?: Date }>(COLLECTIONS.sendRequests)
+    .find(
+      { organizationId: body.organizationId, instanceId: body.instanceId, groupJid: body.groupJid, status: "sent" },
+      { projection: { _id: 0, text: 1, scheduledFor: 1, createdAt: 1 } },
+    )
+    .sort({ scheduledFor: -1 })
+    .limit(20)
+    .toArray();
+  // Both sides, in the order they happened: what arrived, and what the assistant
+  // said back. The window is the newest twenty lines of that conversation, taken
+  // after the merge rather than from each source separately — otherwise a chat
+  // where the assistant answered everything would carry twenty incoming messages
+  // and not one of its own answers.
+  type IncomingLine = {
+    senderJid: string;
+    senderName: string | null;
+    text: string;
+    waMessageId: string | null;
+    kind: string | null;
+    fileName: string | null;
+  };
+  const merged: ({ at: Date; incoming: IncomingLine } | { at: Date; outgoing: string })[] = [];
+  for (const row of history) {
+    if (row.timestamp instanceof Date && typeof row.senderJid === "string") {
+      merged.push({
+        at: row.timestamp,
+        incoming: {
+          senderJid: row.senderJid,
+          senderName: typeof row.pushName === "string" && row.pushName.trim() !== "" ? row.pushName : null,
+          text: typeof row.text === "string" ? row.text : "",
+          waMessageId: typeof row.waMessageId === "string" ? row.waMessageId : null,
+          kind: typeof row.media?.kind === "string" && row.media.kind !== "" ? row.media.kind : null,
+          fileName: row.media?.fileName ?? null,
+        },
+      });
+    }
   }
+  for (const row of said) {
+    const at = row.scheduledFor ?? row.createdAt;
+    // An outgoing message is a line the assistant said, and only text is stored:
+    // there is nothing in the send table to read an attachment from.
+    if (at instanceof Date && typeof row.text === "string" && row.text !== "") {
+      merged.push({ at, outgoing: row.text });
+    }
+  }
+  merged.sort((left, right) => right.at.getTime() - left.at.getTime());
+
+  // The prompt reads oldest-first, because a conversation is read in the order it
+  // happened.
+  const contextMessages: ReplyContextMessage[] = merged
+    .slice(0, 20)
+    .reverse()
+    .map((entry) =>
+      "outgoing" in entry
+        ? {
+            senderJid: body.groupJid,
+            senderName: "Assistant",
+            text: entry.outgoing,
+            timestamp: entry.at,
+            waMessageId: null,
+            attachment: null,
+          }
+        : {
+            senderJid: entry.incoming.senderJid,
+            // The name the group sees, when WhatsApp told us one.
+            senderName: entry.incoming.senderName,
+            text: entry.incoming.text,
+            timestamp: entry.at,
+            // Named so the reply can read it: a media tool is addressed by message id.
+            waMessageId: entry.incoming.waMessageId,
+            attachment:
+              entry.incoming.kind === null ? null : { kind: entry.incoming.kind, fileName: entry.incoming.fileName },
+          },
+    );
 
   const scope = { organizationId: body.organizationId, instanceId: body.instanceId, groupJid: body.groupJid, waMessageId: body.waMessageId };
   // The key names the chat too: the send table is unique on
