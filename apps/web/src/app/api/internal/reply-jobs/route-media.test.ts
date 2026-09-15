@@ -21,17 +21,44 @@ const plan = vi.hoisted(() => ({
   result: null as unknown,
 }));
 const generateText = vi.hoisted(() =>
-  vi.fn(async (input: { tools?: Record<string, { execute?: (arguments_: unknown, options: unknown) => Promise<unknown> }> }) => {
-    plan.result = null;
-    const current = plan.current;
-    if (current?.tool) {
-      const tool = input.tools?.[current.tool];
-      plan.result = tool?.execute
-        ? await tool.execute(current.args, { toolCallId: "call-1", messages: [], context: {} })
-        : "missing-tool";
-    }
-    return { text: current?.text ?? "", usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 } };
-  }),
+  vi.fn(
+    async (input: {
+      tools?: Record<
+        string,
+        {
+          execute?: (arguments_: unknown, options: unknown) => Promise<unknown>;
+          toModelOutput?: (options: { toolCallId: string; input: unknown; output: unknown }) => unknown;
+        }
+      >;
+    }) => {
+      plan.result = null;
+      const current = plan.current;
+      if (current?.tool) {
+        const tool = input.tools?.[current.tool];
+        if (!tool?.execute) {
+          plan.result = "missing-tool";
+        } else {
+          const output = await tool.execute(current.args, { toolCallId: "call-1", messages: [], context: {} });
+          // What the *model* is handed, which is the conversion and not the raw
+          // output: that is where an image stops being text, so a test asserting on
+          // the raw value would be testing the wrong side of the boundary.
+          const mapped = tool.toModelOutput
+            ? (tool.toModelOutput({ toolCallId: "call-1", input: current.args, output }) as
+                | { type: "text"; value: string }
+                | { type: "content"; value: { type: string; text?: unknown }[] })
+            : { type: "text" as const, value: String(output) };
+          plan.result =
+            mapped.type === "text"
+              ? mapped.value
+              : (mapped.value ?? [])
+                  .filter((part: { type: string }) => part.type === "text")
+                  .map((part: { text?: unknown }) => String(part.text))
+                  .join("\n");
+        }
+      }
+      return { text: current?.text ?? "", usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 } };
+    },
+  ),
 );
 vi.mock("ai", async (importOriginal) => {
   const actual = await importOriginal<typeof aiSdk>();
