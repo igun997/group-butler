@@ -13,7 +13,11 @@
 # the build runs on the Debian-based golang image and the runtime must be
 # glibc-based (docs/architecture-draft.md §12.1).
 
-FROM golang:1.25-bookworm AS builder
+# The builder tracks the language version `go.mod` requires, because the Golang
+# images pin GOTOOLCHAIN=local: with an older builder the toolchain cannot fetch
+# itself and `go mod download` fails on the module's own `go` directive. Raising
+# the module's version means raising this with it.
+FROM golang:1.26-bookworm AS builder
 
 WORKDIR /src
 ENV CGO_ENABLED=1 GOOS=linux
