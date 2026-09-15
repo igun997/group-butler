@@ -1,0 +1,103 @@
+# Build and test both halves of the stack on every change.
+#
+#   app     the Next.js BFF — lint, typecheck, the whole test suite, production build
+#   worker  the Go worker — vet, build, short tests
+#
+# The two are separate jobs because they are separate deployables with separate
+# toolchains (docs/architecture-draft.md §12.1), and because a failure in one says
+# nothing about the other. `deploy.yml` publishes the images; this only proves the
+# tree builds, so it holds read-only permissions and pushes nothing.
+#
+# No service containers: every test that needs a database starts its own
+# `mongodb-memory-server` replica set, which is also how the suites run locally. That
+# download is cached per runner image, so the first run of a branch pays for it.
+
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request: {}
+
+permissions:
+  contents: read
+
+# A force-push or a quick follow-up commit makes the previous run's result moot.
+# Unlike `deploy.yml`, cancelling here is the point: nothing is published.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  app:
+    name: app
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+
+      # The lockfile is the contract: a dependency that is not in it is a
+      # dependency nobody has run.
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Typecheck
+        run: bun run check
+
+      - name: Test the launchers and the shared contract
+        run: bun test scripts/dev.test.ts scripts/prod.test.ts && bun run --cwd packages/shared test
+
+      # `--no-file-parallelism` because every suite that touches a database starts
+      # its own mongod: run side by side on a two-core runner they contend, and a
+      # server that has not finished booting inside its own timeout reads as a
+      # failing test. Serial file execution is also not slower here.
+      - name: Test the app
+        run: bun run --cwd apps/web test --no-file-parallelism
+
+      # The production build, from the same tree, so a change that only breaks the
+      # build cannot pass as green.
+      - name: Build the BFF
+        run: bun run --cwd apps/web build
+
+  worker:
+    name: worker
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/worker
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          # The module's own go.mod decides the toolchain; the cache key is go.sum.
+          go-version-file: apps/worker/go.mod
+          cache-dependency-path: apps/worker/go.sum
+
+      - name: Verify the module is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      # `-short` is the same suite `bun run test:worker` runs: the long passes need
+      # a live WhatsApp session and are not what this job is for.
+      - name: Test
+        run: go test ./... -short
+
+      - name: Build
+        run: go build ./...
