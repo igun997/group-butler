@@ -63,7 +63,10 @@ USER butler
 
 EXPOSE 4000
 
+# The port the container actually bound — the config reads PORT, and a platform
+# may set it. Probing the declared default instead would report a healthy worker
+# as unhealthy and have it restarted.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:4000/health || exit 1
+  CMD curl -fsS "http://127.0.0.1:${PORT:-4000}/health" || exit 1
 
 CMD ["worker"]

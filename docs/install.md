@@ -103,6 +103,13 @@ not exist. `docker login` writes to the invoking user's `~/.docker/config.json`,
 so `sudo docker pull` uses root's and does not see yours — and a tool that sets
 `DOCKER_CONFIG` has a client of its own.
 
+**`PORT` is per service, and the two images read the same name**: the BFF serves on
+`3000` and the worker's control plane listens on `4000`. A platform that injects one
+value into both — or a web service given the worker's environment — puts the BFF on the
+worker's port, where the proxy does not look for it. Set `PORT=3000` for web and
+`PORT=4000` for worker, and point the worker's `WORKER_URL` at it
+(`http://worker:4000` on a compose network).
+
 `infra/prod/docker-compose.ghcr.yml` is pull-only: it builds nothing and starts no
 database (the worker reaches yours through `MONGODB_URI`). It publishes only the web
 port; the worker's control plane is reachable on the compose network as

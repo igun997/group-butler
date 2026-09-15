@@ -65,7 +65,12 @@ EXPOSE 3000
 
 # busybox wget ships with the alpine base; it exits non-zero on an HTTP error
 # status, so a 503 health route marks the container unhealthy.
+# The port the container actually bound, not the one this image declares: the
+# server reads PORT, and a platform that sets it — Easypanel and friends inject
+# one — would otherwise leave the healthcheck probing a port nothing listens on.
+# The container would then report unhealthy and be restarted while it was serving
+# perfectly well on another port.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD wget -q -O /dev/null http://127.0.0.1:3000/api/health || exit 1
+  CMD wget -q -O /dev/null "http://127.0.0.1:${PORT:-3000}/api/health" || exit 1
 
 CMD ["node", "apps/web/server.js"]
