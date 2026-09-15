@@ -171,7 +171,10 @@ group-butler/
 │  └─ shared/                               # zod schemas + TS types for the worker contract
 ├─ scripts/
 │  ├─ dev.sh                                # REQUIRED one-command local dev (§13)
-│  └─ dev.test.ts                           # contract tests for scripts/dev.sh + .env.example
+│  ├─ prod.sh                               # the built stack on this host (§13.2)
+│  ├─ stack.sh                              # the launcher both entry points share
+│  ├─ dev.test.ts                           # contract tests for scripts/dev.sh + .env.example
+│  └─ prod.test.ts                          # contract tests for scripts/prod.sh
 ├─ infra/
 │  ├─ dev/docker-compose.yml                # MongoDB replica set only (dev); R2 is the real service
 │  └─ prod/docker-compose.ghcr.yml          # OPTIONAL: pull-only wrapper for the two images
@@ -1387,13 +1390,58 @@ What the script MUST do:
    and exits without launching the apps (exit 1 on any failure).
 
 `bun run` surface: `dev`/`dev:local` → the script; `dev:check` → `--check`; `dev:infra` → infra up
-only; `dev:down` → compose down. Contract tests for the script and for `.env.example` live in
-`scripts/dev.test.ts` (§14.5), including a test that asserts no MinIO/path-style remnant exists.
+only; `dev:down` → compose down. `prod`/`prod:check` run the built stack instead (§13.2). Contract
+tests for the script and for `.env.example` live in `scripts/dev.test.ts` (§14.5), including a test
+that asserts no MinIO/path-style remnant exists.
+
+`scripts/stack.sh` holds what the development and production entry points share — the environment and
+R2 preflight, the infra bring-up, and the supervision, logging and shutdown of the two host
+processes. `scripts/dev.sh` and `scripts/prod.sh` decide only what differs: the two commands and that
+the BFF is `next dev` rather than the built server.
 
 Both the R2 client (Go, `aws-sdk-go-v2/service/s3`) and the presigner (TS,
 `@aws-sdk/client-s3` + `s3-request-presigner`) talk to the real R2 endpoint, which both services derive
 from `R2_ACCOUNT_ID` as `https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com`. There is no endpoint
 variable, no path-style flag, no emulator branch and no environment-specific storage code path.
+
+### 13.2 Production build on the host (`scripts/prod.sh`)
+
+`bun run prod` runs the same two host processes as development, built the way the image builds them:
+
+| | development (`dev.sh`) | production (`prod.sh`) |
+| --- | --- | --- |
+| web | `next dev` | `next build`, then the standalone server the image runs (`node apps/web/server.js`, from `apps/web/.next/standalone`) |
+| worker | `go run ./...` | `go build -o apps/worker/whatsapp-worker .`, then that binary |
+| infra | the mongodb replica set in Docker, identical | identical |
+
+The image's entry point is used rather than `next start` because this app is built with
+`output: "standalone"` as a contract with `apps/web/Dockerfile`, and Next warns that `next start`
+does not work with that output. What the image copies in — `apps/web/.next/static` and
+`apps/web/public`, which the standalone trace leaves out — is linked from the build beside the
+standalone server, so the host serves the same tree the container does. The BFF's port is pinned to
+`WEB_PORT` (default 3000) and is deliberately not `.env`'s `PORT`, which belongs to the worker.
+
+**Builds are kept, not repeated.** `next build` writes `apps/web/.next` and the worker is compiled to
+`apps/worker/whatsapp-worker`, so a restart over an unchanged tree starts in about a second and a
+missing artifact is the only thing built. Neither tool can tell this working tree from the one it
+built last, so `bun run prod --force` rebuilds both, and a run that reuses them says so.
+
+**What production needs and development does not** is checked before anything starts, because
+`next start` sets `NODE_ENV=production` and two rules follow from it:
+
+- the owner console refuses the development plaintext password, so an empty `OWNER_PASSWORD_HASH` is
+  refused here — with the `bun run auth:hash` command that fills it — rather than at a login that
+  cannot succeed;
+- the session cookie is `Secure`, so the console is reached at `http://localhost:3000` (localhost is
+  a secure context) and not over a LAN address, or the login appears to succeed and then bounces.
+
+The password hash that command prints is `scrypt$16384$8$1$…`, and `.env` is *sourced* by the shell,
+so it must be single-quoted there: `OWNER_PASSWORD_HASH='scrypt$…'`. An unquoted `$` is expanded, and
+the launcher refuses the file naming that quoting rather than failing with the shell's own error.
+
+`--check` validates env, R2 and mongo and builds nothing. Contract tests for the entry point — reuse,
+`--force`, the partial build, a failed build starting nothing, and the two production refusals — live
+in `scripts/prod.test.ts`.
 
 ### 13.1 Environment examples
 - **Root `.env.example`** — the file `scripts/dev.sh` sources (`set -a; . ./.env; set +a`). Must be
