@@ -2,6 +2,7 @@ import { z } from "zod";
 import { clientKey } from "../../../../server/auth/client";
 import { UnauthorizedError, requireOwner } from "../../../../server/auth/owner";
 import { getDb } from "../../../../server/mongo";
+import { logFailure } from "../../../../server/log-failure";
 import { readGroupDetail, updateGroupConfig } from "../../../../server/repos/groups";
 
 /**
@@ -123,11 +124,16 @@ export async function PATCH(
   let result;
   try {
     result = await updateGroupConfig(db, organizationId, id, patch.data, clientKey(request));
-  } catch {
+  } catch (error) {
+    logFailure(
+      "group config update",
+      error,
+      { organizationId, groupJid: id },
+    );
     // The row, the assistant's scope it mirrors and the record of the move are
     // one transaction (§5.1, §7.2), so a write that cannot commit leaves all
     // three as they were and the operation can be repeated. The driver's own
-    // words never reach the browser (§11.5).
+    // words never reach the browser (§11.5) — they go to the operator's log.
     return Response.json(
       { error: "the configuration could not be stored", code: "store_error" },
       { status: 502, headers: noStore },

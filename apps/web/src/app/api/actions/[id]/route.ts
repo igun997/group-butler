@@ -3,6 +3,7 @@ import { clientKey } from "../../../../server/auth/client";
 import { UnauthorizedError, requireOwner } from "../../../../server/auth/owner";
 import { executeAction, type ExecuteOutcome } from "../../../../server/actions/execute";
 import { getDb } from "../../../../server/mongo";
+import { logFailure } from "../../../../server/log-failure";
 import { decideAction, type ActionDecision } from "../../../../server/repos/pending-actions";
 
 const noStore = { "cache-control": "no-store" } as const;
@@ -62,7 +63,8 @@ export async function POST(
   let decided: ActionDecision;
   try {
     decided = await decideAction(db, { organizationId, id, decision: parsed.data.decision, decidedBy, ip });
-  } catch {
+  } catch (error) {
+    logFailure("action decision", error, { organizationId, actionId: id });
     return Response.json(
       { error: "the decision could not be stored", code: "store_error" },
       { status: 502, headers: noStore },

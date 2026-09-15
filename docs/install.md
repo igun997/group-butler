@@ -18,6 +18,7 @@ upload rather than at deploy time.
 | **Bun** ≥ 1.3 | installs and runs the BFF, the scripts, and every test |
 | **Go** ≥ 1.24 | builds the worker |
 | **Docker** with the `compose` v2 plugin | runs the local MongoDB replica set. The apps always run on the host |
+| **MongoDB, as a replica set** | every multi-document write is a transaction and the live dashboard uses change streams. A standalone `mongod` refuses **both** — the app then answers 502 on any save and 503 on the stream, which looks like a broken build rather than a database without a replica set. A single node is enough |
 | A **Cloudflare R2** bucket + scoped token | attachments; the endpoint is derived from the account id, and there is no emulator |
 | A **WhatsApp** account for the bot | paired by QR or phone code from the console |
 | An **OpenAI-compatible model endpoint** | the reply agent; `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL` |
@@ -37,7 +38,7 @@ The four that have to be right before anything will start:
 
 | Key | Notes |
 | --- | --- |
-| `MONGODB_URI` | local default is the compose replica set: `mongodb://127.0.0.1:27017/group_butler?replicaSet=rs0` |
+| `MONGODB_URI` | local default is the compose replica set: `mongodb://127.0.0.1:27017/group_butler?replicaSet=rs0`. The `replicaSet=` parameter is not optional: without it the driver may connect to a member it was not told about, and the database must *be* a replica set anyway |
 | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET` | Cloudflare dashboard → R2. `bun run dev:check` refuses placeholders and probes the bucket |
 | `OWNER_EMAIL` + `OWNER_PASSWORD_HASH` | the one console account. Generate the hash with `bun run auth:hash '<password>'` and paste it **single-quoted**: `OWNER_PASSWORD_HASH='scrypt$16384$8$1$…'` |
 | `AUTH_SECRET` | ≥ 32 characters; it signs the session cookie. Rotating it signs everyone out |
@@ -118,6 +119,31 @@ that container, so a loopback `WORKER_URL` makes every BFF call to the worker fa
 both containers look healthy. Pin a release with `BUTLER_TAG=v1.2.3` rather than floating
 on `latest`.
 
+### If your MongoDB is a standalone
+
+A standalone `mongod` cannot be made to serve transactions by configuration alone —
+the server itself has to be started as a replica set, which for one node is:
+
+```bash
+# the server needs `--replSet` before it will accept rs.initiate()
+mongod --replSet rs0 --bind_ip_all --dbpath /data/db
+# once, on the same server, and idempotent enough to re-run and read the message
+mongosh --eval 'try { rs.status().ok } catch { rs.initiate({_id: "rs0", members: [{_id: 0, host: "<host>:27017"}]}) }'
+```
+
+Existing data is kept: initiating a replica set over a data directory that was a
+standalone is supported. Two details decide whether it works from a container:
+
+- the **member host** the set advertises must be an address the clients can resolve.
+  A client on the same network uses the service name (`mongo:27017`); host processes
+  use `127.0.0.1:27017`. `infra/dev/docker-compose.yml` runs a host-process stack and
+  initiates with `127.0.0.1`; `infra/prod/docker-compose.ghcr.yml` plus a container
+  database wants the service name.
+- `MONGODB_URI` then carries the set's name: `mongodb://mongo:27017/group_butler?replicaSet=rs0`.
+
+A managed MongoDB (Atlas, most PaaS add-ons) is already a replica set; check with
+`db.hello().setName` — `null` means standalone.
+
 ## 4. Pair the WhatsApp account
 
 1. Open the console at `http://localhost:3000` and sign in with the owner email and
@@ -156,6 +182,7 @@ bun run test:worker                           # cd apps/worker && go test ./... 
 | `could not read …/.env` | a value with a `$` is unquoted — the password hash needs single quotes |
 | `OWNER_PASSWORD_HASH is empty` | `bun run prod` refuses the development plaintext password; run `bun run auth:hash` |
 | `/api/health` reports `worker: unreachable` | the worker is not running, or `WORKER_URL` points at loopback from inside a container |
+| **502** `store_error` on saving a scope, a group's settings, an approval, or a send | the write is transactional and the database refused it. Check `db.hello().setName`: `null` means a standalone, which cannot serve transactions — the server log now says so, with the fix |
 | A container shows **`unhealthy`**, or never appears when using the compose file | the image's healthcheck is `GET /api/health`, and that route is a dependency check: it answers 503 while MongoDB or the worker is unreachable, so the container reports unhealthy rather than failing. The compose file's `depends_on: service_healthy` then starts nothing. Read why with `docker inspect --format '{{json .State.Health.Log}}' <container>` |
 | `EADDRINUSE` on 3000 or 4000 | the development stack is still up; stop it before `bun run prod` |
 | `unauthorized` pulling `ghcr.io/…` | the client has no GHCR credential: log in as the user that runs docker (`sudo` uses root's config), or pull a tag that exists — a private package says `unauthorized` either way |

@@ -6,6 +6,7 @@ import {
   type PresignedMedia,
 } from "../../../../../server/media/presign";
 import { getDb } from "../../../../../server/mongo";
+import { logFailure } from "../../../../../server/log-failure";
 import { messageMediaKey } from "../../../../../server/repos/messages";
 
 /**
@@ -57,6 +58,7 @@ export async function GET(
       return Response.json({ error: "not_found" }, { status: 404, headers: { "cache-control": "no-store" } });
     }
     if (error instanceof R2ConfigurationError) {
+      logFailure("media url", error, { organizationId, instanceId, messageId });
       return Response.json(
         { error: "media_unavailable" },
         { status: 503, headers: { "cache-control": "no-store" } },

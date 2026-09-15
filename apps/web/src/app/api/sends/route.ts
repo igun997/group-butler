@@ -3,6 +3,7 @@ import { clientKey } from "../../../server/auth/client";
 import { UnauthorizedError, requireOwner } from "../../../server/auth/owner";
 import { COLLECTIONS } from "../../../server/collections";
 import { getDb } from "../../../server/mongo";
+import { logFailure } from "../../../server/log-failure";
 import { createSend, sendTargetState, type SendRow, type SendTargetState } from "../../../server/repos/sends";
 
 const noStore = { "cache-control": "no-store" } as const;
@@ -75,7 +76,8 @@ export async function POST(request: Request): Promise<Response> {
   try {
     const send = await createSend(db, { ...parsed.data, organizationId, actorIP: clientKey(request) });
     return Response.json({ send }, { status: 201, headers: noStore });
-  } catch {
+  } catch (error) {
+    logFailure("send creation", error, { organizationId, instanceId: parsed.data.instanceId });
     return Response.json({ error: "the send request could not be stored", code: "store_error" }, { status: 502, headers: noStore });
   }
 }

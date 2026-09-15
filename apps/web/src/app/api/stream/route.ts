@@ -3,6 +3,7 @@ import type { GroupUpdatedEvent } from "@butler/shared";
 import { COLLECTIONS } from "../../../server/collections";
 import { UnauthorizedError, requireOwner } from "../../../server/auth/owner";
 import { getDb } from "../../../server/mongo";
+import { logFailure } from "../../../server/log-failure";
 import { toInstanceRow, type InstanceDoc } from "../../../server/repos/instances";
 import { toMessageRow, type MessageDoc } from "../../../server/repos/messages";
 
@@ -350,12 +351,19 @@ export async function GET(request: Request): Promise<Response> {
   try {
     db = await getDb();
     support = await changeStreamSupport(db);
-  } catch {
+  } catch (error) {
     // Mongo is unreachable: there is no stream to serve, and holding a
-    // connection open would only look healthy while delivering nothing.
+    // connection open would only look healthy while delivering nothing. The
+    // client gets one shape either way; the operator gets the reason.
+    logFailure("stream open", error, { organizationId });
     return streamUnavailable();
   }
-  if (!support.supported) return streamUnavailable();
+  if (!support.supported) {
+    // The one cause that is configuration rather than a fault: change streams need
+    // a replica set, and a standalone mongod answers every one of them with this.
+    logFailure("stream open", new Error("MongoDB does not support change streams"), { organizationId });
+    return streamUnavailable();
+  }
 
   // Resume precedence: the client's own token first — `Last-Event-ID` is what an
   // `EventSource` sends by itself, and `?resume=` is what the coordinator adds
@@ -370,9 +378,11 @@ export async function GET(request: Request): Promise<Response> {
   if (clientToken === undefined) {
     try {
       persisted = await readStreamCursor(db, organizationId);
-    } catch {
+    } catch (error) {
       // The cursor read is part of opening the channel: a failure here is the
-      // same unavailable stream, not a 500 for the operator to decode.
+      // same unavailable stream to the client, not a 500 — and a logged line for
+      // the operator, who otherwise has a retrying page and no reason for it.
+      logFailure("stream cursor read", error, { organizationId });
       return streamUnavailable();
     }
   }

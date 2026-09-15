@@ -2,6 +2,7 @@ import { z } from "zod";
 import { clientKey } from "../../../../server/auth/client";
 import { guardInstance } from "../../../../server/instance-guard";
 import { getDb } from "../../../../server/mongo";
+import { logFailure } from "../../../../server/log-failure";
 import { updateInstanceConfig, WHITELIST_MAX_GROUPS } from "../../../../server/repos/instance-config";
 import { deleteWorkerInstance, getWorkerInstance, workerFailureResponse } from "../../../../server/worker/client";
 
@@ -96,11 +97,17 @@ export async function PATCH(
       patch.data.groupJidWhitelist,
       clientKey(request),
     );
-  } catch {
+  } catch (error) {
+    logFailure(
+      "instance config update",
+      error,
+      { organizationId: guard.organizationId, instanceId: id },
+    );
     // A database that cannot commit the edit and its audit row together
     // commits neither, so the whitelist on screen is still the last good one and
     // the operation can be repeated. The driver's own words never reach the
-    // browser (§11.5).
+    // browser (§11.5) — they go to the operator's log instead, which is the only
+    // way a 502 from here can be diagnosed at all.
     return Response.json(
       { error: "the configuration could not be stored", code: "store_error" },
       { status: 502, headers: noStore },

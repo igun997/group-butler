@@ -2,6 +2,7 @@ import { z } from "zod";
 import { clientKey } from "../../../../../server/auth/client";
 import { UnauthorizedError, requireOwner } from "../../../../../server/auth/owner";
 import { getDb } from "../../../../../server/mongo";
+import { logFailure } from "../../../../../server/log-failure";
 import { approveSend, getSend, sendTargetState, type SendTargetState } from "../../../../../server/repos/sends";
 
 const noStore = { "cache-control": "no-store" } as const;
@@ -64,7 +65,8 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       return Response.json({ error: "the send cannot be approved in its current state", code }, { status, headers: noStore });
     }
     return Response.json({ send: result }, { headers: noStore });
-  } catch {
+  } catch (error) {
+    logFailure("send approval", error, { organizationId, sendId: id });
     return Response.json({ error: "the approval could not be stored", code: "store_error" }, { status: 502, headers: noStore });
   }
 }

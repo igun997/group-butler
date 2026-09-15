@@ -1,6 +1,7 @@
 import { clientKey } from "../../../../server/auth/client";
 import { UnauthorizedError, requireOwner } from "../../../../server/auth/owner";
 import { getDb } from "../../../../server/mongo";
+import { logFailure } from "../../../../server/log-failure";
 import { transitionSend } from "../../../../server/repos/sends";
 
 const noStore = { "cache-control": "no-store" } as const;
@@ -27,7 +28,8 @@ export async function decideSend(
       );
     }
     return Response.json({ send: result }, { headers: noStore });
-  } catch {
+  } catch (error) {
+    logFailure("send decision", error, { organizationId, sendId: id });
     return Response.json({ error: "the send decision could not be stored", code: "store_error" }, { status: 502, headers: noStore });
   }
 }

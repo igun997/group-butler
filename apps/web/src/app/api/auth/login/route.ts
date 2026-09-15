@@ -9,6 +9,7 @@ import {
 } from "../../../../server/auth/owner";
 import { issueSession } from "../../../../server/auth/session";
 import { recordAuthEvent, type AuthAuditEvent } from "../../../../server/repos/audit";
+import { logFailure } from "../../../../server/log-failure";
 
 /** Credentials, or `null` for anything that is not a JSON body carrying two strings. */
 async function readCredentials(request: Request): Promise<{ email: string; password: string } | null> {
@@ -34,7 +35,8 @@ async function readCredentials(request: Request): Promise<{ email: string; passw
 async function answer(startedAt: number, event: AuthAuditEvent, response: () => Response): Promise<Response> {
   try {
     await recordAuthEvent(event);
-  } catch {
+  } catch (error) {
+    logFailure("auth audit", error, { action: event.action });
     await padLogin(startedAt);
     return Response.json(
       { error: "Cannot record the attempt" },

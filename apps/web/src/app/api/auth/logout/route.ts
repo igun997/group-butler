@@ -1,6 +1,7 @@
 import { clientKey } from "../../../../server/auth/client";
 import { clearSessionCookie } from "../../../../server/auth/owner";
 import { recordAuthEvent } from "../../../../server/repos/audit";
+import { logFailure } from "../../../../server/log-failure";
 
 /**
  * The session is the cookie and nothing else, so logging out is the empty cookie
@@ -18,7 +19,8 @@ export async function POST(request: Request): Promise<Response> {
       ip: clientKey(request),
       email,
     });
-  } catch {
+  } catch (error) {
+    logFailure("auth audit", error, {});
     return Response.json(
       { error: "Cannot record the attempt" },
       { status: 503, headers: { "cache-control": "no-store" } },
