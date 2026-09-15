@@ -48,6 +48,22 @@ const COMPLETE_ENV = [
   "",
 ].join("\n");
 
+/**
+ * The names the fixture's own env file declares. The repository `.env` is loaded
+ * into this test process (bun reads it at startup), so an inherited value under
+ * one of these names would outlive the fixture's file and quietly decide a test
+ * that means to withhold it.
+ */
+const FIXTURE_ENV_NAMES = COMPLETE_ENV.split("\n")
+  .map((line) => line.split("=")[0] ?? "")
+  .filter((name) => name !== "");
+
+function withoutFixtureEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const copy = { ...env };
+  for (const name of FIXTURE_ENV_NAMES) delete copy[name];
+  return copy;
+}
+
 interface Fixture {
   dir: string;
   state: string;
@@ -74,6 +90,9 @@ function makeFixture(opts: { env?: string | null; stubDocker?: boolean; failWeb?
 
   cpSync(launcherSource, join(dir, "scripts", "dev.sh"));
   chmodSync(join(dir, "scripts", "dev.sh"), 0o755);
+  // The launcher is a thin caller: the harness it runs is `scripts/stack.sh`,
+  // shared with the production entry point, so both have to be in the fixture.
+  cpSync(join(repoRoot, "scripts/stack.sh"), join(dir, "scripts", "stack.sh"));
   // Content is irrelevant: the docker stub never reads it.
   writeFileSync(join(dir, "infra", "dev", "docker-compose.yml"), "name: group-butler-dev\nservices: {}\n");
   writeFileSync(join(dir, ".env.example"), COMPLETE_ENV);
@@ -162,7 +181,7 @@ printf '403'
   );
 
   const env = (extra: Record<string, string> = {}) => ({
-    ...process.env,
+    ...withoutFixtureEnv(process.env),
     PATH: `${stubPath}:${makeSystemPath(dir)}`,
     STUB_STATE: state,
     DEV_ENV_FILE: join(dir, ".env"),

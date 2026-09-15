@@ -5,12 +5,14 @@
   "scripts": {
     "dev": "bun run dev:local",
     "dev:local": "bash scripts/dev.sh",
+    "prod": "bash scripts/prod.sh",
+    "prod:check": "bash scripts/prod.sh --check",
     "dev:check": "bash scripts/dev.sh --check",
     "dev:infra": "docker compose -f infra/dev/docker-compose.yml up -d",
     "dev:down": "docker compose -f infra/dev/docker-compose.yml down",
     "bootstrap": "bun run --cwd apps/web bootstrap",
     "auth:hash": "bun run --cwd apps/web auth:hash",
-    "test": "bun test scripts/dev.test.ts && bun run --cwd packages/shared test && bun run --cwd apps/web test",
+    "test": "bun test scripts/dev.test.ts scripts/prod.test.ts && bun run --cwd packages/shared test && bun run --cwd apps/web test",
     "test:worker": "cd apps/worker && go test ./... -short",
     "lint": "bun run --cwd packages/shared lint && bun run --cwd apps/web lint",
     "check": "bun run --cwd apps/web check"
