@@ -395,6 +395,16 @@ listed in `organizations.config.autoReplyAuthorizedJids`. It retrieves context
 only from that group, then creates one idempotent approved send with
 `provenance.source: "owner_mention"` and `provenance.replyToMessageId`.
 
+That send's `idempotencyKey` is derived from the job's instance, group, and
+message (`agentReplyIdempotencyKey`), because the send table's uniqueness index
+is `{organizationId, idempotencyKey}`: the group has to be part of the key, or
+one instance's identical message id in two groups would contend for one send.
+
+The worker delivers that send as a quoted reply to the message it names: the
+quote's `StanzaID` is the stored `replyToMessageId` and its participant is that
+message's stored `senderJid`. A send whose quoted message the worker does not
+hold is not sent unquoted — it fails with `dispatch.errorClass: "rejected"`.
+
 Every model call writes one `aiCalls` row, before the answer is decided and on
 success and failure alike: `{ organizationId, instanceId, groupJid,
 kind: "assistant", model, status: "ok" | "error", latencyMs, usage: {

@@ -274,7 +274,10 @@ Three levels, deliberately distinct:
   Ingestion happens for every observed group (R1).
 - **assigned** — the owner opted the group into the managed surface (R6); drives list views and
   allowed send targets.
-- **whitelisted** — the group is answerable by the AI for that instance (R5). A subset of assigned.
+- **whitelisted** — the group is answerable by the AI for that instance (R5). A subset of assigned:
+  `instances.config.assignedGroupJids` has no surface in this build, so the whitelist is the only
+  scope control the owner has, and the whitelist writers set `assigned` with it — a grant assigns
+  the group, a removal un-assigns it, and no granted group is left un-answerable.
 
 ```
 {
@@ -299,7 +302,7 @@ Three levels, deliberately distinct:
     lastSyncedAt: Date, lastSyncSource: "connect"|"timer"|"manual"|"event"|"message"
   },
   config: {                               // ← BFF-owned
-    assigned: false,
+    assigned: false,                      // moved with `whitelisted` by the whitelist writers
     whitelisted: false,                   // denormalized mirror of instances.config.groupJidWhitelist
     active: true, notes: "", tags: []
   },
@@ -311,8 +314,9 @@ Indexes: `{organizationId:1, instanceId:1, groupJid:1}` unique;
 `{organizationId:1, groupJid:1}` (global "which instances see this group");
 `{organizationId:1, instanceId:1, "observed.subjectSearch":1}` (name search per instance);
 `{organizationId:1, "observed.state":1, "observed.lastSyncedAt":-1}` (reconciliation sweep).
-`config.whitelisted` is written **only** by the whitelist mutation endpoint, in the same
-`updateOne` batch that rewrites `instances.config.groupJidWhitelist` — one code path, no drift.
+`config.whitelisted`, and the `config.assigned` a grant carries with it, are written **only** by the
+whitelist mutation path, in the same `updateOne` batch that rewrites `instances.config.groupJidWhitelist`
+— one code path, no drift.
 The worker never writes `config.*`; the BFF never writes `observed.*` (§6.6 TDD slice T8).
 
 #### `messages`
