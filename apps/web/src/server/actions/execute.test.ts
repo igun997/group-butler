@@ -25,6 +25,7 @@ beforeEach(async () => {
   await Promise.all([
     db.collection(COLLECTIONS.pendingActions).deleteMany({}),
     db.collection(COLLECTIONS.auditLog).deleteMany({}),
+    db.collection(COLLECTIONS.sendRequests).deleteMany({}),
   ]);
 });
 
@@ -319,6 +320,67 @@ describe("executing a staged action", () => {
     });
     expect(await audited(db, "action.executed")).toBe(0);
     expect(await audited(db, "action.execution_failed")).toBe(1);
+  });
+});
+
+/**
+ * A message is not a group-administration call: the executor turns it into a send
+ * request, which the worker's dispatcher delivers. That is the whole path an owner
+ * asked for when they told the assistant to put something in a group — and the one
+ * an owner was told the assistant could not do at all.
+ */
+describe("executing a staged message", () => {
+  test("creates the send the row describes, once", async () => {
+    const db = await getDb();
+    const row = await approved(db, "group_send", { text: "Selamat pagi semua." });
+
+    const outcome = await executeAction(db, row, "worker");
+
+    expect(outcome.kind).toBe("executed");
+    const sends = await db.collection(COLLECTIONS.sendRequests).find({ organizationId: ORG }).toArray();
+    expect(sends).toHaveLength(1);
+    expect(sends[0]).toMatchObject({
+      instanceId: "inst_1",
+      groupJid: JID,
+      text: "Selamat pagi semua.",
+      // Nothing is left waiting: the owner asked for this message.
+      status: "approved",
+      approval: { state: "approved", approvedBy: "assistant" },
+      // The staged row is the idempotency boundary, so a second execution of this
+      // row cannot put a second copy in the group.
+      idempotencyKey: `action:${row.id}`,
+    });
+    expect(await stored(db, row.id)).toMatchObject({ state: "executed", result: { sendId: sends[0]?.id } });
+
+    await executeAction(db, row, "worker");
+    expect(await db.collection(COLLECTIONS.sendRequests).countDocuments({ organizationId: ORG })).toBe(1);
+  });
+
+  test("schedules it for the time the row names, rather than sending it now", async () => {
+    const db = await getDb();
+    const when = new Date(Date.now() + 60 * 60 * 1000);
+    const row = await approved(db, "group_send", { text: "Laporan harian ya.", scheduledFor: when.toISOString() });
+
+    await executeAction(db, row, "worker");
+
+    const send = await db.collection(COLLECTIONS.sendRequests).findOne({ organizationId: ORG });
+    // `scheduled` is what the worker's dispatcher waits on: it claims a row when
+    // `scheduledFor` has passed, so this message arrives at the hour it was given.
+    expect(send).toMatchObject({ status: "scheduled", text: "Laporan harian ya." });
+    expect(send?.scheduledFor?.toISOString()).toBe(when.toISOString());
+  });
+
+  // The row is the input to the only code that can send, so it is validated again
+  // here rather than trusted because another path once accepted it.
+  test("refuses a row whose message cannot be sent, and creates nothing", async () => {
+    const db = await getDb();
+    const empty = await approved(db, "group_send", { text: "   " });
+    const past = await approved(db, "group_send", { text: "hi", scheduledFor: "not-a-date" });
+
+    expect((await executeAction(db, empty, "worker")).kind).toBe("failed");
+    expect((await executeAction(db, past, "worker")).kind).toBe("failed");
+    expect(await db.collection(COLLECTIONS.sendRequests).countDocuments({})).toBe(0);
+    expect(await stored(db, empty.id)).toMatchObject({ state: "failed" });
   });
 });
 

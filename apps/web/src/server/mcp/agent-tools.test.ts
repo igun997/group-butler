@@ -317,6 +317,8 @@ describe("group tools as the agent's tool set", () => {
     group_info: ["includeAddresses"],
     group_participants: ["includeAddresses"],
     monitored_groups: ["includeAddresses"],
+    group_messages: ["includeAddresses", "hours", "limit", "query"],
+    scheduled_sends: ["includeAddresses"],
     group_rename: ["name"],
     group_set_announce: ["announce"],
     group_set_locked: ["locked"],
@@ -324,6 +326,8 @@ describe("group tools as the agent's tool set", () => {
     group_members: ["membership", "jids"],
     group_leave: ["reason"],
     message_revoke: ["waMessageId"],
+    group_send: ["text", "sendAt"],
+    cancel_scheduled: ["sendId"],
   };
 
   test("exposes exactly the registered group tools, with the action's params and no scope at all", async () => {

@@ -24,7 +24,12 @@ export interface SendRow {
   idempotencyKey: string;
   status: SendStatus;
   scheduledFor: Date;
-  approval: { state: "pending" | "approved" | "rejected"; approvedBy?: "owner"; approvedAt?: Date };
+  /**
+   * Who approved it. `assistant` is a change the assistant was allowed to make on
+   * its own — the owner's own instruction carried out, not a decision it took in
+   * their name — and the audit trail has to tell the two apart.
+   */
+  approval: { state: "pending" | "approved" | "rejected"; approvedBy?: "owner" | "assistant"; approvedAt?: Date };
   provenance?: { source: "owner_mention"; replyToMessageId: string; memoryBatchIds?: ObjectId[]; memoryFactIds?: ObjectId[] };
   dispatch: { attempts: number; lockedAt: Date | null; lockedBy: string | null; waMessageId: string | null; errorClass: string | null };
   createdAt: Date;
@@ -33,6 +38,13 @@ export interface SendRow {
 
 export type CreateSendInput = Pick<SendRow, "organizationId" | "instanceId" | "groupJid" | "text" | "idempotencyKey"> & {
   actorIP: string;
+  /**
+   * Present when the send is created already decided, which is what an action the
+   * assistant may perform on its own produces: the owner asked for this message in
+   * their own chat, so there is nobody left to ask. Absent leaves the row awaiting
+   * the owner, which is what the console's composer does.
+   */
+  decision?: { decidedBy: "owner" | "assistant"; scheduledFor?: Date };
 };
 
 /**
@@ -72,6 +84,7 @@ export async function getSend(db: Db, organizationId: string, id: string): Promi
 /** Creates a request in the only state that the dispatcher can never claim. */
 export async function createSend(db: Db, input: CreateSendInput): Promise<SendRow> {
   const now = new Date();
+  const scheduledFor = input.decision?.scheduledFor ?? now;
   const candidate: SendRow = {
     id: randomUUID(),
     organizationId: input.organizationId,
@@ -79,9 +92,13 @@ export async function createSend(db: Db, input: CreateSendInput): Promise<SendRo
     groupJid: input.groupJid,
     text: input.text,
     idempotencyKey: input.idempotencyKey,
-    status: "pending_approval",
-    scheduledFor: now,
-    approval: { state: "pending" },
+    status:
+      input.decision === undefined ? "pending_approval" : scheduledFor > now ? "scheduled" : "approved",
+    scheduledFor,
+    approval:
+      input.decision === undefined
+        ? { state: "pending" }
+        : { state: "approved", approvedBy: input.decision.decidedBy, approvedAt: now },
     dispatch: { attempts: 0, lockedAt: null, lockedBy: null, waMessageId: null, errorClass: null },
     createdAt: now,
     updatedAt: now,
@@ -101,10 +118,17 @@ export async function createSend(db: Db, input: CreateSendInput): Promise<SendRo
         db,
         {
           organizationId: input.organizationId,
-          actor: "owner",
+          // Who asked for this send. A row the assistant created on the owner's
+          // instruction is not the owner having created it, and the audit trail
+          // says which of the two happened.
+          actor: input.decision?.decidedBy ?? "owner",
           action: "send.created",
           target: { type: "send", id: candidate.id },
-          meta: { instanceId: input.instanceId, groupJid: input.groupJid },
+          meta: {
+            instanceId: input.instanceId,
+            groupJid: input.groupJid,
+            ...(input.decision === undefined ? {} : { scheduledFor, approvedBy: input.decision.decidedBy }),
+          },
           ip: input.actorIP,
         },
         session,
@@ -442,6 +466,12 @@ export async function transitionSend(
   id: string,
   action: "reject" | "cancel",
   actorIP: string,
+  /**
+   * Who did it. A cancellation the assistant carried out on the owner's
+   * instruction is recorded as the assistant's, the same way a send it created
+   * is: the trail exists to tell those apart.
+   */
+  actor: "owner" | "assistant" = "owner",
 ): Promise<SendTransition> {
   const allowed: SendStatus[] = action === "reject" ? ["pending_approval"] : ["approved", "scheduled"];
   const status: SendStatus = action === "reject" ? "rejected" : "cancelled";
@@ -461,7 +491,7 @@ export async function transitionSend(
         db,
         {
           organizationId,
-          actor: "owner",
+          actor,
           action: action === "reject" ? "send.rejected" : "send.cancelled",
           target: { type: "send", id },
           meta: {},

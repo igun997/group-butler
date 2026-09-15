@@ -248,7 +248,7 @@ export async function decideAction(db: Db, input: DecideActionInput): Promise<Ac
         db,
         {
           organizationId: input.organizationId,
-          actor: "owner",
+          actor: input.decidedBy === "owner" ? "owner" : "assistant",
           action: input.decision === "approve" ? "action.approved" : "action.rejected",
           target: { type: "action", id: decided.id },
           meta: {

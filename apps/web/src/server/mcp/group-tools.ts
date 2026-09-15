@@ -6,6 +6,7 @@ import type { Db } from "mongodb";
 import { z } from "zod";
 import { clipScalars, normalizeUntrustedText } from "../ai/sanitize-whatsapp";
 import { COLLECTIONS } from "../collections";
+import { toZonedIso } from "../display-time";
 import { getDb } from "../mongo";
 import {
   decideAction,
@@ -16,6 +17,7 @@ import {
   type StageActionInput,
 } from "../repos/pending-actions";
 import { executeAction, type ExecuteOutcome } from "../actions/execute";
+import { transitionSend, type SendTransition } from "../repos/sends";
 import { writeAudit, type AuditEntry } from "../repos/audit";
 import {
   getWorkerGroupInfo,
@@ -56,9 +58,31 @@ export const GROUP_TOOL_LIMITS = {
   dataUrlChars: 1_400_000,
   /** The longest member name one answer repeats, so a single member cannot spend the budget. */
   labelChars: 256,
+  /** How far back a message recap reaches, in hours, when the call does not say. */
+  recapHoursDefault: 12,
+  /** The furthest back it may reach. A week is a summary's job, not a tool's. */
+  recapHoursMax: 168,
+  /** The most messages one recap returns, however large the window. */
+  recapMessagesDefault: 60,
+  recapMessagesMax: 100,
+  /** The longest single message a recap repeats; a longer one is clipped, not dropped. */
+  recapTextChars: 800,
+  /** The longest search string a caller may pass; it becomes a regex, escaped here. */
+  recapQueryChars: 200,
+  /** The most queued sends one listing returns. */
+  scheduledMax: 50,
+  /** The longest message this tool will send into a group. */
+  sendTextChars: 4_000,
+  /** How far ahead a send may be scheduled. A month is a calendar's job, not a tool's. */
+  sendAheadMs: 31 * 24 * 60 * 60 * 1000,
 } as const;
 
-export type GroupReadToolName = "group_info" | "group_participants" | "monitored_groups";
+export type GroupReadToolName =
+  | "group_info"
+  | "group_participants"
+  | "monitored_groups"
+  | "group_messages"
+  | "scheduled_sends";
 
 export type GroupWriteToolName =
   | "group_rename"
@@ -67,9 +91,19 @@ export type GroupWriteToolName =
   | "group_set_photo"
   | "group_members"
   | "group_leave"
-  | "message_revoke";
+  | "message_revoke"
+  | "group_send"
+  | "cancel_scheduled";
 
 export type GroupToolName = GroupReadToolName | GroupWriteToolName;
+
+/**
+ * The writes that go through the owner's queue: staged, then approved, then
+ * performed. `cancel_scheduled` is a write that is not one of them — it is about
+ * a queued send rather than a group, so it names no group to key a queue row by,
+ * and it is performed directly (`cancelScheduledSend`).
+ */
+export type StagedGroupWriteToolName = Exclude<GroupWriteToolName, "cancel_scheduled">;
 
 export type GroupMembership = "add" | "remove" | "promote" | "demote";
 
@@ -96,12 +130,24 @@ export interface GroupToolInput {
   /** What a staged exit says about itself; the owner reads it before approving. */
   reason?: string;
   /**
-   * Whether the list read returns each group's WhatsApp address. The owner reads
-   * names, so an address is only useful to a model that is about to act on a
-   * group; asking is also what puts input in the call, which this deployment's
-   * gateway requires (see `MONITORED_GROUPS_PARAMS`).
+   * Whether a read returns each group's WhatsApp address. The owner reads names,
+   * so an address is only useful to a model that is about to act on a group;
+   * asking is also what puts input in the call, which this deployment's gateway
+   * requires (see `ADDRESS_PARAMS`).
    */
   includeAddresses?: boolean;
+  /** How far back a recap reads, in hours. See `RECAP_PARAMS`. */
+  hours?: number;
+  /** How many messages a recap returns at most. See `RECAP_PARAMS`. */
+  limit?: number;
+  /** Text to search a group's messages for. See `RECAP_PARAMS`. */
+  query?: string;
+  /** The queued send a cancellation is about. See `CANCEL_PARAMS`. */
+  sendId?: string;
+  /** The message a send puts in the group. See `SEND_PARAMS`. */
+  text?: string;
+  /** When a staged send should go out. ISO 8601; absent means as soon as approved. */
+  sendAt?: string;
 }
 
 export interface GroupUnavailable {
@@ -182,6 +228,34 @@ export interface GroupStagedResult {
  * which addresses landed and which did not — a partial result must not be
  * reported as a whole one.
  */
+/**
+ * What a monitored group said, most recent last, as one bounded list.
+ *
+ * The owner asks "what was said in the group today?" from their own chat, and the
+ * answer is the group's stored messages rather than anything the model recalls:
+ * every in-scope message is written down as it arrives, so a recap is a read, not
+ * a summary of a summary. Names come with the messages, because a reader cannot
+ * resolve an address and a recap nobody can attribute is not a recap.
+ */
+export interface GroupMessagesResult {
+  ok: true;
+  /** Present only when the call asked for the group's address. */
+  groupJid?: string;
+  /** The group as this chat calls it. */
+  name: string;
+  /** How far back this read reached, and how many messages were in scope. */
+  hours: number;
+  /**
+   * One line per message. `messageId` is what a media tool is called with, so an
+   * attachment a recap names can actually be opened: without it the answer can
+   * only say that a document exists, which is what an owner was told before the
+   * assistant could read one at all.
+   */
+  messages: { messageId: string; at: string; from: string; text: string; attachment?: string }[];
+  total: number;
+  truncated: boolean;
+}
+
 export interface GroupDoneResult {
   ok: true;
   done: true;
@@ -189,6 +263,21 @@ export interface GroupDoneResult {
   summary: string;
   result: Record<string, unknown>;
   /** The plain statement that the change happened, for the agent to pass on. */
+  message: string;
+}
+
+/** What is queued to go out, and the id that cancels one. */
+export interface ScheduledSendsResult {
+  ok: true;
+  sends: { sendId: string; group: string; text: string; at: string; status: string }[];
+  total: number;
+}
+
+/** A cancellation the assistant carried out. */
+export interface ScheduledSendCancelled {
+  ok: true;
+  cancelled: true;
+  sendId: string;
   message: string;
 }
 
@@ -204,6 +293,9 @@ export type GroupToolResult =
   | GroupInfoResult
   | GroupParticipantsResult
   | MonitoredGroupsResult
+  | GroupMessagesResult
+  | ScheduledSendsResult
+  | ScheduledSendCancelled
   | GroupStagedResult
   | GroupDoneResult
   | GroupActionFailed;
@@ -228,13 +320,28 @@ export interface GroupToolDeps {
   decide?: (db: Db, input: DecideActionInput) => Promise<ActionDecision>;
   /** Overridden in tests only; production performs through `executeAction`. */
   execute?: (db: Db, action: PendingActionRow, ip: string) => Promise<ExecuteOutcome>;
+  /** Overridden in tests only; production cancels through `transitionSend`. */
+  cancelSend?: (
+    db: Db,
+    organizationId: string,
+    id: string,
+    action: "reject" | "cancel",
+    actorIP: string,
+    actor?: "owner" | "assistant",
+  ) => Promise<SendTransition>;
 }
 
 /** The control-plane reads, wired as the worker client states them. */
 const WORKER: GroupWorker = { info: getWorkerGroupInfo, participants: getWorkerGroupParticipants };
 
 function isReadTool(name: GroupToolName): name is GroupReadToolName {
-  return name === "group_info" || name === "group_participants" || name === "monitored_groups";
+  return (
+    name === "group_info" ||
+    name === "group_participants" ||
+    name === "monitored_groups" ||
+    name === "group_messages" ||
+    name === "scheduled_sends"
+  );
 }
 
 /** The characters one string spends once JSON has escaped it. */
@@ -274,6 +381,37 @@ function clipJson(value: string, budget: number): { value: string; truncated: bo
  * watched" or "who is in this group" has no use for one. An address is returned
  * only when the call says it is about to act on the group.
  */
+/**
+ * What a recap asks for beyond the group itself. Both bounds are the caller's to
+ * narrow and never to widen: a question about "today" needs hours, and a caller
+ * that wants one message still gets it through the same bounded read.
+ */
+const RECAP_PARAMS = z.object({
+  hours: z
+    .number()
+    .int()
+    .min(1)
+    .max(GROUP_TOOL_LIMITS.recapHoursMax)
+    .optional()
+    .describe(`How far back to read, in hours (default ${GROUP_TOOL_LIMITS.recapHoursDefault}).`),
+  limit: z
+    .number()
+    .int()
+    .min(1)
+    .max(GROUP_TOOL_LIMITS.recapMessagesMax)
+    .optional()
+    .describe(`The most messages to return (default ${GROUP_TOOL_LIMITS.recapMessagesDefault}).`),
+  query: z
+    .string()
+    .trim()
+    .min(1)
+    .max(GROUP_TOOL_LIMITS.recapQueryChars)
+    .optional()
+    .describe(
+      "Text to search for in the group's messages, matched anywhere in a message and without regard to case. Use it to find what was said about something rather than to recap a period; the search then reads the whole window (a week by default) and returns the newest matches first.",
+    ),
+});
+
 const ADDRESS_PARAMS = z.object({
   includeAddresses: z
     .boolean()
@@ -330,6 +468,39 @@ const LEAVE_PARAMS = z.object({
     .describe("Why the assistant is leaving, in a few words. The owner reads this before approving."),
 });
 
+/**
+ * A message to put in a group, and when.
+ *
+ * Sending is one of the things this assistant may do on its own — it already
+ * answers the owner in a group without asking — so there is no approval step here.
+ * What the owner asked for is the message; the model composes it, and the
+ * sanitizer every outbound message passes still decides whether it may go.
+ */
+/**
+ * Which queued send to cancel. The id is the one a listing returned, so a caller
+ * cancels what it just read rather than something it guessed at.
+ */
+const CANCEL_PARAMS = z.object({
+  sendId: z.string().trim().min(1).describe("The send to cancel, by the id a scheduled-messages listing returned."),
+});
+
+const SEND_PARAMS = z.object({
+  text: z
+    .string()
+    .trim()
+    .min(1)
+    .max(GROUP_TOOL_LIMITS.sendTextChars)
+    .describe("The message to send into the group, exactly as it should arrive."),
+  sendAt: z
+    .string()
+    .trim()
+    .min(1)
+    .optional()
+    .describe(
+      "When to send it, as an ISO 8601 instant (e.g. 2026-09-16T02:00:00Z). Leave it out to send as soon as possible; give a future time to schedule it. WhatsApp delivers it when it is due, whether or not the assistant is still running.",
+    ),
+});
+
 const REVOKE_PARAMS = z.object({
   waMessageId: z.string().trim().min(1).describe("The stored message whose WhatsApp send is revoked."),
 });
@@ -352,7 +523,7 @@ interface GroupWriteTool {
   stage(input: GroupToolInput): { params: Record<string, unknown>; summary: string } | null;
 }
 
-const WRITE_TOOLS: Record<GroupWriteToolName, GroupWriteTool> = {
+const WRITE_TOOLS: Record<StagedGroupWriteToolName, GroupWriteTool> = {
   group_rename: {
     stage: (input) => {
       const parsed = NAME_PARAMS.safeParse(input);
@@ -412,6 +583,29 @@ const WRITE_TOOLS: Record<GroupWriteToolName, GroupWriteTool> = {
       const parsed = REVOKE_PARAMS.safeParse(input);
       if (!parsed.success) return null;
       return { params: { waMessageId: parsed.data.waMessageId }, summary: `Revoke the message ${parsed.data.waMessageId}.` };
+    },
+  },
+  group_send: {
+    stage: (input) => {
+      const parsed = SEND_PARAMS.safeParse(input);
+      if (!parsed.success) return null;
+      const sendAt = parsed.data.sendAt === undefined ? null : new Date(parsed.data.sendAt);
+      // A schedule is a promise about the future, so a time the caller got wrong is
+      // refused here rather than stored as a send that will never be due: unparseable,
+      // already past, or further ahead than this tool will hold.
+      if (sendAt !== null) {
+        const ahead = sendAt.getTime() - Date.now();
+        if (Number.isNaN(sendAt.getTime()) || ahead <= 0 || ahead > GROUP_TOOL_LIMITS.sendAheadMs) {
+          return null;
+        }
+      }
+      return {
+        params: { text: parsed.data.text, ...(sendAt === null ? {} : { scheduledFor: sendAt.toISOString() }) },
+        summary:
+          sendAt === null
+            ? `Send this message to the group: ${parsed.data.text}`
+            : `Send this message to the group at ${sendAt.toISOString()}: ${parsed.data.text}`,
+      };
     },
   },
 };
@@ -550,6 +744,286 @@ async function knownNames(db: Db, context: ToolChatContext, groupJid: string): P
     }
   }
   return names;
+}
+
+/**
+ * What the group said recently, as the owner would read it back.
+ *
+ * It reads the messages this deployment already stored for one monitored group —
+ * the same rows the reply history is built from — so nothing new is fetched and
+ * nothing outside the instance can be reached: the group was authorized before
+ * this is called, exactly like every other read.
+ *
+ * The answer is bounded three ways, because a recap is a question about a period
+ * and a period can be arbitrarily busy: the window, the number of messages, and
+ * the result budget. One long message is clipped rather than dropped, and a window
+ * whose messages did not all fit says so, so a model cannot present a truncated
+ * recap as the whole of it.
+ */
+async function readGroupMessages(
+  db: Db,
+  context: ToolChatContext,
+  groupJid: string,
+  input: GroupToolInput,
+  includeAddresses: boolean,
+): Promise<GroupToolResult> {
+  const searching = input.query !== undefined && input.query !== "";
+  // A question about a period is asked about today or yesterday, so a recap looks
+  // back twelve hours. A search is asked about something that may have been said
+  // any time, so it reads the whole window the tool allows unless told otherwise.
+  const hours = input.hours ?? (searching ? GROUP_TOOL_LIMITS.recapHoursMax : GROUP_TOOL_LIMITS.recapHoursDefault);
+  const limit = input.limit ?? GROUP_TOOL_LIMITS.recapMessagesDefault;
+  const since = new Date(Date.now() - hours * 60 * 60 * 1000);
+  const scope = {
+    organizationId: context.organizationId,
+    instanceId: context.instanceId,
+    groupJid,
+    timestamp: { $gte: since },
+    ...(searching ? { text: { $regex: escapeRegExp(input.query ?? ""), $options: "i" } } : {}),
+  };
+  const rows = await db
+    .collection<MessageRow>(COLLECTIONS.messages)
+    // `waMessageId` is not decoration: it is what the media tools are called with,
+    // so a line that names an attachment without it is a line the model cannot act on.
+    .find(scope, { projection: { _id: 0, waMessageId: 1, senderJid: 1, pushName: 1, fromMe: 1, text: 1, timestamp: 1, media: 1 } })
+    .sort({ timestamp: -1 })
+    .limit(limit)
+    .toArray();
+  // What the assistant itself said in this group is not in `messages`: an outgoing
+  // message is a send row. Left out, a recap of "what was said" would be a recap of
+  // one side of the conversation, and the owner's own answers would be missing from
+  // the account of what happened.
+  const sentScope = {
+    organizationId: context.organizationId,
+    instanceId: context.instanceId,
+    groupJid,
+    status: "sent",
+    scheduledFor: { $gte: since },
+    ...(searching ? { text: { $regex: escapeRegExp(input.query ?? ""), $options: "i" } } : {}),
+  };
+  const spoken = await db
+    .collection<{ text?: string; scheduledFor?: Date; dispatch?: { waMessageId?: string | null } }>(COLLECTIONS.sendRequests)
+    .find(sentScope, { projection: { _id: 0, text: 1, scheduledFor: 1, "dispatch.waMessageId": 1 } })
+    .sort({ scheduledFor: -1 })
+    .limit(limit)
+    .toArray();
+
+  // Newest-first from the query so the window keeps what just happened. A recap is
+  // read in the order it happened; a search is read newest match first, because
+  // what was said most recently about something is what was asked about.
+  // Everything in scope, both sides of it: `total` is what the answer was drawn
+  // from, so it counts the assistant's own lines exactly as it counts the members'.
+  const total =
+    (await db.collection(COLLECTIONS.messages).countDocuments(scope)) +
+    (await db.collection(COLLECTIONS.sendRequests).countDocuments(sentScope));
+
+  // The two sources merge in the order they happened, before the window is taken
+  // from them, so a busy group cannot squeeze the assistant's own messages out of
+  // its own recap.
+  type RecapLine = { at: Date; incoming: MessageRow } | { at: Date; outgoing: { text: string; messageId: string } };
+  const merged: RecapLine[] = [];
+  for (const row of rows) {
+    if (row.timestamp instanceof Date) merged.push({ at: row.timestamp, incoming: row });
+  }
+  for (const row of spoken) {
+    const text = typeof row.text === "string" ? row.text : "";
+    if (row.scheduledFor instanceof Date && text !== "") {
+      // A line the assistant said. Its WhatsApp id is what the send recorded, and
+      // there is no attachment to read: the send table holds text, not bytes.
+      const claimed = row.dispatch?.waMessageId;
+      merged.push({ at: row.scheduledFor, outgoing: { text, messageId: typeof claimed === "string" ? claimed : "" } });
+    }
+  }
+  merged.sort((left, right) => right.at.getTime() - left.at.getTime());
+  // A recap is read in the order it happened; a search reads the newest match
+  // first, because what was said most recently about something is what was asked.
+  const windowed = merged.slice(0, limit);
+  const ordered = searching ? windowed : windowed.slice().reverse();
+
+  const messages: GroupMessagesResult["messages"] = [];
+  let remaining = GROUP_TOOL_LIMITS.resultChars;
+  let clipped = false;
+  for (const line of ordered) {
+    if ("outgoing" in line) {
+      const text = clipJson(normalizeUntrustedText(line.outgoing.text), Math.min(GROUP_TOOL_LIMITS.recapTextChars, Math.max(remaining, 0)));
+      clipped = clipped || text.truncated;
+      remaining -= jsonChars(text.value);
+      messages.push({ messageId: line.outgoing.messageId, at: toZonedIso(line.at), from: "Assistant", text: text.value });
+      continue;
+    }
+    const row = line.incoming;
+    const kind = row.media?.kind;
+    const attachment = typeof kind === "string" && kind !== "" ? kind : undefined;
+    const entry: GroupMessagesResult["messages"][number] = {
+      messageId: typeof row.waMessageId === "string" ? row.waMessageId : "",
+      // The owner's own clock, with the offset, so a recap reads as the times they
+      // saw on their phone rather than the ones the database keeps.
+      at: toZonedIso(line.at),
+      from: senderLabel(row),
+      text: "",
+      ...(attachment === undefined ? {} : { attachment }),
+    };
+    const text = clipJson(
+      normalizeUntrustedText(typeof row.text === "string" ? row.text : ""),
+      Math.min(GROUP_TOOL_LIMITS.recapTextChars, Math.max(remaining, 0)),
+    );
+    clipped = clipped || text.truncated;
+    entry.text = text.value;
+    remaining -= jsonChars(entry.text);
+    messages.push(entry);
+  }
+
+  return {
+    ok: true,
+    ...(includeAddresses ? { groupJid } : {}),
+    name: "",
+    hours,
+    messages,
+    total,
+    truncated: clipped || rows.length < total,
+  };
+}
+
+/**
+ * The caller's text as a literal. A search string is not a pattern: the model
+ * sends what the owner said, and a `.` or a `(` in a group's own words must match
+ * itself rather than mean something to the database. Escaping here is also what
+ * keeps an innocent string from becoming a catastrophic one.
+ */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+/**
+ * What is queued to go out for this instance, and when.
+ *
+ * A scheduled send is a promise about the future, and until now it was visible
+ * only in the console: the assistant could make one and then had no way to say
+ * what was waiting, or to take one back. This reads the send rows themselves —
+ * the same rows the dispatcher claims — so the answer is what will actually
+ * happen rather than a second record of it.
+ */
+async function listScheduledSends(
+  db: Db,
+  context: ToolChatContext,
+  includeAddresses: boolean,
+): Promise<GroupToolResult> {
+  if (!usableChatContext(context)) return NOT_AVAILABLE;
+  const rows = await db
+    .collection<{ id: string; groupJid: string; text?: string; scheduledFor?: Date; status?: string }>(COLLECTIONS.sendRequests)
+    .find(
+      { organizationId: context.organizationId, instanceId: context.instanceId, status: "scheduled" },
+      { projection: { _id: 0, id: 1, groupJid: 1, text: 1, scheduledFor: 1, status: 1 } },
+    )
+    .sort({ scheduledFor: 1 })
+    .limit(GROUP_TOOL_LIMITS.scheduledMax)
+    .toArray();
+  // One read of the names, not one per send.
+  const names = new Map(
+    (
+      await db
+        .collection<{ groupJid: string; observed?: { subject?: unknown } }>(COLLECTIONS.groups)
+        .find(
+          { organizationId: context.organizationId, instanceId: context.instanceId, groupJid: { $in: rows.map((row) => row.groupJid) } },
+          { projection: { _id: 0, groupJid: 1, "observed.subject": 1 } },
+        )
+        .toArray()
+    ).map((group) => [group.groupJid, typeof group.observed?.subject === "string" ? group.observed.subject : ""]),
+  );
+  const sends: ScheduledSendsResult["sends"] = [];
+  for (const row of rows) {
+    if (!(row.scheduledFor instanceof Date)) continue;
+    const name = clipJson(normalizeUntrustedText(names.get(row.groupJid) ?? ""), GROUP_TOOL_LIMITS.labelChars);
+    sends.push({
+      sendId: typeof row.id === "string" ? row.id : "",
+      group: includeAddresses ? row.groupJid : name.value,
+      text: clipJson(normalizeUntrustedText(typeof row.text === "string" ? row.text : ""), GROUP_TOOL_LIMITS.recapTextChars).value,
+      at: toZonedIso(row.scheduledFor),
+      status: typeof row.status === "string" ? row.status : "",
+    });
+  }
+  return { ok: true, sends, total: sends.length };
+}
+
+/**
+ * Takes back one queued send.
+ *
+ * Cancelling is the safe direction — it removes a message from the future rather
+ * than putting one into a group — so it needs no approval and the assistant does
+ * it when the owner asks. It is also not a group action: what it names is a send,
+ * and the group that send was for is recorded with it. That is why it is performed
+ * here rather than staged through the queue every group change goes through: the
+ * queue is keyed by the group a change is about, and this change is about a
+ * message.
+ *
+ * The row is checked against this instance first, because a send id is opaque: one
+ * from somewhere else has to be refused exactly as an unknown one is.
+ */
+async function cancelScheduledSend(
+  db: Db,
+  deps: GroupToolDeps,
+  context: ToolChatContext,
+  input: GroupToolInput,
+): Promise<GroupToolResult> {
+  if (!usableChatContext(context)) return NOT_AVAILABLE;
+  const parsed = CANCEL_PARAMS.safeParse(input);
+  if (!parsed.success) return NOT_AVAILABLE;
+  const send = await db
+    .collection<{ instanceId?: string; status?: string; text?: string }>(COLLECTIONS.sendRequests)
+    .findOne(
+      { organizationId: context.organizationId, id: parsed.data.sendId },
+      { projection: { _id: 0, instanceId: 1, status: 1, text: 1 } },
+    );
+  if (send?.instanceId !== context.instanceId) return NOT_AVAILABLE;
+  const outcome = await (deps.cancelSend ?? transitionSend)(
+    db,
+    context.organizationId,
+    parsed.data.sendId,
+    "cancel",
+    "internal",
+    "assistant",
+  );
+  if ("kind" in outcome) {
+    return {
+      ok: false,
+      code: "action_failed",
+      message:
+        "That message is not waiting to be sent any more, so there was nothing to cancel. Say so plainly; do not say it was cancelled.",
+    };
+  }
+  const cancelled = clipJson(normalizeUntrustedText(typeof send?.text === "string" ? send.text : ""), GROUP_TOOL_LIMITS.labelChars);
+  return {
+    ok: true,
+    done: true,
+    action: "cancel_scheduled",
+    summary: `Cancel the queued send ${parsed.data.sendId}.`,
+    result: { sendId: parsed.data.sendId, status: outcome.status },
+    message: `Cancelled: the queued message "${cancelled.value}" will not be sent. Tell the owner it is cancelled, and that it will not arrive.`,
+  };
+}
+
+/**
+ * Who a message is from, as a reader would name them: the group's own name for
+ * the sender when there is one, the assistant itself for what it sent, and the
+ * digits alone when only a number is known. Never an address.
+ */
+function senderLabel(row: MessageRow): string {
+  if (row.fromMe === true) return "Assistant";
+  const pushName = typeof row.pushName === "string" ? normalizeUntrustedText(row.pushName).trim() : "";
+  if (pushName !== "") return pushName.slice(0, GROUP_TOOL_LIMITS.labelChars);
+  const jid = typeof row.senderJid === "string" ? row.senderJid : "";
+  return jid.split("@", 1)[0]?.split(":", 1)[0] ?? "";
+}
+
+/** The fields of one stored message a recap reads. */
+interface MessageRow {
+  waMessageId?: unknown;
+  senderJid?: unknown;
+  pushName?: unknown;
+  fromMe?: unknown;
+  text?: unknown;
+  timestamp?: unknown;
+  media?: { kind?: unknown };
 }
 
 /**
@@ -700,6 +1174,11 @@ const AUTONOMOUS_ACTIONS: ReadonlySet<GroupWriteToolName> = new Set<GroupWriteTo
   "group_rename",
   "group_set_announce",
   "group_set_locked",
+  // A message the owner asked for, in the assistant's own voice, in a group it
+  // already answers in. Every automatic reply has been exactly that since the
+  // first owner mention, so asking permission for this one would be a formality
+  // the reply path never had.
+  "group_send",
 ]);
 
 /**
@@ -715,7 +1194,7 @@ async function stageGroupAction(
   deps: GroupToolDeps,
   context: ToolChatContext,
   groupJid: string,
-  name: GroupWriteToolName,
+  name: StagedGroupWriteToolName,
   input: GroupToolInput,
 ): Promise<GroupToolResult> {
   const staged = WRITE_TOOLS[name].stage(input);
@@ -840,7 +1319,7 @@ export async function runGroupTool(
   // a refusal is still evidence of what was attempted, and the instance's own
   // list is about no single group at all.
   const about =
-    name === "monitored_groups"
+    name === "monitored_groups" || name === "scheduled_sends" || name === "cancel_scheduled"
       ? null
       : context.chatKind === "group"
         ? context.groupJid
@@ -851,11 +1330,17 @@ export async function runGroupTool(
     db = deps.db ?? (await (deps.getDatabase ?? getDb)());
     if (name === "monitored_groups") {
       result = await listMonitoredGroups(db, context, input.includeAddresses === true);
+    } else if (name === "scheduled_sends") {
+      result = await listScheduledSends(db, context, input.includeAddresses === true);
+    } else if (name === "cancel_scheduled") {
+      result = await cancelScheduledSend(db, deps, context, input);
     } else {
       const groupJid = await scopedGroup(db, context, input);
       if (groupJid !== null) {
         result = isReadTool(name)
-          ? await readGroup(db, deps.worker ?? WORKER, context, groupJid, name, input.includeAddresses === true)
+          ? name === "group_messages"
+            ? await readGroupMessages(db, context, groupJid, input, input.includeAddresses === true)
+            : await readGroup(db, deps.worker ?? WORKER, context, groupJid, name, input.includeAddresses === true)
           : await stageGroupAction(db, deps, context, groupJid, name, input);
       }
     }
@@ -952,6 +1437,15 @@ export function createGroupMcpServer(context: ToolChatContext, deps: GroupToolDe
     async (input) => content(await runGroupTool(context, deps, "group_participants", input)),
   );
   server.registerTool(
+    "group_messages",
+    {
+      title: `Read what ${group} said recently`,
+      description: `Reads ${group}'s recent messages, oldest first, each with the speaker's name, the time, and the message id. Use it to recap or summarise a conversation — "what was said today?" is this tool, not memory — and to find something: a search returns the newest matches first. An attachment a line names is read with the media tools, using that line's message id, so never say an attachment cannot be read when this has given you its id. The window and the number of messages are bounded, one long message is clipped rather than dropped, and an answer that did not fit says so. ${UNTRUSTED_NOTE}`,
+      inputSchema: { ...refShape, ...ADDRESS_PARAMS.shape, ...RECAP_PARAMS.shape },
+    },
+    async (input) => content(await runGroupTool(context, deps, "group_messages", input)),
+  );
+  server.registerTool(
     "monitored_groups",
     {
       title: "List the groups being monitored",
@@ -959,6 +1453,28 @@ export function createGroupMcpServer(context: ToolChatContext, deps: GroupToolDe
       inputSchema: ADDRESS_PARAMS.shape,
     },
     async (input) => content(await runGroupTool(context, deps, "monitored_groups", input)),
+  );
+  server.registerTool(
+    "scheduled_sends",
+    {
+      title: "List the messages waiting to be sent",
+      description:
+        "Lists the sends queued for this instance: the message, the group, and when it is due, oldest first, each with the id that cancels it. Use it to answer what is scheduled, and before cancelling anything. " +
+        UNTRUSTED_NOTE,
+      inputSchema: ADDRESS_PARAMS.shape,
+    },
+    async (input) => content(await runGroupTool(context, deps, "scheduled_sends", input)),
+  );
+  server.registerTool(
+    "cancel_scheduled",
+    {
+      title: "Cancel a queued message",
+      description:
+        "Cancels one queued send, by the id a scheduled-messages listing returned, so it is never delivered. This is not a proposal: it is done immediately, and the result says so — tell the owner it is cancelled. " +
+        UNTRUSTED_NOTE,
+      inputSchema: CANCEL_PARAMS.shape,
+    },
+    async (input) => content(await runGroupTool(context, deps, "cancel_scheduled", input)),
   );
   server.registerTool(
     "group_rename",
@@ -1013,6 +1529,15 @@ export function createGroupMcpServer(context: ToolChatContext, deps: GroupToolDe
       inputSchema: { ...refShape, ...LEAVE_PARAMS.shape },
     },
     async (input) => content(await runGroupTool(context, deps, "group_leave", input)),
+  );
+  server.registerTool(
+    "group_send",
+    {
+      title: `Send a message to ${group}`,
+      description: `Sends a message into ${group}, or schedules it for a later time with sendAt. ${PERFORMED_NOTE} It is the owner's own instruction carried out, so say what you sent and, for a scheduled one, when it will arrive — never that it is waiting for approval. ${UNTRUSTED_NOTE}`,
+      inputSchema: { ...refShape, ...SEND_PARAMS.shape },
+    },
+    async (input) => content(await runGroupTool(context, deps, "group_send", input)),
   );
   server.registerTool(
     "message_revoke",

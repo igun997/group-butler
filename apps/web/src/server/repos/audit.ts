@@ -47,7 +47,13 @@ export interface AuthAuditEvent {
 /** One `auditLog` row, before it is stored (§5.1). */
 export interface AuditEntry {
   organizationId: string;
-  actor: "owner" | "worker";
+  /**
+   * Who did it. `assistant` is the third, and the one a reader must be able to
+   * tell apart: a change the assistant performed on its own under the policy the
+   * owner set is not the owner having performed it, and a trail that says "owner"
+   * for both cannot answer the only question it exists for.
+   */
+  actor: "owner" | "worker" | "assistant";
   action: AuditAction;
   target: { type: AuditTargetType; id: string };
   /** Whatever the action needs to be reconcilable, e.g. a whitelist's before/after. */

@@ -99,11 +99,20 @@ const AUTONOMOUS_WRITE_CALLS: { name: GroupWriteToolName; params: Record<string,
   { name: "group_rename", params: { name: "Ops Team" }, summary: "Rename the group to Ops Team." },
   { name: "group_set_announce", params: { announce: true }, summary: "Only admins may post in this group." },
   { name: "group_set_locked", params: { locked: true }, summary: "Only admins may edit this group's info." },
+  { name: "group_send", params: { text: "Selamat pagi semua." }, summary: "Send this message to the group: Selamat pagi semua." },
+];
+
+/**
+ * The write that is about the instance rather than a group: it names a queued
+ * send, so there is no group for a scope check to answer about.
+ */
+const INSTANCE_WRITE_CALLS: { name: GroupWriteToolName; params: Record<string, unknown>; summary: string }[] = [
+  { name: "cancel_scheduled", params: { sendId: "send-1" }, summary: "Cancel the queued send send-1." },
 ];
 
 const WRITE_CALLS = [...AUTONOMOUS_WRITE_CALLS, ...APPROVAL_WRITE_CALLS];
 
-const READ_CALLS: GroupToolName[] = ["group_info", "group_participants"];
+const READ_CALLS: GroupToolName[] = ["group_info", "group_participants", "group_messages", "scheduled_sends"];
 
 /**
  * Every read asks for addresses, because the tests below assert the address in
@@ -115,14 +124,25 @@ const SAMPLES = {
   group_info: { includeAddresses: true },
   group_participants: { includeAddresses: true },
   monitored_groups: { includeAddresses: true },
-  ...Object.fromEntries(WRITE_CALLS.map((call) => [call.name, call.params])),
+  group_messages: { includeAddresses: true },
+  scheduled_sends: { includeAddresses: true },
+  ...Object.fromEntries([...WRITE_CALLS, ...INSTANCE_WRITE_CALLS].map((call) => [call.name, call.params])),
 } as Record<GroupToolName, GroupToolInput>;
 
 /** The same call from the owner's own chat: the group has to be named, and nothing else changes. */
 const dmInput = (name: GroupToolName): GroupToolInput =>
   name === "monitored_groups" ? { includeAddresses: true } : { group: "group-a@g.us", ...SAMPLES[name] };
 
-const ALL_TOOLS: GroupToolName[] = [...READ_CALLS, "monitored_groups", ...new Set(WRITE_CALLS.map((call) => call.name))];
+/**
+ * Every tool the loop below can call through the descriptor alone. `cancel_scheduled`
+ * is not one of them: it names a queued send, and the loop's fixture has no send
+ * for it to name, so it is covered by its own tests instead.
+ */
+const ALL_TOOLS: GroupToolName[] = [
+  ...READ_CALLS,
+  "monitored_groups",
+  ...new Set(WRITE_CALLS.map((call) => call.name)),
+];
 
 let replSet: MongoMemoryReplSet;
 let db: Db;
@@ -206,6 +226,9 @@ describe("group tool scope", () => {
     }
     expect(info).toHaveBeenCalledWith("instance-a", "group-a@g.us");
     expect(participants).toHaveBeenCalledWith("instance-a", "group-a@g.us");
+    // Every write reaches the queue: an autonomous change is recorded exactly as a
+    // staged one is. (Cancelling is not among them — it is performed directly, and
+    // is not a change to a group.)
     expect(await stagedRows()).toHaveLength(WRITE_CALLS.length);
     // The list is this tenant's, and the only in-scope group of it is group-a.
     expect(await call("monitored_groups", SAMPLES.monitored_groups)).toMatchObject({
@@ -441,6 +464,245 @@ describe("group tool reads", () => {
     expect(JSON.stringify(byName)).not.toContain("@lid");
   });
 
+  /**
+   * The owner asks "what was said in the group today?" from their own chat. Every
+   * in-scope message is written down as it arrives, so the answer is a read of
+   * those rows — not a summary of a summary, and not "I cannot see the group's
+   * messages", which is what the assistant used to have to say.
+   */
+  describe("reading what a group said", () => {
+    const now = Date.now();
+    const at = (minutesAgo: number) => new Date(now - minutesAgo * 60 * 1000);
+    const message = (id: string, minutesAgo: number, extra: Record<string, unknown>) => ({
+      organizationId: "org-a",
+      instanceId: "instance-a",
+      groupJid: "group-a@g.us",
+      waMessageId: id,
+      timestamp: at(minutesAgo),
+      text: "",
+      fromMe: false,
+      ...extra,
+    });
+
+    beforeEach(async () => {
+      await db.collection(COLLECTIONS.messages).deleteMany({});
+      await db.collection(COLLECTIONS.sendRequests).deleteMany({});
+      await db.collection(COLLECTIONS.messages).insertMany([
+        message("old", 60 * 24 * 3, { senderJid: "628990000001@s.whatsapp.net", pushName: "Indra", text: "tiga hari lalu" }),
+        message("m1", 30, { senderJid: "239959873196218:67@lid", pushName: "Indra", text: "deploy sudah selesai" }),
+        message("m2", 20, { senderJid: "628990000009@s.whatsapp.net", text: "stok semen tinggal 128" }),
+        message("m3", 10, { senderJid: "628990000010@s.whatsapp.net", pushName: "Fajar", text: "harga naik (5%) ya", media: { kind: "image" } }),
+        message("mine", 5, { fromMe: true, senderJid: "628990000001@s.whatsapp.net", text: "siap, saya catat" }),
+        message("elsewhere", 6, { groupJid: "group-b@g.us", senderJid: "628990000001@s.whatsapp.net", pushName: "Indra", text: "group lain" }),
+      ]);
+    });
+
+    test("recaps a window oldest first, with names instead of addresses", async () => {
+      const result = await call("group_messages", { group: "Ops Team", includeAddresses: true, hours: 2 }, dmContext);
+
+      if (!result.ok || !("messages" in result)) throw new Error("expected a recap");
+      // Each line is stamped in the operator's own clock, with its offset: the
+      // message sent half an hour ago is not stamped three hours off.
+      expect(result.messages[0]?.at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/u);
+      // Three days ago is outside the window, and another group's message is not
+      // this group's; the assistant's own message is part of the conversation.
+      expect(result.messages.map((entry) => entry.text)).toEqual([
+        "deploy sudah selesai",
+        "stok semen tinggal 128",
+        "harga naik (5%) ya",
+        "siap, saya catat",
+      ]);
+      expect(result.messages.map((entry) => entry.from)).toEqual(["Indra", "628990000009", "Fajar", "Assistant"]);
+      // The attachment is named, so a recap can say a picture arrived.
+      expect(result.messages[2]?.attachment).toBe("image");
+      // And every line carries the id a media tool is called with. An owner who
+      // asks about a document a group sent is answered by reading it, which cannot
+      // happen if the line that names it has no id — the assistant could only say
+      // the message had one.
+      expect(result.messages.map((entry) => entry.messageId)).toEqual(["m1", "m2", "m3", "mine"]);
+      expect(result.total).toBe(4);
+      expect(result.truncated).toBe(false);
+      expect(JSON.stringify(result)).not.toContain("@lid");
+      expect(JSON.stringify(result)).not.toContain("@s.whatsapp.net");
+    });
+
+    /**
+     * An outgoing message is a send row, not a `messages` row, so a recap built
+     * from the stored messages alone is one side of the conversation. The owner is
+     * asking what happened in the group, and the assistant's own messages are part
+     * of what happened.
+     */
+    test("includes what the assistant itself said, in the order it said it", async () => {
+      await db.collection(COLLECTIONS.sendRequests).insertOne({
+        organizationId: "org-a",
+        instanceId: "instance-a",
+        groupJid: "group-a@g.us",
+        text: "siap, saya kirim ringkasannya",
+        idempotencyKey: "probe-send",
+        status: "sent",
+        scheduledFor: at(15),
+        dispatch: { attempts: 1, lockedAt: null, lockedBy: null, waMessageId: "3EB0SENT", errorClass: null },
+        approval: { state: "approved", approvedBy: "assistant" },
+        createdAt: at(15),
+        updatedAt: at(15),
+      });
+
+      const result = await call("group_messages", { group: "Ops Team", includeAddresses: true, hours: 2 }, dmContext);
+
+      if (!result.ok || !("messages" in result)) throw new Error("expected a recap");
+      expect(result.messages.map((entry) => entry.text)).toEqual([
+        "deploy sudah selesai",
+        "stok semen tinggal 128",
+        "siap, saya kirim ringkasannya",
+        "harga naik (5%) ya",
+        "siap, saya catat",
+      ]);
+      expect(result.messages[2]?.from).toBe("Assistant");
+      // The send recorded the WhatsApp id it went out with, so a line can still be
+      // referred to afterwards.
+      expect(result.messages[2]?.messageId).toBe("3EB0SENT");
+      expect(result.total).toBe(5);
+    });
+
+    test("searches the whole window by text, newest match first", async () => {
+      const result = await call("group_messages", { group: "Ops Team", includeAddresses: true, query: "semen" }, dmContext);
+
+      if (!result.ok || !("messages" in result)) throw new Error("expected a recap");
+      expect(result.messages.map((entry) => entry.text)).toEqual(["stok semen tinggal 128"]);
+      // A search reads a week by default rather than the twelve hours a recap reads,
+      // because what is being looked for may have been said any time.
+      expect(result.hours).toBe(GROUP_TOOL_LIMITS.recapHoursMax);
+    });
+
+    // The caller sends what the owner said, and a `(` or a `.` in a group's own
+    // words must match itself rather than mean something to the database.
+    test("treats the search text as literal, not as a pattern", async () => {
+      const result = await call("group_messages", { group: "Ops Team", includeAddresses: true, query: "naik (5%)" }, dmContext);
+
+      if (!result.ok || !("messages" in result)) throw new Error("expected a recap");
+      expect(result.messages.map((entry) => entry.text)).toEqual(["harga naik (5%) ya"]);
+
+      const pattern = await call("group_messages", { group: "Ops Team", includeAddresses: true, query: "na.k (5%)" }, dmContext);
+      if (!pattern.ok || !("messages" in pattern)) throw new Error("expected a recap");
+      expect(pattern.messages).toEqual([]);
+    });
+
+    test("never reads another tenant's or another group's messages, whatever it is asked", async () => {
+      await db.collection(COLLECTIONS.messages).insertOne(
+        message("foreign", 5, { organizationId: "org-b", groupJid: "group-b@g.us", text: "rahasia tenant lain" }),
+      );
+
+      const result = await call("group_messages", { group: "Ops Team", includeAddresses: true, hours: GROUP_TOOL_LIMITS.recapHoursMax }, dmContext);
+
+      if (!result.ok || !("messages" in result)) throw new Error("expected a recap");
+      expect(JSON.stringify(result)).not.toContain("rahasia tenant lain");
+      expect(JSON.stringify(result)).not.toContain("group lain");
+    });
+
+    test("says so when the window held more than the answer carried", async () => {
+      const result = await call("group_messages", { group: "Ops Team", includeAddresses: true, hours: 2, limit: 2 }, dmContext);
+
+      if (!result.ok || !("messages" in result)) throw new Error("expected a recap");
+      expect(result.messages).toHaveLength(2);
+      // The two newest, and the answer says it is not the whole of it.
+      expect(result.messages.map((entry) => entry.text)).toEqual(["harga naik (5%) ya", "siap, saya catat"]);
+      expect(result.total).toBe(4);
+      expect(result.truncated).toBe(true);
+    });
+  });
+
+  /**
+   * A scheduled message is a promise about the future. Until this existed the
+   * assistant could make one and then neither say what was waiting nor take it
+   * back — the queue was visible only in the console.
+   */
+  describe("what is waiting to be sent", () => {
+    const at = (minutesAhead: number) => new Date(Date.now() + minutesAhead * 60 * 1000);
+    const queued = (id: string, minutesAhead: number, text: string, status = "scheduled") => ({
+      id,
+      organizationId: "org-a",
+      instanceId: "instance-a",
+      groupJid: "group-a@g.us",
+      text,
+      idempotencyKey: `queued-${id}`,
+      status,
+      scheduledFor: at(minutesAhead),
+      approval: { state: "approved", approvedBy: "assistant" },
+      dispatch: { attempts: 0, lockedAt: null, lockedBy: null, waMessageId: null, errorClass: null },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    beforeEach(async () => {
+      await db.collection(COLLECTIONS.sendRequests).deleteMany({});
+      await db.collection(COLLECTIONS.sendRequests).insertMany([
+        queued("send-later", 240, "laporan harian ya"),
+        queued("send-sooner", 30, "rapat jam 9"),
+        // Already delivered, so there is nothing to wait for.
+        queued("send-done", -30, "sudah terkirim", "sent"),
+        // Another instance's queue is not this instance's queue.
+        { ...queued("send-theirs", 60, "punya instance lain"), instanceId: "instance-b" },
+      ]);
+    });
+
+    test("lists what is queued, soonest first, with the id that cancels it", async () => {
+      // The sample asks for addresses; the owner reads names, so this asks for the
+      // form they read and the address is asserted below.
+      const result = await call("scheduled_sends", { includeAddresses: false }, dmContext);
+
+      if (!result.ok || !("sends" in result)) throw new Error("expected a queue listing");
+      expect(result.sends.map((send) => send.sendId)).toEqual(["send-sooner", "send-later"]);
+      expect(result.sends.map((send) => send.text)).toEqual(["rapat jam 9", "laporan harian ya"]);
+      // The group is named the way the owner reads it, and each line is stamped in
+      // their own clock.
+      expect(result.sends[0]?.group).toBe("Ops Team");
+      expect(result.sends[0]?.at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/u);
+      expect(result.total).toBe(2);
+      const addressed = await call("scheduled_sends", SAMPLES.scheduled_sends, dmContext);
+      if (!addressed.ok || !("sends" in addressed)) throw new Error("expected a queue listing");
+      expect(addressed.sends[0]?.group).toBe("group-a@g.us");
+    });
+
+    /**
+     * A cancellation names a queued send, not a group, and it is performed here
+     * rather than staged: it removes a message from the future, which is the safe
+     * direction, and the queue every group change goes through is keyed by the
+     * group that change is about.
+     */
+    test("cancels one, and it stops being queued", async () => {
+      const cancelled = await call("cancel_scheduled", { sendId: "send-later" });
+
+      expect(cancelled).toMatchObject({ ok: true, done: true, action: "cancel_scheduled" });
+      expect(String((cancelled as { message: string }).message)).toMatch(/will not be sent/i);
+      expect(await db.collection(COLLECTIONS.sendRequests).findOne({ id: "send-later" })).toMatchObject({ status: "cancelled" });
+      // The queue it was read from now holds the other one only.
+      const listed = await call("scheduled_sends", { includeAddresses: false }, dmContext);
+      if (!listed.ok || !("sends" in listed)) throw new Error("expected a queue listing");
+      expect(listed.sends.map((send) => send.sendId)).toEqual(["send-sooner"]);
+    });
+
+    test("refuses an id that is not queued, and one belonging to another instance", async () => {
+      // Executed directly, because these are the answers the queue has to give;
+      // the tool's own path would settle them the same way.
+      // A delivered message, another instance's, and an id nobody has. None of them
+      // is cancellable, and none of them is touched: the refusal leaves the queue
+      // exactly as it found it.
+      // Delivered already, so there is nothing waiting to take back…
+      expect(await call("cancel_scheduled", { sendId: "send-done" }, dmContext)).toMatchObject({
+        ok: false,
+        code: "action_failed",
+      });
+      // …while another instance's id and an id nobody has are the one refusal, which
+      // says nothing about whether either exists.
+      expect(await call("cancel_scheduled", { sendId: "send-theirs" }, dmContext)).toEqual(NOT_AVAILABLE);
+      expect(await call("cancel_scheduled", { sendId: "not-a-send" }, dmContext)).toEqual(NOT_AVAILABLE);
+      for (const sendId of ["send-done", "send-theirs", "not-a-send"]) {
+        const after = await db.collection(COLLECTIONS.sendRequests).findOne({ id: sendId });
+        expect(after?.status ?? "absent", sendId).not.toBe("cancelled");
+      }
+    });
+  });
+
   test("turns a failed worker call into the uniform refusal", async () => {
     participants.mockResolvedValueOnce({
       ok: false,
@@ -466,7 +728,7 @@ describe("group tool reads", () => {
 
     const result = await call("group_info", SAMPLES.group_info);
 
-    if (!result.ok || !("name" in result)) throw new Error("expected a group result");
+    if (!result.ok || !("participantCount" in result)) throw new Error("expected a group metadata result");
     expect(JSON.stringify(result).length).toBeLessThanOrEqual(GROUP_TOOL_LIMITS.resultChars);
     expect(result.truncated).toBe(true);
     expect(result.name.length).toBeLessThan(GROUP_TOOL_LIMITS.resultChars * 2);
@@ -815,12 +1077,17 @@ describe("group MCP server", () => {
     return Object.keys(schema.properties ?? {});
   }
 
-  test("registers the ten group tools over a real MCP session, and only them", async () => {
+  test("registers the group tools over a real MCP session, and only them", async () => {
     const { client, server } = await connect();
     try {
       const { tools } = await client.listTools();
 
-      expect(tools.map((tool) => tool.name).sort()).toEqual([...ALL_TOOLS].sort());
+      // The reads, the writes the loop exercises, and the one write that is about a
+      // queued send rather than a group. The two instance-level reads are in
+      // `ALL_TOOLS` already, because the loop can call them through the descriptor.
+      expect(tools.map((tool) => tool.name).sort()).toEqual(
+        [...ALL_TOOLS, ...INSTANCE_WRITE_CALLS.map((call) => call.name)].sort(),
+      );
       // A group job's read names no scope, only what it wants back. It cannot be
       // called with no arguments at all, and that is the point: this deployment's
       // gateway drops an input-less call, which is how the first `group_info` the
@@ -853,6 +1120,8 @@ describe("group MCP server", () => {
         group_info: ["includeAddresses"],
         group_participants: ["includeAddresses"],
         monitored_groups: ["includeAddresses"],
+        group_messages: ["includeAddresses", "hours", "limit", "query"],
+        scheduled_sends: ["includeAddresses"],
         group_rename: ["name"],
         group_set_announce: ["announce"],
         group_set_locked: ["locked"],
@@ -860,6 +1129,8 @@ describe("group MCP server", () => {
         group_members: ["membership", "jids"],
         group_leave: ["reason"],
         message_revoke: ["waMessageId"],
+        group_send: ["text", "sendAt"],
+        cancel_scheduled: ["sendId"],
       };
 
       for (const [name, params] of Object.entries(paramsPerTool)) {

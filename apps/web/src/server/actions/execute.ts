@@ -3,6 +3,7 @@ import { z } from "zod";
 import { COLLECTIONS } from "../collections";
 import { writeAudit } from "../repos/audit";
 import type { PendingActionRow } from "../repos/pending-actions";
+import { createSend, transitionSend } from "../repos/sends";
 import { runWorkerGroupAction, type GroupAdminRequest } from "../worker/client";
 
 /**
@@ -57,6 +58,13 @@ const UNKNOWN_ACTION: ExecuteFailure = {
   message: "this action is not one the dashboard knows how to perform",
 };
 
+/** Nothing is queued under that id any more, so there is nothing to take back. */
+const NOTHING_QUEUED: ExecuteFailure = {
+  status: 409,
+  code: "nothing_queued",
+  message: "that message is not waiting to be sent, so there is nothing to cancel",
+};
+
 const INVALID_PARAMS: ExecuteFailure = {
   status: 422,
   code: "invalid_params",
@@ -105,6 +113,24 @@ export type ExecuteOutcome =
   | { kind: "executed"; action: PendingActionRow }
   | { kind: "failed"; action: PendingActionRow; failure: ExecuteFailure }
   | { kind: "refused"; failure: ExecuteFailure };
+
+/**
+ * The message one staged `group_send` row means: the text, and the instant it is
+ * due — `null` for "as soon as it is approved".
+ *
+ * The params were validated when the action was staged, and they are validated
+ * again here: the row is the input to the only code that can send, so it is not
+ * trusted merely because another path once accepted it.
+ */
+function sendRequestFor(
+  action: PendingActionRow,
+): { ok: true; text: string; scheduledFor: Date | null } | { ok: false; failure: ExecuteFailure } {
+  const parsed = z.object({ text: z.string().trim().min(1), scheduledFor: z.string().datetime().optional() }).safeParse(action.params);
+  if (!parsed.success) return { ok: false, failure: INVALID_PARAMS };
+  const scheduledFor = parsed.data.scheduledFor === undefined ? null : new Date(parsed.data.scheduledFor);
+  if (scheduledFor !== null && Number.isNaN(scheduledFor.getTime())) return { ok: false, failure: INVALID_PARAMS };
+  return { ok: true, text: parsed.data.text, scheduledFor };
+}
 
 /**
  * The worker request one staged row means: the worker's action name and that
@@ -288,6 +314,75 @@ export async function executeAction(db: Db, action: PendingActionRow, ip: string
 
   const claimed = await claim(db, action, ip);
   if (claimed === null) return { kind: "refused", failure: NOT_APPROVED };
+
+  // Taking a queued message back. It is not a group-administration call either, and
+  // it is the safe direction — the message is removed from the future — so the
+  // assistant performs it when the owner asks. The row is checked against this
+  // instance first: a send id is opaque, and one from somewhere else is refused
+  // exactly as an unknown one is.
+  if (action.action === "cancel_scheduled") {
+    const parsed = z.object({ sendId: z.string().trim().min(1) }).safeParse(action.params);
+    const waiting = parsed.success
+      ? await db
+          .collection<{ instanceId?: string; status?: string; text?: string }>(COLLECTIONS.sendRequests)
+          .findOne(
+            { organizationId: action.organizationId, id: parsed.data.sendId },
+            { projection: { _id: 0, instanceId: 1, status: 1, text: 1 } },
+          )
+      : null;
+    let cancelled: ExecuteFailure | null = null;
+    let outcome: Record<string, unknown> = {};
+    if (waiting?.instanceId !== action.instanceId) {
+      cancelled = NOTHING_QUEUED;
+      outcome = { code: cancelled.code, message: cancelled.message };
+    } else {
+      const transition = await transitionSend(db, action.organizationId, parsed.success ? parsed.data.sendId : "", "cancel", ip, "assistant");
+      if ("kind" in transition) {
+        cancelled = NOTHING_QUEUED;
+        outcome = { code: cancelled.code, message: cancelled.message };
+      } else {
+        outcome = { sendId: transition.id, status: transition.status, text: transition.text };
+      }
+    }
+    const settled = await settle(db, action, { result: outcome, failure: cancelled }, ip);
+    if (settled === null) return { kind: "failed", action, failure: UNRECORDED };
+    return cancelled === null ? { kind: "executed", action: settled } : { kind: "failed", action: settled, failure: cancelled };
+  }
+
+  // A message is not a group-administration call: it becomes a send request, which
+  // the worker's dispatcher delivers — immediately, or when its scheduled time
+  // arrives. It goes through the same staged-and-approved row as everything else,
+  // so it is recorded the same way and performed exactly once.
+  if (action.action === "group_send") {
+    const message = sendRequestFor(action);
+    let sentFailure: ExecuteFailure | null = null;
+    let sentResult: Record<string, unknown> = {};
+    if (!message.ok) {
+      sentFailure = message.failure;
+      sentResult = { code: message.failure.code, message: message.failure.message };
+    } else {
+      const send = await createSend(db, {
+        organizationId: action.organizationId,
+        instanceId: action.instanceId,
+        groupJid: action.groupJid,
+        text: message.text,
+        // The staged row is the idempotency boundary: the unique index on
+        // `{organizationId, idempotencyKey}` means a second execution of this very
+        // row cannot put a second copy of the message in the group.
+        idempotencyKey: `action:${action.id}`,
+        actorIP: ip,
+        decision: { decidedBy: "assistant", ...(message.scheduledFor === null ? {} : { scheduledFor: message.scheduledFor }) },
+      });
+      sentResult = {
+        sendId: send.id,
+        status: send.status,
+        scheduledFor: send.scheduledFor.toISOString(),
+      };
+    }
+    const settled = await settle(db, action, { result: sentResult, failure: sentFailure }, ip);
+    if (settled === null) return { kind: "failed", action, failure: UNRECORDED };
+    return sentFailure === null ? { kind: "executed", action: settled } : { kind: "failed", action: settled, failure: sentFailure };
+  }
 
   const request = workerRequestFor(action);
   let failure: ExecuteFailure | null = null;
