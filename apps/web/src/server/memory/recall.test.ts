@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import { MongoMemoryReplSet } from "mongodb-memory-server";
 import { ObjectId } from "mongodb";
 import { COLLECTIONS } from "../collections";
@@ -289,6 +289,12 @@ describe("reply prompt assembly", () => {
     // exceed its cap here is the request and each content segment.
     expect(assembled.truncated).toEqual({ system: false, request: true, messages: true, summaries: true, facts: true, tools: true });
     expect(accountTokens(assembled.system)).toBeLessThanOrEqual(REPLY_SEGMENT_MAX.system);
+    // The prompt itself is charged by the counter as well, so a counter that counts
+    // twice as much must still leave the system prompt unclipped — that is the
+    // condition the multiplier test relies on, and a prompt that grows past it is a
+    // prompt being silently cut on every request. Asserted here, where the prompt is
+    // defined, so growing it fails with a sentence instead of a changed number.
+    expect(accountTokens(assembled.system) * 2).toBeLessThan(REPLY_SEGMENT_MAX.system);
     expect(assembled.prompt).toContain("r".repeat(REPLY_SEGMENT_MAX.request));
     expect(assembled.dropped.tools).toBe(1);
     expect(assembled.dropped.messages).toBeGreaterThan(0);
@@ -316,12 +322,19 @@ describe("reply prompt assembly", () => {
     expect(assembled.system).not.toContain("You are the group's butler");
     expect(assembled.system).toContain("every call names the group it is about");
     // And it is told what it may do by itself, so it cannot promise an approval
-    // queue for a change it is allowed to make.
-    expect(assembled.system).toContain("yours to make");
+    // queue for a change it is allowed to make — nor claim it cannot send a
+    // message or read what a group said, which is what an owner was told before
+    // those tools existed.
+    expect(assembled.system).toContain("yours to do");
     expect(assembled.system).toContain("are proposals");
+    expect(assembled.system).toContain("send a message into one");
+    expect(assembled.system).toContain("read and search what a group said recently");
   });
 
   test("shows each speaker as a name or plain digits, never as a raw identifier", () => {
+    // The stamp is the operator's own clock, so the test names the zone rather
+    // than depending on whichever one the machine happens to be configured with.
+    vi.stubEnv("DISPLAY_TIMEZONE", "Asia/Jakarta");
     const assembled = assembleReplyPrompt({
       counter: BYTE_UPPER_BOUND_COUNTER,
       chatKind: "group",
@@ -332,13 +345,15 @@ describe("reply prompt assembly", () => {
       ],
       recall: { summaries: [], facts: [] },
     });
+    vi.unstubAllEnvs();
 
     if (!assembled.ok) throw new Error("expected assembly to succeed");
     // The name is shown when one is known; otherwise the digits alone.
     expect(assembled.prompt).toContain("Fajar: deploy sudah selesai");
     expect(assembled.prompt).toContain("239959873196218: terima kasih");
-    // A reader gets a date, not the instant the capture stored.
-    expect(assembled.prompt).toContain("15 Sept 2026, 08:20");
+    // A reader gets a date, not the instant the capture stored — and the date is
+    // read in their own zone: 08:20 UTC is 15:20 in Jakarta.
+    expect(assembled.prompt).toContain("15 Sept 2026, 15:20");
     expect(assembled.prompt).not.toContain("2026-09-15T08:20:00.000Z");
     // Neither device suffix nor either addressing domain reaches the model.
     expect(assembled.prompt).not.toContain("628990000002:5");

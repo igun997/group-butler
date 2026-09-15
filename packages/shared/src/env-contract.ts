@@ -19,6 +19,9 @@ export const REQUIRED_ENV = [
   "MONGODB_DB",
   "LOG_LEVEL",
   "ENVIRONMENT",
+  // The clock times are written in for the owner (an IANA name, e.g.
+  // Asia/Jakarta). Stored times stay UTC; this is what a reader is shown.
+  "DISPLAY_TIMEZONE",
 
   // --- worker control plane ---
   "PORT",
