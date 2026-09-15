@@ -187,8 +187,38 @@ export interface MediaUnavailable {
   code: "not_available";
 }
 
+/**
+ * In scope, and there are no bytes to read.
+ *
+ * The scope gate stays uniform — an absent row, another tenant's row and an
+ * unauthorized group all answer the same way, so nothing can be probed for
+ * existence. Once the row *is* the caller's own, though, the reason is the
+ * owner's business: an attachment whose capture never finished arriving is a
+ * different sentence from one that cannot be parsed, and the owner can act on
+ * the first by sending it again. Saying only `not_available` left the model to
+ * guess, which is how an owner was told to resend a picture that had arrived
+ * perfectly well.
+ */
+export interface MediaNotStored {
+  ok: false;
+  code: "not_stored";
+  /** What the capture recorded, so the model can say it in one sentence. */
+  status: string;
+  message: string;
+}
+
+/** In scope, and this tool is not one that reads that kind of file. */
+export interface MediaUnsupportedType {
+  ok: false;
+  code: "unsupported_type";
+  mime: string;
+  message: string;
+}
+
 export type MediaToolResult =
   | MediaUnavailable
+  | MediaNotStored
+  | MediaUnsupportedType
   | { ok: true; messageId: string; mime: string; dataUrl: string; sha256: string }
   | { ok: true; messageId: string; columns: string[]; rows: string[][]; truncated: boolean; sha256: string }
   | { ok: true; messageId: string; mime: string; text: string; truncated: boolean; sha256: string }
@@ -217,6 +247,8 @@ interface ScopedMedia {
   /** The group the row turned out to belong to: the job's own group, or the one a direct chat named. */
   groupJid: string;
   messageId: string;
+  /** What the capture did with the bytes: `stored`, or the state it stopped in. */
+  status: string;
   mime: string;
   r2Key: string;
 }
@@ -321,20 +353,24 @@ async function loadScopedMedia(db: Db, context: ToolChatContext, input: MediaToo
       return null;
     }
   }
+  // A row that does not exist is the uniform refusal, not a lifecycle answer: the
+  // scope gate is what makes the difference between "yours, and here is why it
+  // cannot be read" and "you may not know whether this exists at all".
+  if (message === null) return null;
+  // The scope is settled by here — the row exists, and it is one this context may
+  // read. What the capture did with the bytes is *not* part of that gate: a
+  // refusal to say so is what leaves the owner resending a file that has to be
+  // parsed differently. The caller decides, with the state in hand.
   const mime = message?.media?.mime;
   const r2Key = message?.media?.r2Key;
   const groupJid = message?.groupJid;
-  if (
-    message?.media?.status !== "stored" ||
-    typeof groupJid !== "string" ||
-    typeof mime !== "string" ||
-    typeof r2Key !== "string" ||
-    mime === "" ||
-    r2Key === ""
-  ) {
-    return null;
-  }
-  return { groupJid, messageId: input.waMessageId, mime: mime.toLowerCase(), r2Key };
+  return {
+    groupJid: typeof groupJid === "string" ? groupJid : "",
+    messageId: input.waMessageId,
+    status: typeof message?.media?.status === "string" ? message.media.status : "unknown",
+    mime: typeof mime === "string" ? mime.toLowerCase() : "",
+    r2Key: typeof r2Key === "string" ? r2Key : "",
+  };
 }
 
 /**
@@ -947,7 +983,25 @@ export async function runMediaTool(
   try {
     db = deps.db ?? (await (deps.getDatabase ?? getDb)());
     scoped = await loadScopedMedia(db, context, bounded);
-    if (scoped) {
+    if (scoped && scoped.status !== "stored") {
+      // In scope, and the bytes never arrived: the owner can fix this by sending
+      // it again, so the answer says which of the two it is.
+      result = {
+        ok: false,
+        code: "not_stored",
+        status: scoped.status,
+        message: `That attachment is not stored (the capture left it ${scoped.status}), so there is nothing to read yet. Tell the owner it has to be sent again; do not claim the file was read.`,
+      };
+    } else if (scoped && !consumableMime(name, scoped.mime)) {
+      // In scope, stored, and not a kind this tool reads — a fact about the file
+      // the owner already knows they sent.
+      result = {
+        ok: false,
+        code: "unsupported_type",
+        mime: scoped.mime,
+        message: `This tool cannot read ${scoped.mime}. Say which kind of file it is and which tool would read it, rather than that nothing arrived.`,
+      };
+    } else if (scoped) {
       result = await readCapability(name, scoped, bounded, deps.readObject ?? readMediaObject, context.organizationId);
     }
   } catch (error) {

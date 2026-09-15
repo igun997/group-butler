@@ -466,13 +466,16 @@ describe("media tool scope", () => {
     expect(reader).toHaveBeenCalledWith(IMAGE_KEY_B, "org-b", IMAGE_MAX_SOURCE_BYTES);
   });
 
-  test("answers one indistinguishable refusal for absence, lifecycle, tenant, and MIME", async () => {
+  /**
+   * The refusal that must stay one shape: everything a caller can learn from here
+   * is that it will not be answered, whatever the reason — a row that does not
+   * exist, one belonging to another instance, one in a group this chat may not
+   * read, or a context too broken to authorize at all. Those are indistinguishable
+   * from each other on purpose, so nothing can be probed for existence.
+   */
+  test("answers one indistinguishable refusal for a row the caller may not read", async () => {
     const results = [
       await call("media_get_image", { waMessageId: "missing" }),
-      await call("media_get_image", { waMessageId: "pending" }),
-      await call("media_get_image", { waMessageId: "unstored" }),
-      await call("media_get_image", { waMessageId: "tiff" }),
-      await call("media_read_csv", { waMessageId: "pdf" }),
       await call("media_get_image", { waMessageId: "img" }, { ...contextA, instanceId: "instance-b" }),
       await call("media_get_image", { waMessageId: "img" }, { ...contextA, groupJid: "group-c@g.us" }),
       await call("media_get_image", { waMessageId: "cimg" }, dmContext),
@@ -483,10 +486,25 @@ describe("media tool scope", () => {
     expect(new Set(results.map((result) => JSON.stringify(result)))).toEqual(new Set([JSON.stringify({ ok: false, code: "not_available" })]));
   });
 
+  /**
+   * And the refusal that must not: once the row is the caller's own, the reason is
+   * the owner's business. "It never finished arriving, send it again" and "this
+   * tool does not read that kind of file" are different sentences, and an owner
+   * told only `not_available` resends a picture that arrived perfectly well.
+   */
+  test("says why an attachment of the caller's own cannot be read", async () => {
+    // The capture never stored these bytes — a lifecycle answer, not a type one.
+    expect(await call("media_get_image", { waMessageId: "pending" })).toMatchObject({ ok: false, code: "not_stored", status: "pending" });
+    expect(await call("media_get_image", { waMessageId: "unstored" })).toMatchObject({ ok: false, code: "not_stored", status: "unparsed" });
+    // Stored, and not a kind this tool reads.
+    expect(await call("media_get_image", { waMessageId: "tiff" })).toMatchObject({ ok: false, code: "unsupported_type", mime: "image/tiff" });
+    expect(await call("media_read_csv", { waMessageId: "pdf" })).toMatchObject({ ok: false, code: "unsupported_type", mime: "application/pdf" });
+  });
+
   test("never reads an unstored attachment, not even to inspect it", async () => {
     const result = await call("media_read_document", { waMessageId: "unstored" });
 
-    expect(result).toEqual({ ok: false, code: "not_available" });
+    expect(result).toMatchObject({ ok: false, code: "not_stored" });
     expect(reader).not.toHaveBeenCalled();
   });
 });
@@ -621,12 +639,16 @@ describe("media tool reads", () => {
     expect(await call("media_read_document", { waMessageId: "stale" })).toEqual({ ok: false, code: "not_available" });
   });
 
-  test("answers unavailable for audio and video without touching the object", async () => {
+  test("answers unavailable for a capability it does not have, and names a kind it does not read", async () => {
     const audio = await call("media_transcribe_audio", { waMessageId: "voice" });
+    // The audio tool holds a real audio MIME and still cannot answer: this
+    // deployment has no transcriber, which is a missing capability, not a fact
+    // about the file. The video tool on an audio message is the other case — a
+    // file whose kind it does not read, which the owner is owed by name.
     const video = await call("media_describe_video", { waMessageId: "voice" });
 
     expect(audio).toEqual({ ok: false, code: "not_available" });
-    expect(video).toEqual({ ok: false, code: "not_available" });
+    expect(video).toMatchObject({ ok: false, code: "unsupported_type" });
     expect(reader).not.toHaveBeenCalled();
   });
 
@@ -680,20 +702,20 @@ describe("media capability matrix", () => {
     const capped = await call("media_transcribe_audio", { waMessageId: "voice", maxSeconds: 99_999 });
     const scoped = await call("media_transcribe_audio", { waMessageId: "voice" });
 
-    expect(wrongMime).toEqual({ ok: false, code: "not_available" });
+    expect(wrongMime).toMatchObject({ ok: false, code: "unsupported_type" });
     expect(capped).toEqual({ ok: false, code: "not_available" });
     expect(scoped).toEqual({ ok: false, code: "not_available" });
     expect(reader).not.toHaveBeenCalled();
   });
 
   test("refuses a video MIME for an audio-only message, and vice versa, before reading", async () => {
-    expect(await call("media_describe_video", { waMessageId: "voice" })).toEqual({ ok: false, code: "not_available" });
-    expect(await call("media_transcribe_audio", { waMessageId: "clip" })).toEqual({ ok: false, code: "not_available" });
+    expect(await call("media_describe_video", { waMessageId: "voice" })).toMatchObject({ ok: false, code: "unsupported_type" });
+    expect(await call("media_transcribe_audio", { waMessageId: "clip" })).toMatchObject({ ok: false, code: "unsupported_type" });
     expect(reader).not.toHaveBeenCalled();
   });
 
   test("the binary spreadsheet format a workbook used to be stays unsupported, refused before any read", async () => {
-    expect(await call("media_read_document", { waMessageId: "legacy" })).toEqual({ ok: false, code: "not_available" });
+    expect(await call("media_read_document", { waMessageId: "legacy" })).toMatchObject({ ok: false, code: "unsupported_type" });
     expect(reader).not.toHaveBeenCalled();
   });
 });
