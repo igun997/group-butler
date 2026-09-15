@@ -1,4 +1,4 @@
-import { generateText, stepCountIs, type ToolSet } from "ai";
+import { generateText, stepCountIs, type FilePart, type ModelMessage, type ToolSet } from "ai";
 import { NO_TOKEN_USAGE, type TokenUsage } from "../repos/ai-calls";
 import { createCompatibleProvider, isProviderProtocolFailure } from "../ai/provider";
 import { sanitizeWhatsAppOutput, type WhatsAppOutputCode } from "../ai/sanitize-whatsapp";
@@ -125,6 +125,18 @@ export async function generateGroupReply(input: {
         maxOutputTokens: REPLY_OUTPUT_RESERVE_TOKENS,
         // A lease heartbeat that finds the run reclaimed aborts the in-flight call.
         abortSignal: input.abortSignal,
+        // An image a tool returned is moved out of the tool result and into a user
+        // message before the next step, because that is the only place a vision
+        // model will see it: measured against this deployment's gateway, the same
+        // image read "HI INDRA 420" as a user-message part and came back as an
+        // empty string inside a tool result. OpenAI-shaped APIs do not carry images
+        // in a `role: "tool"` message, and this provider does not convert them.
+        prepareStep: input.tools
+          ? ({ messages }) => {
+              const lifted = liftToolResultImages(messages);
+              return lifted === null ? {} : { messages: lifted };
+            }
+          : undefined,
       });
       let text = first.text;
       spent = addUsage(spent, {
@@ -171,6 +183,46 @@ export async function generateGroupReply(input: {
   // The loop above returns on its last attempt, so this is unreachable; it exists
   // because the compiler cannot see that.
   return { kind: "rejected", code: refusal ?? "empty" };
+}
+
+/**
+ * Tool-result images, moved to where a model can see them.
+ *
+ * Returns the messages to use for the next step, or `null` when there is nothing to
+ * move — a reply that read no image keeps the messages the SDK built. The file parts
+ * are removed from the tool result as they are taken, so an image is never sent
+ * twice: a provider that does carry tool-result images sends the user message's copy,
+ * and one that does not, sends the only copy there is.
+ */
+function liftToolResultImages(messages: readonly ModelMessage[]): ModelMessage[] | null {
+  const images: FilePart[] = [];
+  const rewritten = messages.map((message): ModelMessage => {
+    if (message.role !== "tool") return message;
+    return {
+      ...message,
+      content: message.content.map((part) => {
+        if (part.type !== "tool-result" || part.output.type !== "content") return part;
+        const files = part.output.value.filter((entry) => entry.type === "file");
+        if (files.length === 0) return part;
+        for (const file of files) images.push({ type: "file", data: file.data, mediaType: file.mediaType });
+        return { ...part, output: { ...part.output, value: part.output.value.filter((entry) => entry.type !== "file") } };
+      }),
+    };
+  });
+  if (images.length === 0) return null;
+  return [
+    ...rewritten,
+    {
+      role: "user",
+      content: [
+        ...images,
+        {
+          type: "text" as const,
+          text: "The image(s) the tool returned, sent as images: read them and answer from what they show.",
+        },
+      ],
+    },
+  ];
 }
 
 /**

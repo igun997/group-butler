@@ -955,6 +955,22 @@ export async function runMediaTool(
     // bytes that were read, and retrieved contents never reach a log.
     console.error(`media tool ${name} failed`, error instanceof Error ? error.name : "unknown");
   }
+  // A refusal is one shape to the model on purpose — it must not be able to tell
+  // an absent attachment from an unauthorized one — but the operator is owed the
+  // reason, and until this existed a media read that answered `not_available`
+  // recorded only that code. Which MIME the capture actually stored, and whether
+  // it was ever stored at all, is the whole diagnosis.
+  if (!result.ok && db !== undefined) {
+    // Best effort, because it is diagnosis and not the answer: when the database
+    // is the thing that failed, the query behind this line fails too, and a
+    // refusal that turned into a rejection would be a worse answer than the one
+    // the caller already has.
+    try {
+      await logRefusedMediaRead(db, context, name, bounded.waMessageId);
+    } catch {
+      // Nothing to add: the refusal itself is already recorded in the audit row.
+    }
+  }
   if (db !== undefined) {
     await recordMediaRead(
       db,
@@ -971,6 +987,48 @@ export async function runMediaTool(
     );
   }
   return result;
+}
+
+/**
+ * Why a media read was refused, for the operator's log only.
+ *
+ * The metadata is the diagnosis: a stored MIME the tool does not read (an image
+ * sent as a document, a phone's own format, a container the reader does not know)
+ * looks nothing like a row that was never stored because the file was too large,
+ * and the two need different answers. Nothing read from the file is logged — the
+ * row's own names, types and sizes are not the contents.
+ */
+async function logRefusedMediaRead(
+  db: Db,
+  context: ToolChatContext,
+  name: MediaToolName,
+  waMessageId: string,
+): Promise<void> {
+  const row = await db
+    .collection<{ kind?: unknown; media?: { status?: unknown; mime?: unknown; fileName?: unknown; error?: unknown; reason?: unknown } }>(
+      COLLECTIONS.messages,
+    )
+    .findOne(
+      { organizationId: context.organizationId, instanceId: context.instanceId, waMessageId },
+      { projection: { _id: 0, kind: 1, "media.status": 1, "media.mime": 1, "media.fileName": 1, "media.error": 1, "media.reason": 1 } },
+    );
+  if (row === null) {
+    console.error(`[api] ${name} refused: no message ${waMessageId} for this instance`);
+    return;
+  }
+  const mime = typeof row.media?.mime === "string" ? row.media.mime : "(none)";
+  const status = typeof row.media?.status === "string" ? row.media.status : "(none)";
+  const kind = typeof row.kind === "string" ? row.kind : "(none)";
+  console.error(`[api] ${name} refused: kind=${kind} status=${status} mime=${mime}`, JSON.stringify({
+    fileName: typeof row.media?.fileName === "string" ? row.media.fileName : null,
+    captureError: typeof row.media?.error === "string" && row.media.error !== "" ? row.media.error : null,
+    captureReason: typeof row.media?.reason === "string" && row.media.reason !== "" ? row.media.reason : null,
+  }));
+  if (status !== "stored") {
+    console.error(`[api] ${name}: the attachment was never stored (the capture left it ${status}), so there is nothing to read — a file past MEDIA_MAX_BYTES is recorded but not uploaded`);
+  } else if (CONSUMABLE_MIMES[name][mime] !== true) {
+    console.error(`[api] ${name}: the stored MIME ${mime} is not one this tool reads — the MIME is what the capture recorded for the bytes, not what the file is named`);
+  }
 }
 
 function content(result: MediaToolResult): CallToolResult {

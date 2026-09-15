@@ -10,6 +10,7 @@ const generateText = vi.hoisted(() =>
       maxOutputTokens: number;
       tools?: Record<string, unknown>;
       stopWhen?: unknown;
+      prepareStep?: (options: { messages: unknown[] }) => { messages?: unknown[] };
     }) => Promise<{
       text: string;
       finishReason: string;
@@ -224,6 +225,69 @@ describe("group reply model call", () => {
     const result = await generateGroupReply({ system: "SYSTEM", prompt: "PROMPT" });
 
     expect(result).toEqual({ kind: "ok", reply: { text: "Grup yang dipantau: Test Grrup.", model: "local-model", usage: { inputTokens: 3, outputTokens: 4, totalTokens: 7 } } });
+  });
+
+  /**
+   * Where an image has to end up. Measured against this deployment's gateway: the
+   * same image, asked to be read, came back as "HI INDRA 420" as a user-message
+   * part and as an empty string inside a tool result — OpenAI-shaped APIs do not
+   * carry images in a `role: "tool"` message, and this provider does not convert
+   * them. So the step after a tool call gets its images moved, in one copy.
+   */
+  test("moves a tool result's image into a user message before the next step", async () => {
+    baseEnv();
+    generateText.mockResolvedValue(answer("done", { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, "stop"));
+    const toolMessages: unknown[] = [
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: "c1", toolName: "media_get_image", input: {} }] },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "c1",
+            toolName: "media_get_image",
+            output: {
+              type: "content",
+              value: [
+                { type: "file", data: { type: "data", data: "aGk=" }, mediaType: "image/png" },
+                { type: "text", text: "{\"ok\":true}" },
+              ],
+            },
+          },
+        ],
+      },
+    ];
+
+    await generateGroupReply({ system: "SYSTEM", prompt: "PROMPT", tools: { media_get_image: { description: "img" } } as never });
+
+    const prepareStep = generateText.mock.calls[0]?.[0]?.prepareStep as
+      | ((options: { messages: unknown[] }) => { messages?: unknown[] })
+      | undefined;
+    expect(prepareStep).toBeTypeOf("function");
+    const rewritten = prepareStep?.({ messages: toolMessages })?.messages ?? [];
+
+    // The image is a user-message part…
+    const last = rewritten.at(-1) as { role: string; content: { type: string }[] };
+    expect(last.role).toBe("user");
+    expect(last.content.map((part) => part.type)).toEqual(["file", "text"]);
+    // …and it is no longer in the tool result, which keeps only the text: no
+    // provider is sent two copies of the same bytes.
+    const result = rewritten[1] as { content: { output: { value: { type: string; text?: string }[] } }[] };
+    expect(result.content[0]?.output.value).toEqual([{ type: "text", text: '{"ok":true}' }]);
+  });
+
+  test("leaves the messages alone when no tool returned an image", async () => {
+    baseEnv();
+    generateText.mockResolvedValue(answer("done", { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, "stop"));
+
+    await generateGroupReply({ system: "SYSTEM", prompt: "PROMPT", tools: { media_read_csv: { description: "csv" } } as never });
+
+    const prepareStep = generateText.mock.calls[0]?.[0]?.prepareStep as
+      | ((options: { messages: unknown[] }) => { messages?: unknown[] })
+      | undefined;
+    const messages = [{ role: "tool", content: [{ type: "tool-result", toolCallId: "c1", toolName: "media_read_csv", output: { type: "text", value: "a,b" } }] }];
+
+    expect(prepareStep?.({ messages })?.messages).toBeUndefined();
   });
 
   test("refuses rather than sends when the markup survives the second answer", async () => {

@@ -80,11 +80,32 @@ async function runTool(set: ToolSet, name: string, input: Record<string, unknown
   return JSON.parse(await runRawTool(set, name, input)) as Record<string, unknown>;
 }
 
-/** The same call, returning whatever the tool returned verbatim. */
+/**
+ * The same call, returning what the *model* is handed — which is the tool's
+ * `toModelOutput`, not its raw output: that conversion is where an image stops
+ * being text, so a test that read the raw value would be testing the wrong side
+ * of the boundary.
+ */
 async function runRawTool(set: ToolSet, name: string, input: Record<string, unknown>): Promise<string> {
+  const parts = await runContentParts(set, name, input);
+  return parts.filter((part) => part.type === "text").map((part) => String(part.text)).join("\n");
+}
+
+/** What the model receives for one call: text parts and file parts, in order. */
+async function runContentParts(
+  set: ToolSet,
+  name: string,
+  input: Record<string, unknown>,
+): Promise<{ type: string; text?: unknown; mediaType?: string; data?: unknown }[]> {
   const tool = set[name];
   if (!tool?.execute) throw new Error(`tool ${name} is not executable`);
-  return String(await tool.execute(input, { toolCallId: "call-1", messages: [], context: {} }));
+  const output = await tool.execute(input, { toolCallId: "call-1", messages: [], context: {} });
+  const mapped = tool.toModelOutput
+    ? await tool.toModelOutput({ toolCallId: "call-1", input, output })
+    : { type: "text" as const, value: String(output) };
+  if (mapped.type === "text") return [{ type: "text", text: mapped.value }];
+  if (!("value" in mapped) || !Array.isArray(mapped.value)) throw new Error(`unexpected tool output: ${mapped.type}`);
+  return mapped.value as { type: string; text?: unknown; mediaType?: string; data?: unknown }[];
 }
 
 beforeAll(async () => {
@@ -241,6 +262,38 @@ const charsCounter = { id: "test-exact", kind: "exact" as const, note: "test", c
  * returns, the model never receives more than the plan's per-result limit.
  */
 describe("tool result capping", () => {
+  /**
+   * The bug this exists for: every tool result was text, so `media_get_image`'s
+   * data URL reached the model as a base64 paragraph it cannot decode — a vision
+   * model asked to look at a very long word, answering from the file name. An
+   * image is sent as an image, and the base64 stops spending the text allowance.
+   */
+  test("sends an image to the model as an image, not as base64 in the text", async () => {
+    const set = await mediaToolSet((await connectMediaTools(context, { db, readObject: reader, audit })).client, new Set(), tokenResultBudget(charsCounter));
+
+    const parts = await runContentParts(set, "media_get_image", { waMessageId: "img" });
+
+    const files = parts.filter((part) => part.type === "file");
+    expect(files).toHaveLength(1);
+    expect(files[0]).toMatchObject({ type: "file", mediaType: "image/png", data: { type: "data" } });
+    // The pixels are the point; the text that travels with them is the tool's own
+    // JSON, with the image field replaced by a note rather than a wall of base64.
+    const text = parts.filter((part) => part.type === "text").map((part) => String(part.text)).join("");
+    expect(text).toContain("sent to you as an image");
+    expect(text).not.toContain("iVBORw0KGgo");
+  });
+
+  // Everything else stays text: the lift is for images, and a reader that finds no
+  // image must not change a result's shape.
+  test("leaves a text result as text", async () => {
+    const set = await mediaToolSet((await connectMediaTools(context, { db, readObject: reader, audit })).client, new Set(), tokenResultBudget(charsCounter));
+
+    const parts = await runContentParts(set, "media_read_csv", { waMessageId: "csv" });
+
+    expect(parts.every((part) => part.type === "text")).toBe(true);
+    expect(String(parts[0]?.text)).toContain("columns");
+  });
+
   test("clips an oversized tool result before it reaches the model", async () => {
     const server = new McpServer({ name: "verbose", version: "1.0.0" });
     server.registerTool(
