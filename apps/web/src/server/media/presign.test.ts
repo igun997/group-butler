@@ -5,6 +5,7 @@ import {
   R2ConfigurationError,
   presignMediaUrl,
   r2Endpoint,
+  readMediaObject,
 } from "./presign";
 
 const ownKey = "org/org_default/instance/inst_1/group/g/2026/09/m2.bin";
@@ -108,5 +109,27 @@ describe("presignMediaUrl", () => {
     expect(new URL(signed).searchParams.get("X-Amz-Expires")).toBe(String(MAX_PRESIGN_TTL_SECONDS));
     expect(expiresInSeconds).toBe(MAX_PRESIGN_TTL_SECONDS);
     goodEnv();
+  });
+});
+
+/**
+ * The agent media tools read bytes through this function instead of a signed
+ * URL, so the same prefix guard must decide before any credential is read: a
+ * row that names another tenant's object is refused, not fetched.
+ */
+describe("readMediaObject", () => {
+  test("refuses a key outside the organisation prefix, before any configuration", async () => {
+    vi.stubEnv("R2_BUCKET", "");
+    await expect(
+      readMediaObject("org/org_other/instance/inst_1/group/g/2026/09/m.bin", "org_default", 1024),
+    ).rejects.toBeInstanceOf(ForeignMediaKeyError);
+    await expect(readMediaObject("org/org_default_evil/x", "org_default", 1024)).rejects.toBeInstanceOf(ForeignMediaKeyError);
+    vi.unstubAllEnvs();
+  });
+
+  test("refuses a cap that is not a positive integer instead of reading unbounded", async () => {
+    for (const maxBytes of [0, -1, 1.5, Number.POSITIVE_INFINITY, Number.NaN]) {
+      await expect(readMediaObject(ownKey, "org_default", maxBytes)).rejects.toBeInstanceOf(RangeError);
+    }
   });
 });

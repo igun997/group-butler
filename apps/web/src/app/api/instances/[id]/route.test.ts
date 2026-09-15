@@ -212,9 +212,11 @@ describe("PATCH /api/instances/[id] (§7.3: the config, whitelist included)", ()
     expect(res.status).toBe(200);
     expect(res.headers.get("cache-control")).toBe("no-store");
     expect(await res.json()).toEqual({ config: { instanceId: "inst_1", groupJidWhitelist: [JID] } });
-    // The rows are the mirror of the list (§5.1), and nothing else moved.
-    expect((await storedGroup(JID))?.config).toMatchObject({ whitelisted: true, assigned: false });
-    expect((await storedGroup(OTHER_JID))?.config).toMatchObject({ whitelisted: false });
+    // The rows are the mirror of the list (§5.1), and nothing else moved. The
+    // list is the only scope control this build has, so a grant assigns the
+    // group as well as whitelisting it.
+    expect((await storedGroup(JID))?.config).toMatchObject({ whitelisted: true, assigned: true });
+    expect((await storedGroup(OTHER_JID))?.config).toMatchObject({ whitelisted: false, assigned: false });
     expect((await storedGroup(JID))?.observed).toMatchObject({ subject: "Ops Team" });
   });
 

@@ -22,7 +22,9 @@ import { z } from "zod";
  * The §6.5 stable error codes, plus the two this layer answers with itself.
  * `worker_unreachable` means the worker could not be reached at all;
  * `internal` means it answered something this dashboard cannot use, including a
- * code it does not know.
+ * code it does not know. The group-maintenance codes are the worker's own
+ * answers to a refused `POST …/groups/{groupJid}/admin`: a group it cannot see,
+ * a bot that is not an admin, and the two refusals WhatsApp itself hands back.
  */
 export type WorkerErrorCode =
   | "invalid_request"
@@ -34,6 +36,10 @@ export type WorkerErrorCode =
   | "method_not_allowed"
   | "instance_cleanup_failed"
   | "group_sync_failed"
+  | "group_not_found"
+  | "not_admin"
+  | "group_admin_failed"
+  | "revoke_failed"
   | "internal"
   | "worker_unreachable";
 
@@ -116,6 +122,13 @@ const WORKER_FAILURES: Readonly<Record<string, WorkerFailure>> = {
   },
   instance_cleanup_failed: { status: 502, code: "instance_cleanup_failed", message: "the instance could not be removed" },
   group_sync_failed: SYNC_FAILURE,
+  // A group the worker cannot address at all is the browser's 404; a bot that
+  // is not an admin is a 403 the console explains as "give the bot admin
+  // rights"; the two WhatsApp refusals are upstream faults, not the caller's.
+  group_not_found: { status: 404, code: "group_not_found", message: "the group could not be found" },
+  not_admin: { status: 403, code: "not_admin", message: "the bot is not an administrator of this group" },
+  group_admin_failed: { status: 502, code: "group_admin_failed", message: "the WhatsApp service refused this group change" },
+  revoke_failed: { status: 502, code: "revoke_failed", message: "the message could not be revoked" },
   internal: UPSTREAM_FAILURE,
 };
 
@@ -318,6 +331,26 @@ export function requestWorkerPairingCode(instanceId: string): Promise<WorkerResu
   return callWorker({ segments: ["instances", instanceId, "pairing-code"], method: "POST", schema: InstanceSnapshotSchema });
 }
 
+/**
+ * `POST /instances/{id}/pair`: put an instance that is not connected back into
+ * pairing. The worker refuses with `invalid_state` when it is already connected,
+ * and answers the current snapshot when it is already pairing, so the console
+ * never has to decide which of those it is asking for.
+ */
+export function pairWorkerInstance(instanceId: string): Promise<WorkerResult<InstanceSnapshot>> {
+  return callWorker({ segments: ["instances", instanceId, "pair"], method: "POST", schema: InstanceSnapshotSchema });
+}
+
+/**
+ * `POST /instances/{id}/check`: verify the instance's real socket state, which
+ * the worker repairs by reconnecting when the stored credential is still valid.
+ * It is a live round trip, not a re-read of stored state, so a "Check now" that
+ * finds a dead session changes the snapshot instead of reporting the stale one.
+ */
+export function checkWorkerInstance(instanceId: string): Promise<WorkerResult<InstanceSnapshot>> {
+  return callWorker({ segments: ["instances", instanceId, "check"], method: "POST", schema: InstanceSnapshotSchema });
+}
+
 /** `POST /instances/{id}/groups/sync` (§6.6.6): a full sync, reported as it ran. */
 export async function requestWorkerGroupSync(instanceId: string): Promise<WorkerResult<GroupSyncSummary>> {
   const result = await callWorker({
@@ -332,4 +365,119 @@ export async function requestWorkerGroupSync(instanceId: string): Promise<Worker
   // visibly is the only honest answer to a contradiction.
   if (result.ok && !result.data.ok) return { ok: false, failure: SYNC_FAILURE };
   return result;
+}
+
+/**
+ * One group's live metadata, read from WhatsApp rather than from the stored
+ * row: `botIsAdmin` is what says whether a staged group change can be performed
+ * at all, and no stored field can answer it.
+ */
+export const WorkerGroupInfoSchema = z.object({
+  ok: z.literal(true),
+  groupJid: z.string().min(1),
+  name: z.string(),
+  topic: z.string(),
+  isAnnounce: z.boolean(),
+  isLocked: z.boolean(),
+  participantCount: z.number().int().nonnegative(),
+  botIsAdmin: z.boolean(),
+  botIsSuperAdmin: z.boolean(),
+});
+
+export type WorkerGroupInfo = z.infer<typeof WorkerGroupInfoSchema>;
+
+/** One member of a group. `displayName` is absent when WhatsApp supplies none. */
+export const WorkerGroupParticipantSchema = z.object({
+  jid: z.string().min(1),
+  isAdmin: z.boolean(),
+  isSuperAdmin: z.boolean(),
+  displayName: z.string().optional(),
+});
+
+export type WorkerGroupParticipant = z.infer<typeof WorkerGroupParticipantSchema>;
+
+export const WorkerGroupParticipantsSchema = z.object({
+  ok: z.literal(true),
+  groupJid: z.string().min(1),
+  participants: z.array(WorkerGroupParticipantSchema),
+});
+
+export type WorkerGroupParticipants = z.infer<typeof WorkerGroupParticipantsSchema>;
+
+/** `GET /instances/{id}/groups/{groupJid}/info`: the group's live metadata. */
+export function getWorkerGroupInfo(instanceId: string, groupJid: string): Promise<WorkerResult<WorkerGroupInfo>> {
+  return callWorker({
+    segments: ["instances", instanceId, "groups", groupJid, "info"],
+    schema: WorkerGroupInfoSchema,
+  });
+}
+
+/** `GET /instances/{id}/groups/{groupJid}/participants`: who is in the group. */
+export function getWorkerGroupParticipants(
+  instanceId: string,
+  groupJid: string,
+): Promise<WorkerResult<WorkerGroupParticipants>> {
+  return callWorker({
+    segments: ["instances", instanceId, "groups", groupJid, "participants"],
+    schema: WorkerGroupParticipantsSchema,
+  });
+}
+
+/** What one `members` call did about one JID. `unreported` was not mentioned by
+ * WhatsApp's answer, so it must not be read as done. */
+const GroupAdminMemberResultSchema = z.object({
+  jid: z.string().min(1),
+  status: z.enum(["ok", "failed", "unreported"]),
+  errorCode: z.number().int().optional(),
+});
+
+/**
+ * The worker's `POST …/groups/{groupJid}/admin` body: its own action name and
+ * that action's parameters, which are the staged row's `params` unchanged.
+ *
+ * One action per worker action, so the executor's `action` discriminator maps
+ * onto exactly this vocabulary and nothing else.
+ */
+export type GroupAdminRequest =
+  | { action: "rename"; name: string }
+  | { action: "announce"; announce: boolean }
+  | { action: "locked"; locked: boolean }
+  | { action: "photo"; dataUrl: string }
+  | { action: "members"; membership: "add" | "remove" | "promote" | "demote"; jids: string[] }
+  | { action: "leave" }
+  | { action: "revoke"; waMessageId: string };
+
+/**
+ * What the worker answered. `ok` is `false` for a `members` call that WhatsApp
+ * did not confirm for every JID — a partial success, not a failed call, which is
+ * why the per-JID `results` are what the caller records.
+ */
+export const WorkerGroupActionResultSchema = z.object({
+  ok: z.boolean(),
+  pictureId: z.string().optional(),
+  revokeMessageId: z.string().optional(),
+  results: z.array(GroupAdminMemberResultSchema).optional(),
+  failed: z.array(z.string()).optional(),
+});
+
+export type WorkerGroupActionResult = z.infer<typeof WorkerGroupActionResultSchema>;
+
+/**
+ * `POST /instances/{id}/groups/{groupJid}/admin`: one destructive group change,
+ * already approved by the owner. The standard control deadline applies: the
+ * worker answers when WhatsApp has, and a call it cannot answer in time is
+ * reported as unreachable rather than left hanging.
+ */
+export function runWorkerGroupAction(
+  instanceId: string,
+  groupJid: string,
+  body: GroupAdminRequest,
+): Promise<WorkerResult<WorkerGroupActionResult>> {
+  return callWorker({
+    segments: ["instances", instanceId, "groups", groupJid, "admin"],
+    method: "POST",
+    body,
+    schema: WorkerGroupActionResultSchema,
+    timeoutMs: WORKER_TIMEOUT_MS,
+  });
 }

@@ -25,10 +25,14 @@ import { readGroupDetail, updateGroupConfig } from "../../../../server/repos/gro
  * (§7.2), of which §5.1 says the row is a mirror. The two writers that can
  * change that scope — this toggle and the instance's whitelist editor — each
  * keep both documents in step, so un-whitelisting here cannot leave the
- * assistant reading the group. The repository does both of this route's writes
- * in one transaction, together with the audit row that records the move, which
- * is why the handler below has one call and one failure mapping rather than a
- * write and then a second one to keep in step.
+ * assistant reading the group. A grant here also assigns the group, and taking
+ * the grant away clears the assignment: `assigned` has no control of its own in
+ * this build, and the worker's ingest gate, the reply route and the memory batch
+ * read the two flags together, so a row that carried only one of them is a group
+ * nothing would ever look at. The repository does both of this route's writes in
+ * one transaction, together with the audit row that records the move, which is
+ * why the handler below has one call and one failure mapping rather than a write
+ * and then a second one to keep in step.
  */
 
 const PatchSchema = z

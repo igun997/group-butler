@@ -29,9 +29,10 @@ import { deleteWorkerInstance, getWorkerInstance, workerFailureResponse } from "
  *   assistant's scope stays editable while the instance is offline — which is
  *   exactly when an operator wants to narrow it.
  *
- * The write itself mirrors onto `groups.config.whitelisted` and records the
- * before/after it replaced, atomically; that is the repository's job, not this
- * handler's.
+ * The write itself mirrors onto `groups.config.whitelisted` *and* its
+ * `config.assigned` — the list is this build's only scope control, and every
+ * reader of a group's eligibility wants the pair — and records the before/after
+ * it replaced, atomically; that is the repository's job, not this handler's.
  */
 
 /** A group JID: one `@`, no whitespace, and WhatsApp's group suffix. */

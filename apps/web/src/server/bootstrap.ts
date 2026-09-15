@@ -41,6 +41,7 @@ export const INDEXES: Record<string, IndexDescription[]> = {
     { name: "uniq_message", key: { organizationId: 1, instanceId: 1, waMessageId: 1 }, unique: true },
     { name: "group_stream", key: { organizationId: 1, instanceId: 1, groupJid: 1, timestamp: -1 } },
     { name: "media_status", key: { organizationId: 1, "media.status": 1, timestamp: -1 } },
+    { name: "memory_batch_scan", key: { organizationId: 1, instanceId: 1, groupJid: 1, "flags.revoked": 1, timestamp: 1, waMessageId: 1 } },
     { name: "sender_stream", key: { organizationId: 1, senderJid: 1, timestamp: -1 } },
     // The cross-instance stream's keyset order (`/api/messages`): tenant
     // equality, then the exact `(timestamp, waMessageId, instanceId)`
@@ -67,11 +68,59 @@ export const INDEXES: Record<string, IndexDescription[]> = {
       default_language: "none",
     },
   ],
+  [COLLECTIONS.memoryBatches]: [
+    {
+      name: "uniq_memory_batch_range",
+      key: {
+        organizationId: 1,
+        instanceId: 1,
+        groupJid: 1,
+        "first.timestamp": 1,
+        "first.waMessageId": 1,
+        "last.timestamp": 1,
+        "last.waMessageId": 1,
+      },
+      unique: true,
+    },
+    {
+      name: "uniq_memory_batch_predecessor",
+      key: { organizationId: 1, instanceId: 1, groupJid: 1, predecessor: 1 },
+      unique: true,
+      partialFilterExpression: { predecessor: { $exists: true } },
+    },
+    { name: "memory_batch_claim", key: { organizationId: 1, state: 1, nextAttemptAt: 1, "lease.expiresAt": 1, createdAt: 1 } },
+    { name: "memory_batch_group_history", key: { organizationId: 1, instanceId: 1, groupJid: 1, completedAt: -1 } },
+  ],
+  [COLLECTIONS.memorySummaries]: [
+    { name: "uniq_memory_summary_batch", key: { organizationId: 1, batchId: 1 }, unique: true },
+    { name: "memory_summary_recent", key: { organizationId: 1, instanceId: 1, groupJid: 1, "period.to": -1 } },
+    { name: "memory_summary_text", key: { summary: "text", topics: "text", decisions: "text", openQuestions: "text", actionItems: "text" } },
+  ],
+  [COLLECTIONS.memoryFacts]: [
+    { name: "uniq_memory_fact_in_batch", key: { organizationId: 1, batchId: 1, kind: 1, textSearch: 1 }, unique: true },
+    { name: "memory_fact_recent", key: { organizationId: 1, instanceId: 1, groupJid: 1, kind: 1, occurredAt: -1 } },
+    { name: "memory_fact_text", key: { text: "text", subject: "text" } },
+    { name: "memory_fact_summary", key: { organizationId: 1, summaryId: 1 } },
+  ],
+  [COLLECTIONS.agentReplyRuns]: [
+    { name: "uniq_agent_reply_source", key: { organizationId: 1, instanceId: 1, groupJid: 1, waMessageId: 1 }, unique: true },
+    { name: "agent_reply_recovery", key: { organizationId: 1, state: 1, "lease.expiresAt": 1 } },
+  ],
   [COLLECTIONS.sendRequests]: [
     { name: "uniq_send_idempotency", key: { organizationId: 1, idempotencyKey: 1 }, unique: true },
     { name: "send_due", key: { status: 1, scheduledFor: 1 } },
     { name: "send_by_instance", key: { organizationId: 1, instanceId: 1, createdAt: -1 } },
     { name: "send_by_group", key: { organizationId: 1, groupJid: 1, createdAt: -1 } },
+  ],
+  [COLLECTIONS.pendingActions]: [
+    // A short id is what an owner types into a DM, so it has to name exactly one
+    // action of that organisation for the row's whole life — not only while it is
+    // pending, or a decided action and a fresh one could answer to the same six
+    // characters and the reader would have to guess.
+    { name: "uniq_pending_action_short_id", key: { organizationId: 1, shortId: 1 }, unique: true },
+    // The console's queue and the repository's list: this organisation's actions
+    // still awaiting a decision, newest first.
+    { name: "pending_action_queue", key: { organizationId: 1, state: 1, requestedAt: -1 } },
   ],
   [COLLECTIONS.aiCalls]: [
     { name: "ai_recent", key: { organizationId: 1, createdAt: -1 } },

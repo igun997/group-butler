@@ -13,6 +13,8 @@
 export const REQUIRED_ENV = [
   // --- tenancy and storage backend ---
   "ORGANIZATION_ID",
+  // Country the operator omits when typing their own number in national form.
+  "DEFAULT_COUNTRY_CODE",
   "MONGODB_URI",
   "MONGODB_DB",
   "LOG_LEVEL",
@@ -46,6 +48,12 @@ export const REQUIRED_ENV = [
   "AI_MODEL",
   "AI_MAX_TOKENS_PER_DAY",
 
+
+  // --- agent memory batches ---
+  "MEMORY_BATCH_INTERVAL",
+  "MEMORY_BATCH_CONCURRENCY",
+  "MEMORY_CALLBACK_URL",
+  "MEMORY_CALLBACK_SECRET",
   // --- worker ingest ---
   "INGEST_QUEUE_SIZE",
   "INGEST_FLUSH_MS",

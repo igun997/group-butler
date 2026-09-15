@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { PendingActionsPanel } from "@/components/actions/pending-actions-panel";
 import { SchedulerSection } from "@/components/operations/scheduler-section";
 import { UsageSection } from "@/components/operations/usage-section";
 import { requireOwner } from "@/server/auth/require";
@@ -7,10 +8,13 @@ import { loadScheduler, loadUsage } from "@/server/console";
 export const metadata: Metadata = { title: "Operations" };
 
 /**
- * What the worker is doing on a timer, and what this organisation has used today.
+ * What is waiting for a decision, what the worker is doing on a timer, and what
+ * this organisation has used today.
  *
- * The two reads are independent and each returns its failure as a value, so the
- * worker being down still leaves the usage numbers on screen, and vice versa.
+ * The approval queue reads itself in the browser; the two reads below are the
+ * page's own. They are independent and each returns its failure as a value, so
+ * the worker being down still leaves the usage numbers on screen, and vice
+ * versa.
  *
  * This page is the only place the console loaders meet the sections: they hand
  * back the read models the sections are typed against (`@/lib/operations`), so a
@@ -25,10 +29,12 @@ export default async function OperationsPage() {
       <header className="flex flex-col gap-1">
         <h1 className="font-heading text-2xl font-semibold tracking-tight">Operations</h1>
         <p className="max-w-[65ch] text-sm text-muted-foreground">
-          What the worker is doing on a timer, and what this organisation has used today.
+          Group changes waiting for your decision, what the worker is doing on a timer, and what this organisation has
+          used today.
         </p>
       </header>
 
+      <PendingActionsPanel />
       <SchedulerSection result={scheduler} />
       <UsageSection result={usage} />
     </div>

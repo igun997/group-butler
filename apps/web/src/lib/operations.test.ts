@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { aiTotals, formatCount, formatInterval, formatPercent, loopOutcome } from "./operations";
+import { aiTotals, formatInterval, loopOutcome } from "./operations";
 
 describe("formatInterval", () => {
   test("a cadence is stated in the largest unit that divides it exactly", () => {
@@ -18,22 +18,6 @@ describe("formatInterval", () => {
     expect(formatInterval(0)).toBe("not available");
     expect(formatInterval(-1)).toBe("not available");
     expect(formatInterval(Number.NaN)).toBe("not available");
-  });
-});
-
-describe("formatCount", () => {
-  test("counts are grouped so a column of them can be read", () => {
-    expect(formatCount(1_204)).toBe("1,204");
-    expect(formatCount(200_000)).toBe("200,000");
-    expect(formatCount(0)).toBe("0");
-  });
-});
-
-describe("formatPercent", () => {
-  test("a share of the budget is one decimal, and an empty budget has no share to state", () => {
-    expect(formatPercent(4_614, 200_000)).toBe("2.3%");
-    expect(formatPercent(100, 100)).toBe("100%");
-    expect(formatPercent(1, 0)).toBe("not available");
   });
 });
 

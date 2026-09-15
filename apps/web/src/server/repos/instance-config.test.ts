@@ -109,11 +109,51 @@ describe("writing the whitelist (R5)", () => {
 
     expect(result).toEqual({ kind: "updated", config: { instanceId: "inst_1", groupJidWhitelist: [JID] } });
     expect((await storedConfig("inst_1"))?.config).toMatchObject({ groupJidWhitelist: [JID] });
-    expect((await storedGroup("inst_1", JID))?.config).toMatchObject({ whitelisted: true });
+    expect((await storedGroup("inst_1", JID))?.config).toMatchObject({ whitelisted: true, assigned: true });
     // The mirror is a set, not an append: a row the operator left out is cleared.
-    expect((await storedGroup("inst_1", OTHER_JID))?.config).toMatchObject({ whitelisted: false });
+    expect((await storedGroup("inst_1", OTHER_JID))?.config).toMatchObject({ whitelisted: false, assigned: false });
+    expect((await storedGroup("inst_1", JID))?.config).toMatchObject({ configVersion: 1 });
+    expect((await storedGroup("inst_1", OTHER_JID))?.config).not.toHaveProperty("configVersion");
     // The worker owns `observed.*`; a whitelist edit must not touch it.
     expect((await storedGroup("inst_1", JID))?.observed).toMatchObject({ subject: "Ops Team" });
+  });
+
+  /**
+   * The list is this build's only scope control, so it establishes assignment
+   * too: a group the operator grants is one this instance works in, which is
+   * what the worker's ingest gate, the reply route and the memory batch all ask
+   * for by name. Granting moves both flags on, removing moves both off.
+   */
+  test("a grant assigns the group as well as whitelisting it, and a removal clears both", async () => {
+    await seed();
+
+    await updateInstanceConfig(await getDb(), "org_default", "inst_1", [JID], "direct");
+    expect((await storedGroup("inst_1", JID))?.config).toMatchObject({
+      assigned: true,
+      whitelisted: true,
+      configVersion: 1,
+    });
+
+    await updateInstanceConfig(await getDb(), "org_default", "inst_1", [], "direct");
+    expect((await storedGroup("inst_1", JID))?.config).toMatchObject({
+      assigned: false,
+      whitelisted: false,
+      configVersion: 2,
+    });
+  });
+
+  test("granting the list again is not a change, so the version does not move", async () => {
+    await seed();
+    await updateInstanceConfig(await getDb(), "org_default", "inst_1", [JID], "direct");
+
+    await updateInstanceConfig(await getDb(), "org_default", "inst_1", [JID], "direct");
+
+    expect((await storedGroup("inst_1", JID))?.config).toMatchObject({
+      assigned: true,
+      whitelisted: true,
+      configVersion: 1,
+    });
+    expect((await storedGroup("inst_1", OTHER_JID))?.config).not.toHaveProperty("configVersion");
   });
 
   test("an empty list is the unconfigured state, and it clears every row it mirrored", async () => {
@@ -124,8 +164,8 @@ describe("writing the whitelist (R5)", () => {
 
     expect(cleared).toEqual({ kind: "updated", config: { instanceId: "inst_1", groupJidWhitelist: [] } });
     expect((await storedConfig("inst_1"))?.config).toMatchObject({ groupJidWhitelist: [] });
-    expect((await storedGroup("inst_1", JID))?.config).toMatchObject({ whitelisted: false });
-    expect((await storedGroup("inst_1", OTHER_JID))?.config).toMatchObject({ whitelisted: false });
+    expect((await storedGroup("inst_1", JID))?.config).toMatchObject({ whitelisted: false, assigned: false });
+    expect((await storedGroup("inst_1", OTHER_JID))?.config).toMatchObject({ whitelisted: false, assigned: false });
   });
 
   test("a group this instance does not have is refused, and nothing is written", async () => {

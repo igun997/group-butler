@@ -210,12 +210,19 @@ describe("PATCH /api/groups/[id]", () => {
     });
 
     const doc = await stored("org_default", "inst_1", JID);
-    expect(doc?.config).toMatchObject({ assigned: true, whitelisted: false });
+    expect(doc?.config).toMatchObject({ assigned: true, whitelisted: false, configVersion: 1 });
     // The worker owns `observed.*`; a config edit must not touch it.
     expect(doc?.observed).toMatchObject({ subject: "Ops Team", subjectSource: "event" });
   });
 
-  test("whitelists a group without disturbing its assignment", async () => {
+  /**
+   * `whitelisted` is the operator's scope signal and `assigned` has no surface
+   * of its own in this build, so a grant on the row assigns the group with it.
+   * Every reader of a group's eligibility — the worker's ingest gate, the reply
+   * route, the memory batch — asks for the pair together, and a row carrying
+   * only one of them is a group the operator granted that nothing ever reads.
+   */
+  test("a whitelist grant also assigns the group, so the row never reads half-set", async () => {
     await insertGroup({
       organizationId: "org_default",
       instanceId: "inst_1",
@@ -223,7 +230,6 @@ describe("PATCH /api/groups/[id]", () => {
       subject: "Ops Team",
       subjectSource: "event",
     });
-    await patch(JID, { assigned: true });
 
     const res = await patch(JID, { whitelisted: true });
 
@@ -232,6 +238,54 @@ describe("PATCH /api/groups/[id]", () => {
     expect((await stored("org_default", "inst_1", JID))?.config).toMatchObject({
       assigned: true,
       whitelisted: true,
+      configVersion: 1,
+    });
+
+    // A grant on a row that already reads both is not a second change.
+    await patch(JID, { whitelisted: true });
+
+    expect((await stored("org_default", "inst_1", JID))?.config).toMatchObject({ configVersion: 1 });
+  });
+
+  test("losing the whitelist clears the assignment with it", async () => {
+    await insertGroup({
+      organizationId: "org_default",
+      instanceId: "inst_1",
+      groupJid: JID,
+      subject: "Ops Team",
+      subjectSource: "event",
+    });
+    await patch(JID, { assigned: true });
+    await patch(JID, { whitelisted: true });
+
+    const res = await patch(JID, { whitelisted: false });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ group: { assigned: false, whitelisted: false } });
+    expect((await stored("org_default", "inst_1", JID))?.config).toMatchObject({
+      assigned: false,
+      whitelisted: false,
+      configVersion: 3,
+    });
+  });
+
+  test("a patch that grants and unassigns at once grants: the whitelist is the scope", async () => {
+    await insertGroup({
+      organizationId: "org_default",
+      instanceId: "inst_1",
+      groupJid: JID,
+      subject: "Ops Team",
+      subjectSource: "event",
+    });
+
+    const res = await patch(JID, { assigned: false, whitelisted: true });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ group: { assigned: true, whitelisted: true } });
+    expect((await stored("org_default", "inst_1", JID))?.config).toMatchObject({
+      assigned: true,
+      whitelisted: true,
+      configVersion: 1,
     });
   });
 
@@ -248,7 +302,22 @@ describe("PATCH /api/groups/[id]", () => {
     const res = await patch(JID, { assigned: false });
 
     expect(await res.json()).toMatchObject({ group: { assigned: false } });
-    expect((await stored("org_default", "inst_1", JID))?.config).toMatchObject({ assigned: false });
+    expect((await stored("org_default", "inst_1", JID))?.config).toMatchObject({ assigned: false, configVersion: 2 });
+  });
+
+  test("increments configVersion for every revoke and regrant", async () => {
+    await insertGroup({
+      organizationId: "org_default",
+      instanceId: "inst_1",
+      groupJid: JID,
+      subject: "Ops Team",
+      subjectSource: "event",
+    });
+    await patch(JID, { assigned: true });
+    await patch(JID, { assigned: false });
+    await patch(JID, { assigned: true });
+
+    expect((await stored("org_default", "inst_1", JID))?.config).toMatchObject({ assigned: true, configVersion: 3 });
   });
 
   test("rejects a patch that changes nothing, without touching the stored config", async () => {
@@ -445,7 +514,10 @@ describe("PATCH /api/groups/[id]", () => {
     const res = await patch(JID, { whitelisted: true });
 
     expect(res.status).toBe(200);
-    expect((await stored("org_default", "inst_1", JID))?.config).toMatchObject({ whitelisted: true });
+    expect((await stored("org_default", "inst_1", JID))?.config).toMatchObject({
+      assigned: true,
+      whitelisted: true,
+    });
     expect(await (await getDb()).collection(COLLECTIONS.auditLog).countDocuments({})).toBe(0);
   });
 

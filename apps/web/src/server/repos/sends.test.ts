@@ -1,8 +1,16 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import { MongoMemoryReplSet } from "mongodb-memory-server";
+import { Collection, MongoRuntimeError, ObjectId } from "mongodb";
 import { COLLECTIONS } from "../collections";
+import { createIndexes } from "../bootstrap";
 import { closeDb, getDb } from "../mongo";
-import { approveSend, createAutomaticSend, createSend, transitionSend } from "./sends";
+import {
+  approveSend,
+  createAutomaticSendUnderRunLease,
+  createHumanReviewSendUnderRunLease,
+  createSend,
+  transitionSend,
+} from "./sends";
 
 let replSet: MongoMemoryReplSet;
 
@@ -10,6 +18,8 @@ beforeAll(async () => {
   replSet = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
   vi.stubEnv("MONGODB_URI", replSet.getUri());
   vi.stubEnv("MONGODB_DB", "butler_send_test");
+  await closeDb();
+  await createIndexes(await getDb());
 });
 
 beforeEach(async () => {
@@ -18,6 +28,7 @@ beforeEach(async () => {
   await Promise.all([
     db.collection(COLLECTIONS.sendRequests).deleteMany({}),
     db.collection(COLLECTIONS.auditLog).deleteMany({}),
+    db.collection(COLLECTIONS.agentReplyRuns).deleteMany({}),
   ]);
 });
 
@@ -35,6 +46,55 @@ const request = {
   idempotencyKey: "send-key-000000000001",
   actorIP: "direct",
 };
+
+/** A reply run's lease row, the ownership proof the send transaction checks. */
+async function seedRun(leaseToken: string, expired = false): Promise<ObjectId> {
+  const db = await getDb();
+  const runId = new ObjectId();
+  await db.collection(COLLECTIONS.agentReplyRuns).insertOne({
+    _id: runId,
+    organizationId: request.organizationId,
+    instanceId: request.instanceId,
+    groupJid: request.groupJid,
+    waMessageId: "3EB0OWNER",
+    state: "processing",
+    lease: { token: leaseToken, expiresAt: new Date(Date.now() + (expired ? -1_000 : 60_000)) },
+    attempts: 1,
+    nextAttemptAt: null,
+    sendRequestId: null,
+    memoryBatchIds: [],
+    memoryFactIds: [],
+    failure: null,
+    createdAt: new Date(),
+    completedAt: null,
+    updatedAt: new Date(),
+  });
+  return runId;
+}
+
+function automaticInput(
+  runId: ObjectId,
+  leaseToken: string,
+  idempotencyKey: string,
+  replyToMessageId: string,
+  memoryBatchIds: ObjectId[],
+  memoryFactIds: ObjectId[],
+) {
+  return {
+    runId,
+    leaseToken,
+    organizationId: request.organizationId,
+    instanceId: request.instanceId,
+    groupJid: request.groupJid,
+    chatKind: "group" as const,
+    waMessageId: replyToMessageId,
+    text: request.text,
+    idempotencyKey,
+    replyToMessageId,
+    memoryBatchIds,
+    memoryFactIds,
+  };
+}
 
 describe("send request state machine", () => {
   test("creates one pending approval request per idempotency key", async () => {
@@ -99,15 +159,163 @@ describe("send request state machine", () => {
 
   test("creates one immediately approved automatic reply per inbound job", async () => {
     const db = await getDb();
-    const first = await createAutomaticSend(db, { ...request, idempotencyKey: "reply:job-001", replyToMessageId: "3EB0OWNER" });
-    const replay = await createAutomaticSend(db, { ...request, idempotencyKey: "reply:job-001", replyToMessageId: "3EB0OWNER" });
+    const runId = await seedRun("lease-a");
+    const batchId = new ObjectId();
+    const factId = new ObjectId();
+    const input = automaticInput(runId, "lease-a", "reply:job-001", "3EB0OWNER", [batchId], [factId]);
 
-    expect(first).toMatchObject({
+    const created = await createAutomaticSendUnderRunLease(db, input);
+
+    expect(created.kind).toBe("completed");
+    if (created.kind !== "completed") return;
+    expect(created.send).toMatchObject({
       status: "approved",
+      chatKind: "group",
       approval: { state: "approved", approvedBy: "owner" },
-      provenance: { source: "owner_mention", replyToMessageId: "3EB0OWNER" },
+      provenance: { source: "owner_mention", replyToMessageId: "3EB0OWNER", memoryBatchIds: [batchId], memoryFactIds: [factId] },
     });
-    expect(replay).toEqual(first);
+    const run = await db.collection(COLLECTIONS.agentReplyRuns).findOne<{ state: string; sendRequestId: ObjectId }>({ _id: runId });
+    const stored = await db.collection<{ _id: ObjectId }>(COLLECTIONS.sendRequests).findOne({ idempotencyKey: "reply:job-001" });
+    expect(run?.state).toBe("complete");
+    expect(run?.sendRequestId.equals(stored!._id)).toBe(true);
     expect(await db.collection(COLLECTIONS.sendRequests).countDocuments({})).toBe(1);
+  });
+
+  test("records the chat a send is addressed to, so a reply to the owner's own chat is not a group send", async () => {
+    const db = await getDb();
+    const runId = await seedRun("lease-dm");
+    const dmChatJid = "628990000001@s.whatsapp.net";
+    // The run is keyed by the chat it answers, which for a DM is the owner's own.
+    await db.collection(COLLECTIONS.agentReplyRuns).updateOne({ _id: runId }, { $set: { groupJid: dmChatJid } });
+
+    const created = await createAutomaticSendUnderRunLease(db, {
+      ...automaticInput(runId, "lease-dm", "reply:dm-001", "3EB0OWNER", [], []),
+      groupJid: dmChatJid,
+      chatKind: "user",
+    });
+
+    expect(created).toMatchObject({ kind: "completed", send: { chatKind: "user", groupJid: dmChatJid } });
+    const stored = await db.collection<{ chatKind: string }>(COLLECTIONS.sendRequests).findOne({ idempotencyKey: "reply:dm-001" });
+    expect(stored?.chatKind).toBe("user");
+  });
+
+  test("an expired former holder creates no send and a reclaimed run creates exactly one", async () => {
+    const db = await getDb();
+    const runId = await seedRun("expired-holder", true);
+
+    // The expired lease matches nothing: no send is created by the stale holder.
+    const stale = await createAutomaticSendUnderRunLease(db, automaticInput(runId, "expired-holder", "reply:job-002", "3EB0OWNER", [], []));
+    expect(stale).toEqual({ kind: "lost_lease" });
+    expect(await db.collection(COLLECTIONS.sendRequests).countDocuments({})).toBe(0);
+
+    // A new holder reclaims the same run row and produces the one send.
+    await db
+      .collection(COLLECTIONS.agentReplyRuns)
+      .updateOne({ _id: runId }, { $set: { lease: { token: "reclaimer", expiresAt: new Date(Date.now() + 60_000) } } });
+    const created = await createAutomaticSendUnderRunLease(db, automaticInput(runId, "reclaimer", "reply:job-002", "3EB0OWNER", [], []));
+    expect(created.kind).toBe("completed");
+
+    // Replaying the completed run cannot create a second send.
+    const replay = await createAutomaticSendUnderRunLease(db, automaticInput(runId, "reclaimer", "reply:job-002", "3EB0OWNER", [], []));
+    expect(replay).toEqual({ kind: "lost_lease" });
+    expect(await db.collection(COLLECTIONS.sendRequests).countDocuments({})).toBe(1);
+  });
+});
+
+/**
+ * Runs `run` with the agent-reply-run update of its first transaction attempt
+ * aborted by the driver's own transient label *after* that attempt's guarded
+ * write (which the abort rolls back). The driver then re-invokes the callback,
+ * and `advance` runs in between — so a test can move the clock without waiting
+ * for it, and observe what the *second* attempt actually reads.
+ */
+async function withRetriedAttempt<T>(advance: () => void, run: () => Promise<T>): Promise<T> {
+  const db = await getDb();
+  const namespace = `${db.databaseName}.${COLLECTIONS.agentReplyRuns}`;
+  const original = Collection.prototype.updateOne;
+  let poisoned = true;
+  const spy = vi.spyOn(Collection.prototype, "updateOne").mockImplementation(async function (this: Collection, ...args) {
+    const result = await original.call(this, ...args);
+    if (!poisoned || this.namespace !== namespace) return result;
+    poisoned = false;
+    advance();
+    const transient = new MongoRuntimeError("aborted first attempt");
+    transient.addErrorLabel("TransientTransactionError");
+    throw transient;
+  });
+  try {
+    return await run();
+  } finally {
+    spy.mockRestore();
+  }
+}
+
+/**
+ * A lease read once outside the transaction would be judged by the time of the
+ * attempt that was abandoned: a retry minutes later would still see it live and
+ * create a send its holder no longer owns. These two tests expire the lease
+ * between the attempts (deterministically, by moving only `Date`) and require
+ * the retry to refuse, which is exactly what re-deriving the clock per attempt
+ * buys. The automatic and human-review paths share the transactional boundary,
+ * so both are pinned.
+ */
+describe("send transactions derive their clock inside each attempt", () => {
+  test("refuses an automatic send when the lease expired before the retry", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const db = await getDb();
+      const runId = await seedRun("lease-retry");
+      const startedAt = new Date();
+      await db.collection(COLLECTIONS.agentReplyRuns).updateOne(
+        { _id: runId },
+        { $set: { lease: { token: "lease-retry", expiresAt: new Date(startedAt.getTime() + 30_000) } } },
+      );
+
+      const created = await withRetriedAttempt(
+        () => vi.setSystemTime(new Date(startedAt.getTime() + 60_000)),
+        () => createAutomaticSendUnderRunLease(db, automaticInput(runId, "lease-retry", "reply:job-retry-1", "3EB0OWNER", [], [])),
+      );
+
+      expect(created).toEqual({ kind: "lost_lease" });
+      expect(await db.collection(COLLECTIONS.sendRequests).countDocuments({})).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("refuses the human-review apology when the lease expired before the retry", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const db = await getDb();
+      const runId = await seedRun("lease-retry");
+      const startedAt = new Date();
+      await db.collection(COLLECTIONS.agentReplyRuns).updateOne(
+        { _id: runId },
+        { $set: { lease: { token: "lease-retry", expiresAt: new Date(startedAt.getTime() + 30_000) } } },
+      );
+
+      const created = await withRetriedAttempt(
+        () => vi.setSystemTime(new Date(startedAt.getTime() + 60_000)),
+        () =>
+          createHumanReviewSendUnderRunLease(db, {
+            runId,
+            leaseToken: "lease-retry",
+            organizationId: request.organizationId,
+            instanceId: request.instanceId,
+            groupJid: request.groupJid,
+            chatKind: "group",
+            waMessageId: "3EB0OWNER",
+            idempotencyKey: "reply:job-retry-2",
+            replyToMessageId: "3EB0OWNER",
+            reason: "unsafe_link",
+          }),
+      );
+
+      expect(created).toEqual({ kind: "lost_lease" });
+      expect(await db.collection(COLLECTIONS.sendRequests).countDocuments({})).toBe(0);
+      expect(await db.collection(COLLECTIONS.auditLog).countDocuments({ action: "reply.output.rejected" })).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

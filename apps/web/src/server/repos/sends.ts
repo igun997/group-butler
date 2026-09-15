@@ -1,21 +1,31 @@
 import { randomUUID } from "node:crypto";
-import type { Db } from "mongodb";
+import { ObjectId, type Db } from "mongodb";
 import { COLLECTIONS } from "../collections";
 import { writeAudit } from "./audit";
 
 export type SendStatus = "pending_approval" | "approved" | "scheduled" | "rejected" | "cancelled" | "sending" | "sent" | "failed";
+
+/**
+ * Which kind of chat a send addresses: `groupJid` carries the chat JID either
+ * way, and the dispatcher needs to know whether that JID names a group or an
+ * owner's own chat. Rows written before direct replies omit the field, and every
+ * one of those is a group send.
+ */
+export type ChatKind = "group" | "user";
 
 export interface SendRow {
   id: string;
   organizationId: string;
   instanceId: string;
   groupJid: string;
+  /** Absent means `"group"`: the only kind of send that existed before direct replies. */
+  chatKind?: ChatKind;
   text: string;
   idempotencyKey: string;
   status: SendStatus;
   scheduledFor: Date;
   approval: { state: "pending" | "approved" | "rejected"; approvedBy?: "owner"; approvedAt?: Date };
-  provenance?: { source: "owner_mention"; replyToMessageId: string };
+  provenance?: { source: "owner_mention"; replyToMessageId: string; memoryBatchIds?: ObjectId[]; memoryFactIds?: ObjectId[] };
   dispatch: { attempts: number; lockedAt: Date | null; lockedBy: string | null; waMessageId: string | null; errorClass: string | null };
   createdAt: Date;
   updatedAt: Date;
@@ -25,12 +35,31 @@ export type CreateSendInput = Pick<SendRow, "organizationId" | "instanceId" | "g
   actorIP: string;
 };
 
-export type CreateAutomaticSendInput = Pick<
-  SendRow,
-  "organizationId" | "instanceId" | "groupJid" | "text" | "idempotencyKey"
-> & {
+/**
+ * Everything the send transaction needs: the live reply-run lease that guards
+ * it, and the answer to persist. `runId`/`leaseToken` are the ownership proof —
+ * an expired former holder's token matches nothing and creates no send.
+ */
+export interface AutomaticSendUnderRunLeaseInput {
+  runId: ObjectId;
+  leaseToken: string;
+  organizationId: string;
+  instanceId: string;
+  groupJid: string;
+  /** The chat `groupJid` names, recorded so the dispatcher cannot mistake a DM for a group. */
+  chatKind: ChatKind;
+  waMessageId: string;
+  text: string;
+  idempotencyKey: string;
   replyToMessageId: string;
-};
+  memoryBatchIds: ObjectId[];
+  memoryFactIds: ObjectId[];
+}
+
+export type AutomaticSendUnderRunLeaseResult = { kind: "completed"; send: SendRow } | { kind: "lost_lease" };
+
+/** Thrown inside the transaction to abort it when the lease predicate fails. */
+class LostAgentReplyLease extends Error {}
 
 export type SendTransition = SendRow | { kind: "not_found" | "invalid_state" | "ambiguous" };
 
@@ -91,35 +120,86 @@ export async function createSend(db: Db, input: CreateSendInput): Promise<SendRo
   }
 }
 
-/** Creates a dispatcher-eligible send for a verified owner mention. Manual sends
- * retain the pending-approval path above; this function is deliberately the
- * only automatic-reply exception and records why it bypassed the dashboard. */
-export async function createAutomaticSend(db: Db, input: CreateAutomaticSendInput): Promise<SendRow> {
-  const now = new Date();
-  const candidate: SendRow = {
-    id: randomUUID(),
-    organizationId: input.organizationId,
-    instanceId: input.instanceId,
-    groupJid: input.groupJid,
-    text: input.text,
-    idempotencyKey: input.idempotencyKey,
-    status: "approved",
-    scheduledFor: now,
-    approval: { state: "approved", approvedBy: "owner", approvedAt: now },
-    provenance: { source: "owner_mention", replyToMessageId: input.replyToMessageId },
-    dispatch: { attempts: 0, lockedAt: null, lockedBy: null, waMessageId: null, errorClass: null },
-    createdAt: now,
-    updatedAt: now,
-  };
+/**
+ * Creates the dispatcher-eligible send for a verified owner mention inside the
+ * reply run's completion transaction. The live lease predicate is the first
+ * write, so an expired or reclaimed holder can never create a send; the send
+ * row itself is inserted already `approved` *with* its immutable memory
+ * provenance, so the dispatcher can never observe an approved send that has no
+ * provenance. Manual sends retain the pending-approval path above.
+ */
+export async function createAutomaticSendUnderRunLease(db: Db, input: AutomaticSendUnderRunLeaseInput): Promise<AutomaticSendUnderRunLeaseResult> {
+  const sendId = new ObjectId();
   const session = db.client.startSession();
   try {
     await session.withTransaction(async () => {
-      const result = await db.collection<SendRow>(COLLECTIONS.sendRequests).updateOne(
-        { organizationId: input.organizationId, idempotencyKey: input.idempotencyKey },
-        { $setOnInsert: candidate },
+      // The clock the lease is checked against and the timestamps the row is
+      // written with both come from inside the attempt: a transaction retried
+      // after a write conflict must not judge an expired lease with the time of
+      // the attempt that was abandoned, nor stamp the send with a stale one.
+      const now = new Date();
+      const candidate: SendRow = {
+        id: randomUUID(),
+        organizationId: input.organizationId,
+        instanceId: input.instanceId,
+        groupJid: input.groupJid,
+        chatKind: input.chatKind,
+        text: input.text,
+        idempotencyKey: input.idempotencyKey,
+        status: "approved",
+        scheduledFor: now,
+        approval: { state: "approved", approvedBy: "owner", approvedAt: now },
+        provenance: {
+          source: "owner_mention",
+          replyToMessageId: input.replyToMessageId,
+          memoryBatchIds: input.memoryBatchIds,
+          memoryFactIds: input.memoryFactIds,
+        },
+        dispatch: { attempts: 0, lockedAt: null, lockedBy: null, waMessageId: null, errorClass: null },
+        createdAt: now,
+        updatedAt: now,
+      };
+      const guarded = await db.collection(COLLECTIONS.agentReplyRuns).updateOne(
+        {
+          _id: input.runId,
+          organizationId: input.organizationId,
+          instanceId: input.instanceId,
+          groupJid: input.groupJid,
+          waMessageId: input.waMessageId,
+          state: "processing",
+          "lease.token": input.leaseToken,
+          "lease.expiresAt": { $gt: now },
+        },
+        {
+          $set: {
+            state: "complete",
+            sendRequestId: sendId,
+            memoryBatchIds: input.memoryBatchIds,
+            memoryFactIds: input.memoryFactIds,
+            completedAt: now,
+            updatedAt: now,
+            lease: null,
+            nextAttemptAt: null,
+          },
+        },
+        { session },
+      );
+      if (guarded.matchedCount !== 1) throw new LostAgentReplyLease();
+
+      const upserted = await db.collection<SendRow>(COLLECTIONS.sendRequests).updateOne(
+        {
+          organizationId: input.organizationId,
+          instanceId: input.instanceId,
+          groupJid: input.groupJid,
+          idempotencyKey: input.idempotencyKey,
+        },
+        { $setOnInsert: { _id: sendId, ...candidate } },
         { upsert: true, session },
       );
-      if (result.upsertedCount !== 1) return;
+      // A send for this job already exists, so this attempt cannot be its
+      // author: abort the whole transaction and let the caller reconcile the
+      // run against the existing send rather than create a second one.
+      if (upserted.upsertedCount !== 1) throw new Error("automatic send already exists for this job");
       await writeAudit(
         db,
         {
@@ -135,9 +215,163 @@ export async function createAutomaticSend(db: Db, input: CreateAutomaticSendInpu
     });
     const stored = await db
       .collection<SendRow>(COLLECTIONS.sendRequests)
-      .findOne({ organizationId: input.organizationId, idempotencyKey: input.idempotencyKey }, { projection: sendProjection });
-    if (stored === null) throw new Error("created automatic send request was not found");
-    return stored;
+      .findOne(
+        {
+          organizationId: input.organizationId,
+          instanceId: input.instanceId,
+          groupJid: input.groupJid,
+          idempotencyKey: input.idempotencyKey,
+        },
+        { projection: sendProjection },
+      );
+    if (stored === null) throw new Error("completed automatic send was not found");
+    return { kind: "completed", send: stored };
+  } catch (error) {
+    if (error instanceof LostAgentReplyLease) return { kind: "lost_lease" };
+    throw error;
+  } finally {
+    await session.endSession();
+  }
+}
+
+/**
+ * The only text a sanitizer-rejected reply may ever queue: fixed, server-authored,
+ * and short. The model's rejected output is not carried here — the input below
+ * has no text field to hold it — so nothing the gate refused can reach the send
+ * table through this path.
+ */
+export const HUMAN_REVIEW_APOLOGY =
+  "I could not safely draft a reply to that message, so it is waiting for a human to review before anything is sent.";
+
+/**
+ * A sanitizer-rejected automatic reply. The rejected model output created no
+ * send; instead the run is closed and, inside the *same* run-lease transaction,
+ * a fixed apology is queued in `pending_approval` — the one state the dispatcher
+ * can never claim — together with the `reply.output.rejected` audit row. A stale
+ * or reclaimed holder matches no lease and creates neither, so the transactional
+ * send boundary is exactly the one the automatic path uses; the only difference
+ * is that this row is never auto-approved.
+ *
+ * The `idempotencyKey` is the job's own, so a retried callback reconciles this
+ * send (rather than a second one) and never calls the model again.
+ */
+export interface HumanReviewSendUnderRunLeaseInput {
+  runId: ObjectId;
+  leaseToken: string;
+  organizationId: string;
+  instanceId: string;
+  groupJid: string;
+  /** The chat `groupJid` names, as on the automatic path. */
+  chatKind: ChatKind;
+  waMessageId: string;
+  idempotencyKey: string;
+  replyToMessageId: string;
+  /** The sanitizer's refusal code, recorded for reconciliation. */
+  reason: string;
+}
+
+export async function createHumanReviewSendUnderRunLease(
+  db: Db,
+  input: HumanReviewSendUnderRunLeaseInput,
+): Promise<AutomaticSendUnderRunLeaseResult> {
+  const sendId = new ObjectId();
+  const session = db.client.startSession();
+  try {
+    await session.withTransaction(async () => {
+      // As on the automatic path, the lease check and the row's timestamps are
+      // derived inside the attempt so a retry cannot judge the lease — or stamp
+      // the apology — with the clock of the abandoned one.
+      const now = new Date();
+      const candidate: SendRow = {
+        id: randomUUID(),
+        organizationId: input.organizationId,
+        instanceId: input.instanceId,
+        groupJid: input.groupJid,
+        chatKind: input.chatKind,
+        text: HUMAN_REVIEW_APOLOGY,
+        idempotencyKey: input.idempotencyKey,
+        status: "pending_approval",
+        scheduledFor: now,
+        approval: { state: "pending" },
+        provenance: { source: "owner_mention", replyToMessageId: input.replyToMessageId, memoryBatchIds: [], memoryFactIds: [] },
+        dispatch: { attempts: 0, lockedAt: null, lockedBy: null, waMessageId: null, errorClass: null },
+        createdAt: now,
+        updatedAt: now,
+      };
+      const guarded = await db.collection(COLLECTIONS.agentReplyRuns).updateOne(
+        {
+          _id: input.runId,
+          organizationId: input.organizationId,
+          instanceId: input.instanceId,
+          groupJid: input.groupJid,
+          waMessageId: input.waMessageId,
+          state: "processing",
+          "lease.token": input.leaseToken,
+          "lease.expiresAt": { $gt: now },
+        },
+        {
+          $set: {
+            state: "complete",
+            sendRequestId: sendId,
+            memoryBatchIds: [],
+            memoryFactIds: [],
+            completedAt: now,
+            updatedAt: now,
+            lease: null,
+            nextAttemptAt: null,
+          },
+        },
+        { session },
+      );
+      if (guarded.matchedCount !== 1) throw new LostAgentReplyLease();
+
+      const upserted = await db.collection<SendRow>(COLLECTIONS.sendRequests).updateOne(
+        {
+          organizationId: input.organizationId,
+          instanceId: input.instanceId,
+          groupJid: input.groupJid,
+          idempotencyKey: input.idempotencyKey,
+        },
+        { $setOnInsert: { _id: sendId, ...candidate } },
+        { upsert: true, session },
+      );
+      // A send for this job already exists, so this attempt cannot be its author:
+      // abort and let the caller reconcile against the existing row.
+      if (upserted.upsertedCount !== 1) throw new Error("automatic send already exists for this job");
+      await writeAudit(
+        db,
+        {
+          organizationId: input.organizationId,
+          actor: "worker",
+          action: "reply.output.rejected",
+          target: { type: "send", id: candidate.id },
+          meta: {
+            instanceId: input.instanceId,
+            groupJid: input.groupJid,
+            replyToMessageId: input.replyToMessageId,
+            reason: input.reason,
+          },
+          ip: "worker",
+        },
+        session,
+      );
+    });
+    const stored = await db
+      .collection<SendRow>(COLLECTIONS.sendRequests)
+      .findOne(
+        {
+          organizationId: input.organizationId,
+          instanceId: input.instanceId,
+          groupJid: input.groupJid,
+          idempotencyKey: input.idempotencyKey,
+        },
+        { projection: sendProjection },
+      );
+    if (stored === null) throw new Error("completed human-review send was not found");
+    return { kind: "completed", send: stored };
+  } catch (error) {
+    if (error instanceof LostAgentReplyLease) return { kind: "lost_lease" };
+    throw error;
   } finally {
     await session.endSession();
   }

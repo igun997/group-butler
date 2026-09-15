@@ -56,6 +56,7 @@ describe("bootstrap", () => {
     expect(await indexNames(db, "messages")).toEqual([
       "group_stream",
       "media_status",
+      "memory_batch_scan",
       "messages_group_stream",
       "messages_stream",
       "messages_text",
@@ -97,6 +98,40 @@ describe("bootstrap", () => {
       organizationId: 1,
       textSearch: 1,
     });
+    await client.close();
+  });
+
+  test("creates memory indexes with their tenant-scoped identity guarantees", async () => {
+    const { client, db } = await connectForTest(uri, "butler_memory_indexes_test");
+    await createIndexes(db);
+
+    expect(await indexNames(db, "memoryBatches")).toEqual([
+      "memory_batch_claim",
+      "memory_batch_group_history",
+      "uniq_memory_batch_predecessor",
+      "uniq_memory_batch_range",
+    ]);
+    const predecessor = (await db.collection("memoryBatches").indexes()).find((index) => index.name === "uniq_memory_batch_predecessor");
+    expect(predecessor).toMatchObject({
+      key: { organizationId: 1, instanceId: 1, groupJid: 1, predecessor: 1 },
+      unique: true,
+      partialFilterExpression: { predecessor: { $exists: true } },
+    });
+    expect(await indexNames(db, "memorySummaries")).toEqual([
+      "memory_summary_recent",
+      "memory_summary_text",
+      "uniq_memory_summary_batch",
+    ]);
+    expect(await indexNames(db, "memoryFacts")).toEqual([
+      "memory_fact_recent",
+      "memory_fact_summary",
+      "memory_fact_text",
+      "uniq_memory_fact_in_batch",
+    ]);
+    expect(await indexNames(db, "agentReplyRuns")).toEqual([
+      "agent_reply_recovery",
+      "uniq_agent_reply_source",
+    ]);
     await client.close();
   });
 

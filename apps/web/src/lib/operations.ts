@@ -7,22 +7,10 @@
  * so a client bundle that reaches this module pulls in no server code, and the
  * sections and their tests render without a Mongo or a worker.
  */
+import { formatCount, formatPercent } from "@/lib/format";
 import type { Loaded, LoopReport, UsageCounters, UsageDay, UsageInstance, UsageTokens } from "@/server/console";
 
 export type { Loaded, LoopReport, UsageCounters, UsageDay, UsageInstance, UsageTokens };
-
-const COUNT = new Intl.NumberFormat("en-US");
-const PERCENT = new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 });
-
-/** Counts are grouped so 1204 reads as 1,204 at a glance. */
-export function formatCount(value: number): string {
-  return COUNT.format(value);
-}
-
-export function formatPercent(part: number, whole: number): string {
-  if (!(whole > 0)) return "not available";
-  return `${PERCENT.format((part / whole) * 100)}%`;
-}
 
 /**
  * A loop's cadence in the largest unit that divides it exactly, so the page says

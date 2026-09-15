@@ -14,19 +14,30 @@ import { writeAudit, type AuditEntry } from "./audit";
  * `config.*` fields — the media caps, the per-instance token budget,
  * `assignedGroupJids` — have no reader yet, and a write path for a field nothing
  * consumes is a control that cannot do anything. Each arrives with the surface
- * that consumes it (settings owns the budget, the groups workspace owns
- * assignment), which is why the patch below is strict about its one field rather
- * than quietly accepting six.
+ * that consumes it (settings owns the budget), which is why the patch below is
+ * strict about its one field rather than quietly accepting six. Assignment is
+ * the exception, and it is served rather than added: nothing writes
+ * `config.assignedGroupJids`, so a grant on this list is what assigns the group
+ * (see below).
  *
- * **One whitelist, two documents.** §5.1 says `groups.config.whitelisted` is
- * "written only by the whitelist mutation endpoint, in the same updateOne batch
- * that rewrites `instances.config.groupJidWhitelist`", and §7.2 makes the
- * instance's list the security-relevant one. So the list is authoritative and
- * the rows are its mirror, and both writers keep the pair in step: the editor
- * writes the list and mirrors down (atomically, below), and the groups
- * workspace's per-row toggle moves the list with the row (`setGroupWhitelisted`,
- * which adds or removes the one JID rather than recomputing). Without the second
- * path, un-whitelisting a group in `groups` would leave the assistant reading it.
+ * **One whitelist, two documents, two flags.** §5.1 says
+ * `groups.config.whitelisted` is "written only by the whitelist mutation
+ * endpoint, in the same updateOne batch that rewrites
+ * `instances.config.groupJidWhitelist`", and §7.2 makes the instance's list the
+ * security-relevant one. So the list is authoritative and the rows are its
+ * mirror, and both writers keep the pair in step: the editor writes the list and
+ * mirrors down (atomically, below), and the groups workspace's per-row toggle
+ * moves the list with the row (`moveGroupWhitelistJid`, which adds or removes
+ * the one JID rather than recomputing). Without the second path,
+ * un-whitelisting a group in `groups` would leave the assistant reading it.
+ *
+ * The mirror maintains `groups.config.assigned` alongside `whitelisted`, both
+ * moving the same way, because this list is the only scope control the operator
+ * has. Assignment has no surface of its own in this build, and every reader of a
+ * group's eligibility asks for both flags — the worker's ingest gate, the reply
+ * route, the memory-batch builder and the MCP group tools. A row carrying only
+ * one of the pair would be a group the operator granted that nothing ever reads,
+ * which is indistinguishable from not having granted it at all.
  */
 
 /** One instance's configuration, as the dashboard reads and writes it. */
@@ -67,7 +78,7 @@ type GroupDoc = {
   organizationId: string;
   instanceId: string;
   groupJid: string;
-  config?: { whitelisted?: boolean; assigned?: boolean };
+  config?: { whitelisted?: boolean; assigned?: boolean; configVersion?: number };
 };
 
 /**
@@ -126,6 +137,12 @@ async function unknownGroups(
  * transaction: the list, the rows, and the audit row that records the change
  * either all land or none do.
  *
+ * A granted row is marked `whitelisted` *and* `assigned`, and a row the operator
+ * left out of the list loses both: the list is this build's only scope control,
+ * and every reader of a group's eligibility — the worker's ingest gate, the
+ * reply route, the memory batch, the MCP group tools — asks for the two flags
+ * together.
+ *
  * The mirror clears before it sets, so a transaction that is cut short (a
  * transient error a retry has not yet absorbed, a deployment that cannot run
  * transactions at all) can only ever leave the assistant reading *less* than the
@@ -166,13 +183,23 @@ export async function updateInstanceConfig(
         { session },
       );
       await groups.updateMany(
-        { organizationId, instanceId, groupJid: { $nin: after } },
-        { $set: { "config.whitelisted": false } },
+        {
+          organizationId,
+          instanceId,
+          groupJid: { $nin: after },
+          $or: [{ "config.whitelisted": { $ne: false } }, { "config.assigned": { $ne: false } }],
+        },
+        { $set: { "config.whitelisted": false, "config.assigned": false }, $inc: { "config.configVersion": 1 } },
         { session },
       );
       await groups.updateMany(
-        { organizationId, instanceId, groupJid: { $in: after } },
-        { $set: { "config.whitelisted": true } },
+        {
+          organizationId,
+          instanceId,
+          groupJid: { $in: after },
+          $or: [{ "config.whitelisted": { $ne: true } }, { "config.assigned": { $ne: true } }],
+        },
+        { $set: { "config.whitelisted": true, "config.assigned": true }, $inc: { "config.configVersion": 1 } },
         { session },
       );
       await writeAudit(db, entry, session);

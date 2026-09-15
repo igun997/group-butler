@@ -10,8 +10,12 @@ const POLL_MS = 2_000;
 
 /**
  * Keeps one instance's snapshot current while it is pairing, and stops the
- * moment it is not: the worker owns the lifecycle, so the console re-reads it
+ * moment it is not: the worker owns the lifecycle, so the console asks it again
  * rather than waiting for a change stream that does not carry pairing material.
+ *
+ * Asking again is a `POST /check`, not a re-read: the worker verifies the live
+ * socket and reconnects when the credential is still valid, so a poll can turn a
+ * stale snapshot into the real one. The same call is what "Check now" runs.
  *
  * The last good snapshot stays on screen if a single poll fails. Pairing is a
  * minutes-long step watched by an operator, and blanking the screen because one
@@ -30,7 +34,7 @@ export function PairingLive({ instanceId, initial }: { instanceId: string; initi
     inFlight.current = true;
     setChecking(true);
     try {
-      const response = await fetch(`/api/instances/${instanceId}`, { cache: "no-store" });
+      const response = await fetch(`/api/instances/${instanceId}/check`, { method: "POST" });
       if (response.ok) {
         setSnapshot((await response.json()) as InstanceSnapshot);
         setFailure(null);
@@ -72,6 +76,27 @@ export function PairingLive({ instanceId, initial }: { instanceId: string; initi
     }
   }, [instanceId]);
 
+  // The worker answers this one with the snapshot the new pairing attempt is in,
+  // so the panel switches to the scan or waiting stage from the same shape it
+  // was already polling.
+  const pairAgain = useCallback(async () => {
+    setChecking(true);
+    try {
+      const response = await fetch(`/api/instances/${instanceId}/pair`, { method: "POST" });
+      if (response.ok) {
+        setSnapshot((await response.json()) as InstanceSnapshot);
+        setFailure(null);
+      } else {
+        const body: { error?: string } = await response.json().catch(() => ({}));
+        setFailure(body.error ?? `The worker refused the request (${response.status}).`);
+      }
+    } catch {
+      setFailure("The worker could not be reached.");
+    } finally {
+      setChecking(false);
+    }
+  }, [instanceId]);
+
   return (
     <div className="flex flex-col gap-2">
       <PairingPanel
@@ -80,6 +105,7 @@ export function PairingLive({ instanceId, initial }: { instanceId: string; initi
         checking={checking}
         onCheckNow={check}
         onRequestCode={snapshot.mode === "code" ? requestCode : undefined}
+        onPairAgain={pairAgain}
       />
       {failure ? (
         <p role="alert" className="rounded-xl border border-warning/30 bg-warning/10 px-3 py-2 text-sm text-warning">

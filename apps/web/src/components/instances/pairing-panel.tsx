@@ -26,7 +26,7 @@ function PanelHeading({ children }: { children: ReactNode }) {
  * The panel holds no state and invents no facts: a QR is the worker's data URL
  * rendered as it arrived, a code is the worker's string, and a stopped stage
  * shows the reason with no payload left on screen. `polling`, `checking` and the
- * two actions are the caller's, because it owns the request that drives them.
+ * actions are the caller's, because it owns the requests that drive them.
  */
 export function PairingPanel({
   stage,
@@ -34,12 +34,14 @@ export function PairingPanel({
   checking = false,
   onCheckNow,
   onRequestCode,
+  onPairAgain,
 }: {
   stage: PairingStage;
   polling?: boolean;
   checking?: boolean;
   onCheckNow?: () => void;
   onRequestCode?: () => void;
+  onPairAgain?: () => void;
 }) {
   const checkingLine = polling ? (
     <p className="mt-4 flex items-center gap-2 text-xs text-muted-foreground">
@@ -58,6 +60,16 @@ export function PairingPanel({
   const requestCode = onRequestCode ? (
     <Button type="button" variant="outline" size="sm" onClick={onRequestCode} className="max-md:h-11">
       Send a pairing code
+    </Button>
+  ) : null;
+
+  // A stopped instance is the one the operator has to repair by hand, so it is
+  // the only stage that offers pairing again. The request is the caller's; this
+  // only renders the button it handed over.
+  const pairAgain = onPairAgain ? (
+    <Button type="button" variant="outline" size="sm" disabled={checking} onClick={onPairAgain} className="max-md:h-11">
+      {checking ? <Spinner /> : null}
+      Pair again
     </Button>
   ) : null;
 
@@ -142,6 +154,7 @@ export function PairingPanel({
             {stage.reason}
           </p>
           {requestCode}
+          {pairAgain}
           {checkNow}
         </div>
       ) : null}

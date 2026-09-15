@@ -11,16 +11,28 @@ export type AuthAuditReason = "invalid_credentials" | "malformed_request" | "rat
  * routes; `instance.whitelist.updated` is written by both whitelist writers
  * (§7.2 step 5: "a whitelist edit writes an `auditLog` row with before/after"),
  * which is why the two surfaces that can change AI scope share one action name.
+ * `action.*` is the destructive-maintenance queue: the stage, the owner's
+ * decision on it, and the execution — `action.execution_attempted` is written
+ * before the WhatsApp call and one of `action.executed`/`action.execution_failed`
+ * after it, so every attempt has an outcome and every outcome an attempt.
  */
 export type AuditAction =
   | AuthAuditAction
   | "instance.whitelist.updated"
+  | "media.tool.read"
+  | "reply.output.rejected"
   | "send.created"
   | "send.approved"
   | "send.rejected"
-  | "send.cancelled";
+  | "send.cancelled"
+  | "action.staged"
+  | "action.approved"
+  | "action.rejected"
+  | "action.execution_attempted"
+  | "action.executed"
+  | "action.execution_failed";
 
-export type AuditTargetType = "owner" | "instance" | "group" | "send";
+export type AuditTargetType = "owner" | "instance" | "group" | "message" | "send" | "action";
 
 export interface AuthAuditEvent {
   organizationId: string;

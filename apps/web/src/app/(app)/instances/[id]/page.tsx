@@ -6,12 +6,15 @@ import { PairingLive } from "@/components/instances/pairing-live";
 import { RemoveInstance } from "@/components/instances/remove-instance";
 import { ScopeForm } from "@/components/instances/scope-form";
 import { SyncGroups } from "@/components/instances/sync-groups";
+import { OwnerWhitelistForm } from "@/components/instances/owner-whitelist-form";
 import { InstanceStatusBadge } from "@/components/shell/status-badge";
 import { formatStamp } from "@/lib/instances";
 import { requireOwner } from "@/server/auth/require";
 import { getDb } from "@/server/mongo";
+import { COLLECTIONS } from "@/server/collections";
 import { readInstanceConfig } from "@/server/repos/instance-config";
 import { getInstanceRuntime, instanceInOrg } from "@/server/repos/instances";
+import { authorizedJidsOf } from "@/server/authorized-jids";
 import { instanceLabel, listInstanceGroups } from "@/server/repos/groups";
 import { getWorkerInstance } from "@/server/worker/client";
 
@@ -51,12 +54,16 @@ export default async function InstancePage({ params }: { params: Promise<{ id: s
   if (!(await ownsInstance(owner.organizationId, id))) notFound();
   const db = await getDb();
 
-  const [label, runtime, config, groups, live] = await Promise.all([
+  const [label, runtime, config, groups, live, organization] = await Promise.all([
     instanceLabel(db, owner.organizationId, id),
     getInstanceRuntime(db, owner.organizationId, id),
     readInstanceConfig(db, owner.organizationId, id),
     listInstanceGroups(db, owner.organizationId, id),
     getWorkerInstance(id),
+    db.collection<{ config?: { autoReplyAuthorizedJids?: unknown } }>(COLLECTIONS.organizations).findOne(
+      { _id: owner.organizationId as never },
+      { projection: { _id: 0, "config.autoReplyAuthorizedJids": 1 } },
+    ),
   ]);
 
   const groupSync = runtime?.groupSync ?? { groupsObserved: 0, groupsLeft: 0, lastSyncAt: null, lastError: null };
@@ -101,6 +108,7 @@ export default async function InstancePage({ params }: { params: Promise<{ id: s
         groups={groups.map((group) => ({ jid: group.groupJid, name: group.name }))}
         whitelisted={config?.groupJidWhitelist ?? []}
       />
+      <OwnerWhitelistForm authorizedJids={authorizedJidsOf(organization?.config?.autoReplyAuthorizedJids)} />
 
       <section className="rounded-xl border border-border p-4">
         <h2 className="text-sm font-medium">Groups observed</h2>

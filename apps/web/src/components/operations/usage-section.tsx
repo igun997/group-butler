@@ -4,7 +4,8 @@ import { FailureNotice } from "@/components/shell/failure-notice";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { Item, ItemDescription, ItemHeader, ItemTitle } from "@/components/ui/item";
 import { cn } from "@/lib/utils";
-import { aiTotals, formatCount, type Loaded, type UsageDay, type UsageInstance } from "@/lib/operations";
+import { formatCount } from "@/lib/format";
+import { aiTotals, type Loaded, type UsageDay, type UsageInstance } from "@/lib/operations";
 
 /**
  * What this organisation has used today, per instance, for the current UTC day.

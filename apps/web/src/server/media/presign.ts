@@ -1,4 +1,4 @@
-import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { GetObjectCommand, S3Client, type GetObjectCommandOutput } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 /**
@@ -115,4 +115,56 @@ export async function presignMediaUrl(key: string, organizationId: string): Prom
     { expiresIn: config.ttlSeconds },
   );
   return { url, expiresInSeconds: config.ttlSeconds };
+}
+
+/**
+ * Reads one stored object's bytes under the same organisation-prefix boundary
+ * and the same validated client as a presign, with no URL in between: the agent
+ * media tools must never receive a key, a URL, or a path to fetch themselves.
+ *
+ * `maxBytes` is the reading tool's own source cap. The declared length is
+ * checked before the body is buffered and the stream is abandoned the moment it
+ * exceeds the cap, so an oversized or hostile object cannot make the BFF
+ * allocate without limit.
+ *
+ * `null` covers every way there is nothing to read — absent, empty, oversized,
+ * or a failed fetch. The media tools answer one unavailable code for all of
+ * them, so a probe cannot tell cross-tenant existence from a missing MIME.
+ */
+export async function readMediaObject(
+  key: string,
+  organizationId: string,
+  maxBytes: number,
+): Promise<Uint8Array | null> {
+  if (!key.startsWith(`org/${organizationId}/`)) throw new ForeignMediaKeyError();
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) throw new RangeError("maxBytes must be a positive integer");
+  const config = r2Config();
+  let output: GetObjectCommandOutput;
+  try {
+    output = await getClient(config).send(new GetObjectCommand({ Bucket: config.bucket, Key: key }));
+  } catch {
+    return null;
+  }
+  if (!output.Body) return null;
+  // The Node client always answers with a readable stream; the Blob arm of the
+  // SDK's union exists for the browser bundle this server never builds.
+  const body = output.Body as unknown as AsyncIterable<Uint8Array> & { destroy: () => void };
+  if (output.ContentLength !== undefined && output.ContentLength > maxBytes) {
+    body.destroy();
+    return null;
+  }
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for await (const chunk of body) {
+      total += chunk.byteLength;
+      if (total > maxBytes) return null;
+      chunks.push(chunk);
+    }
+  } catch {
+    return null;
+  } finally {
+    body.destroy();
+  }
+  return total === 0 ? null : Buffer.concat(chunks);
 }

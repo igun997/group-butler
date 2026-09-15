@@ -79,6 +79,34 @@ describe("pairing panel", () => {
     expect(idle).toContain("Send a pairing code");
   });
 
+  test("re-pairing is offered on a stopped stage, in either tone, and nowhere else", () => {
+    const failure = renderToStaticMarkup(
+      <PairingPanel
+        stage={{ kind: "stopped", tone: "failure", reason: "This device was unlinked from the phone." }}
+        onPairAgain={() => {}}
+        onCheckNow={() => {}}
+      />,
+    );
+    expect(failure).toContain("Pair again");
+
+    const idle = renderToStaticMarkup(
+      <PairingPanel
+        stage={{ kind: "stopped", tone: "idle", reason: "This account is not linked right now." }}
+        onPairAgain={() => {}}
+      />,
+    );
+    expect(idle).toContain("Pair again");
+
+    // A stopped stage with no caller-supplied action leaves only the reason.
+    const bare = renderToStaticMarkup(
+      <PairingPanel stage={{ kind: "stopped", tone: "idle", reason: "This account is not linked right now." }} />,
+    );
+    expect(bare).not.toContain("Pair again");
+
+    const linked = renderToStaticMarkup(<PairingPanel stage={connected} onPairAgain={() => {}} />);
+    expect(linked).not.toContain("Pair again");
+  });
+
   test("checking disables the control so a second request cannot overlap", () => {
     const html = renderToStaticMarkup(<PairingPanel stage={{ kind: "waiting" }} polling onCheckNow={() => {}} checking />);
 

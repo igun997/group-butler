@@ -82,7 +82,7 @@ type GroupDoc = {
     messageCount?: number;
     members?: GroupMemberRow[];
   };
-  config?: { assigned?: boolean; whitelisted?: boolean };
+  config?: { assigned?: boolean; whitelisted?: boolean; configVersion?: number };
 };
 
 type InstanceDoc = {
@@ -250,6 +250,13 @@ async function instanceLabels(db: Db, organizationId: string): Promise<Record<st
  */
 export interface GroupConfigPatch {
   assigned?: boolean;
+  /**
+   * The assistant's scope (§7.2). A grant here assigns the group with it, and
+   * removing it clears the assignment too: the pair is what the worker's ingest
+   * gate, the reply route and the memory batch read together, and this build
+   * gives the operator no separate assignment control. `whitelisted` is
+   * therefore also the answer when a patch names both flags.
+   */
   whitelisted?: boolean;
   /**
    * Disambiguates a JID that exists on more than one instance of the
@@ -268,7 +275,7 @@ export type GroupConfigUpdate = { kind: "updated"; group: GroupRow } | { kind: "
  * Writes `assigned`/`whitelisted` on one group of one organisation, as one
  * transaction.
  *
- * Two properties are the reason this is one operation rather than a write the
+ * Three properties are the reason this is one operation rather than a write the
  * caller completes. **The target is resolved before anything is written**: the
  * group JID is the addressing key, a JID can legitimately exist under two
  * instances (the same group joined by two linked accounts), and an unqualified
@@ -279,7 +286,11 @@ export type GroupConfigUpdate = { kind: "updated"; group: GroupRow } | { kind: "
  * the assistant's actual scope, so the row, the list and the `auditLog` row that
  * records the move commit together or not at all. A failure leaves the scope
  * exactly as it was and unaudited rather than half-changed, which is what the
- * route reports.
+ * route reports. **A whitelist grant is the assignment too**: `assigned` has no
+ * control of its own in this build, and every reader of a group's eligibility —
+ * the worker's ingest gate, the reply route, the memory-batch builder — asks for
+ * `assigned` and `whitelisted` together, so the whitelist moves the pair and a
+ * row is never left granted but unreadable.
  */
 export async function updateGroupConfig(
   db: Db,
@@ -291,7 +302,13 @@ export async function updateGroupConfig(
   const groups = db.collection<GroupDoc>(COLLECTIONS.groups);
   const changes: Record<string, boolean> = {};
   if (patch.assigned !== undefined) changes["config.assigned"] = patch.assigned;
-  if (patch.whitelisted !== undefined) changes["config.whitelisted"] = patch.whitelisted;
+  if (patch.whitelisted !== undefined) {
+    changes["config.whitelisted"] = patch.whitelisted;
+    // The whitelist wins over an `assigned` in the same patch, because it is the
+    // only scope control this build gives the operator: a grant assigns the
+    // group, and losing the whitelist clears the assignment with it.
+    changes["config.assigned"] = patch.whitelisted;
+  }
 
   let outcome: GroupConfigUpdate = { kind: "not_found" };
   const session = db.client.startSession();
@@ -300,7 +317,7 @@ export async function updateGroupConfig(
       const matched = await groups
         .find(
           { organizationId, groupJid, ...(patch.instanceId === undefined ? {} : { instanceId: patch.instanceId }) },
-          { projection: { instanceId: 1 }, session },
+          { projection: { instanceId: 1, config: 1 }, session },
         )
         .toArray();
       if (matched.length === 0) {
@@ -319,9 +336,17 @@ export async function updateGroupConfig(
         return;
       }
 
+      const current = matched[0];
+      const storedConfig = current?.config;
+      const eligibilityChanged =
+        (changes["config.assigned"] !== undefined && changes["config.assigned"] !== storedConfig?.assigned) ||
+        (changes["config.whitelisted"] !== undefined &&
+          changes["config.whitelisted"] !== storedConfig?.whitelisted);
       const updated = await groups.findOneAndUpdate(
         { organizationId, instanceId, groupJid },
-        { $set: changes },
+        eligibilityChanged
+          ? { $set: changes, $inc: { "config.configVersion": 1 } }
+          : { $set: changes },
         { returnDocument: "after", session },
       );
       if (!updated) {

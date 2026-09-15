@@ -2,6 +2,7 @@ import { checkHealth, type HealthReport } from "./health";
 import { getDb } from "./mongo";
 import { listInstances, type InstanceRow } from "./repos/instances";
 import { readUsage, type UsageDay } from "./repos/usage";
+import { readTokenTrend, type TokenTrend } from "./repos/tokens";
 import { getWorkerScheduler } from "./worker/client";
 import type { LoopReport } from "@butler/shared";
 
@@ -15,6 +16,7 @@ export type Loaded<T> = { ok: true; data: T } | { ok: false; error: string };
 /** The page renders these without reaching into the modules that produced them. */
 export type { LoopReport } from "@butler/shared";
 export type { UsageCounters, UsageDay, UsageInstance, UsageTokens } from "./repos/usage";
+export type { TokenDay, TokenTrend, TokenTrendInstance } from "./repos/tokens";
 
 /**
  * Fixed phrases only. The console never echoes a driver message or the worker's
@@ -61,6 +63,20 @@ export async function loadUsage(organizationId: string): Promise<Loaded<UsageDay
     return { ok: true, data: await readUsage(db, organizationId) };
   } catch {
     return { ok: false, error: "MongoDB did not answer, so today's usage could not be read." };
+  }
+}
+
+/**
+ * The assistant's token use over the last seven UTC days, per instance (§10), for
+ * the overview's trend charts. One aggregation over `aiCalls` feeds every chart,
+ * and a provider that reported nothing stays a gap rather than a zero.
+ */
+export async function loadTokens(organizationId: string): Promise<Loaded<TokenTrend>> {
+  try {
+    const db = await getDb();
+    return { ok: true, data: await readTokenTrend(db, organizationId) };
+  } catch {
+    return { ok: false, error: "MongoDB did not answer, so the token history could not be read." };
   }
 }
 
