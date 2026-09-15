@@ -189,13 +189,7 @@ for arg in "$@"; do
 done
 if [[ -z "$out" ]]; then echo "stub go: no -o target" >&2; exit 93; fi
 cat > "$out" <<'EOS'
-#!/usr/bin/env bash
-echo "$$" > "$STUB_STATE/worker.pid"
-echo "$PWD" > "$STUB_STATE/worker.cwd"
-trap 'echo stopped > "$STUB_STATE/worker.stopped"; exit 143' TERM INT
-echo "[worker] compiled worker started"
-while true; do sleep 0.2; done
-EOS
+${WORKER_BINARY}EOS
 chmod +x "$out"
 `,
   );
@@ -275,6 +269,20 @@ while true; do sleep 0.2; done
 `;
 
 /**
+ * The file `go build` produces, as this fixture's version of it: the worker child the
+ * launcher then runs. It has to be the real thing rather than a stub that exits — a
+ * launcher that runs an artifact and finds it already finished stops its sibling,
+ * which is correct behaviour and a race in a fixture.
+ */
+const WORKER_BINARY = `#!/usr/bin/env bash
+echo "$$" > "$STUB_STATE/worker.pid"
+echo "$PWD" > "$STUB_STATE/worker.cwd"
+trap 'echo stopped > "$STUB_STATE/worker.stopped"; exit 143' TERM INT
+echo "[worker] compiled worker started"
+while true; do sleep 0.2; done
+`;
+
+/**
  * What a previous run of this launcher leaves behind: the standalone server (the
  * artifact `next build` produces and the one this mode runs) and the compiled
  * worker. Both are what the next run looks for before deciding to build.
@@ -285,9 +293,9 @@ function leaveBuiltArtifacts(fx: Fixture, opts: { worker?: boolean } = {}): void
   writeFileSync(join(appDir, "server.js"), STANDALONE_SERVER);
   chmodSync(join(appDir, "server.js"), 0o755);
   if (opts.worker === false) return;
-  // An executable where the worker is compiled to; the launcher only checks that
-  // it is there and runs it.
-  writeFileSync(join(fx.dir, "apps", "worker", "whatsapp-worker"), "#!/usr/bin/env bash\ntrue\n");
+  // The compiled worker as the build leaves it: the launcher runs this, so a stub
+  // that exits at once would take the BFF down with it.
+  writeFileSync(join(fx.dir, "apps", "worker", "whatsapp-worker"), WORKER_BINARY);
   chmodSync(join(fx.dir, "apps", "worker", "whatsapp-worker"), 0o755);
 }
 
@@ -365,7 +373,7 @@ describe("production launcher: builds are kept", () => {
       // leave the launcher running past the fixture's own cleanup.
       await proc.exited;
     }
-  });
+  }, 30_000);
 
   test("--force rebuilds what is already there", async () => {
     const fx = makeFixture();
@@ -385,7 +393,7 @@ describe("production launcher: builds are kept", () => {
       // leave the launcher running past the fixture's own cleanup.
       await proc.exited;
     }
-  });
+  }, 30_000);
 
   // Each artifact is judged on its own, so a worker change does not pay for a
   // `next build` it does not need.
@@ -406,7 +414,7 @@ describe("production launcher: builds are kept", () => {
       // leave the launcher running past the fixture's own cleanup.
       await proc.exited;
     }
-  });
+  }, 30_000);
 });
 
 describe("production launcher: built, not interpreted", () => {
@@ -454,7 +462,7 @@ describe("production launcher: built, not interpreted", () => {
     await proc.exited;
     expect(readFileIfPresent(join(fx.state, "web.stopped"))).toBe("stopped\n");
     expect(readFileIfPresent(join(fx.state, "worker.stopped"))).toBe("stopped\n");
-  });
+  }, 30_000);
 
   // A stack that half-started around a failed build would serve whatever was built
   // last, which is the one thing a production run exists to rule out.

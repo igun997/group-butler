@@ -149,6 +149,7 @@ bun run test:worker                           # cd apps/worker && go test ./... 
 | `could not read …/.env` | a value with a `$` is unquoted — the password hash needs single quotes |
 | `OWNER_PASSWORD_HASH is empty` | `bun run prod` refuses the development plaintext password; run `bun run auth:hash` |
 | `/api/health` reports `worker: unreachable` | the worker is not running, or `WORKER_URL` points at loopback from inside a container |
+| A container shows **`unhealthy`**, or never appears when using the compose file | the image's healthcheck is `GET /api/health`, and that route is a dependency check: it answers 503 while MongoDB or the worker is unreachable, so the container reports unhealthy rather than failing. The compose file's `depends_on: service_healthy` then starts nothing. Read why with `docker inspect --format '{{json .State.Health.Log}}' <container>` |
 | `EADDRINUSE` on 3000 or 4000 | the development stack is still up; stop it before `bun run prod` |
 | `unauthorized` pulling `ghcr.io/…` | the client has no GHCR credential: log in as the user that runs docker (`sudo` uses root's config), or pull a tag that exists — a private package says `unauthorized` either way |
 | The console says a model call failed | `AI_*` is wrong, or the endpoint answered with an error envelope — the reply is retried once and then recorded as a provider fault |
