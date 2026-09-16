@@ -55,6 +55,23 @@ ENV NODE_ENV=production \
 RUN addgroup --system --gid 1001 nodejs \
  && adduser --system --uid 1001 nextjs
 
+# The binaries the media tools read bytes with, and they belong in the runtime
+# image rather than in the build: a missing one does not break the container, it
+# makes every attachment of that kind unreadable — `status=stored`,
+# `mime=image/jpeg`, and an owner told the bot cannot read their picture. The tool
+# path names them exactly: ImageMagick (`magick`/`convert`) for any image,
+# poppler's `pdftotext` for PDF text, `ffmpeg`/`ffprobe` for a video's frames.
+# `unzip` already ships with the base and reads DOCX and XLSX.
+#
+# This was missing, and the failure it caused is worth the paragraph: on a host
+# every one of these exists, so the same code read every image in development and
+# read none in the deployed image.
+RUN apk add --no-cache imagemagick poppler-utils ffmpeg \
+ # Imagick and poppler install what the tools call; the legacy `convert` name is
+ # what older deployments invoke, and alpine's v7 keeps it as a symlink only in
+ # the `imagemagick` package's own layout, so it is made explicit here.
+ && (command -v convert >/dev/null || ln -s "$(command -v magick)" /usr/local/bin/convert)
+
 COPY --from=builder --chown=nextjs:nodejs /app/apps/web/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/apps/web/.next/static ./apps/web/.next/static
 COPY --from=builder --chown=nextjs:nodejs /app/apps/web/public ./apps/web/public
