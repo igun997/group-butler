@@ -4,7 +4,7 @@ model:
   # This gateway funds an OpenRouter request out of a small credit balance, and
   # Hermes otherwise asks for 65536 output tokens -- a maximum cost the balance
   # cannot cover, so every call is refused with 402 before a token is generated.
-  max_tokens: 4096
+  max_tokens: __AI_MAX_TOKENS__
 providers:
   main:
     api: __AI_BASE_URL__
@@ -480,14 +480,10 @@ network:
 gateway:
   platforms:
     whatsapp:
-      home_channel:
-        platform: whatsapp
-        chat_id: "239959873196218@lid"
-        name: "Indra"
-        thread_id: null
       extra:
-        # Groups are listened to, but the agent only runs when it is mentioned.
-        require_mention: true
+        # require_mention is deliberately NOT set here: a config value wins over
+        # WHATSAPP_REQUIRE_MENTION, so setting it would make the env var unable to
+        # turn it off. It comes from the environment.
         text_batch_delay_seconds: 5.0
         text_batch_split_delay_seconds: 10.0
 
