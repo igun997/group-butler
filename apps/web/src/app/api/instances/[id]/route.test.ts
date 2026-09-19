@@ -5,12 +5,24 @@ import { issueSession } from "../../../../server/auth/session";
 import { closeDb, getDb } from "../../../../server/mongo";
 import { insertGroup, insertInstance } from "../../../../server/repos/test-helpers";
 import { jsonAnswer, withStubWorker } from "../../../../server/worker/test-helpers";
+import type * as hermesPairing from "../../../../server/hermes/pairing";
 import { DELETE, GET, PATCH } from "./route";
 
 /** Same request-scoped cookie seam as the group read-model route tests. */
 const session = vi.hoisted(() => ({ token: "" as string }));
 vi.mock("next/headers", () => ({
   cookies: async () => ({ get: () => (session.token ? { value: session.token } : undefined) }),
+}));
+
+/**
+ * Hermes's pairing state is the wizard's log file, which lives in the machine's
+ * temp directory and survives a test run — so the suite pins it: nothing is
+ * pairing, and the instance's own row is what these reads answer from.
+ */
+vi.mock("../../../../server/hermes/pairing", async (importOriginal) => ({
+  ...(await importOriginal<typeof hermesPairing>()),
+  readHermesPairing: () => null,
+  readHermesPairingAny: async () => null,
 }));
 
 const ownerToken = () => issueSession({ email: "owner@local", organizationId: "org_default" });
@@ -94,20 +106,21 @@ const storedGroup = (groupJid: string) =>
   getDb().then((db) => db.collection(COLLECTIONS.groups).findOne({ instanceId: "inst_1", groupJid }));
 
 describe("GET /api/instances/[id]", () => {
-  test("returns this organisation's live snapshot and refuses to be cached", async () => {
+  test("returns this organisation's stored snapshot and refuses to be cached", async () => {
     await insertInstance("org_default", "inst_1", "Support bot");
 
-    await withStubWorker(jsonAnswer(200, snapshot), async (worker) => {
-      const res = await get("inst_1");
+    const res = await get("inst_1");
 
-      expect(res.status).toBe(200);
-      expect(res.headers.get("cache-control")).toBe("no-store");
-      expect(await res.json()).toEqual(snapshot);
-      expect(worker.requests[0]).toMatchObject({
-        method: "GET",
-        url: "/instances/inst_1",
-        authorization: "Bearer worker-secret",
-      });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    // The row owns what live pairing does not speak for: the label, when it was
+    // created, and the status nothing has changed since.
+    expect(await res.json()).toEqual({
+      id: "inst_1",
+      label: "Support bot",
+      mode: "qr",
+      status: "disconnected",
+      createdAt: expect.any(String),
     });
   });
 
@@ -128,27 +141,6 @@ describe("GET /api/instances/[id]", () => {
       expect((await get("inst_unknown")).status).toBe(404);
       expect(worker.requests).toHaveLength(0);
     });
-  });
-
-  test("answers the worker's own 404 for an instance it has forgotten", async () => {
-    await insertInstance("org_default", "inst_1", "Support bot");
-
-    await withStubWorker(jsonAnswer(404, { code: "not_found", error: "instance not found" }), async () => {
-      const res = await get("inst_1");
-
-      expect(res.status).toBe(404);
-      expect(await res.json()).toMatchObject({ code: "not_found" });
-    });
-  });
-
-  test("reports an unreachable worker rather than a missing instance", async () => {
-    await insertInstance("org_default", "inst_1", "Support bot");
-    vi.stubEnv("WORKER_URL", "http://127.0.0.1:1");
-
-    const res = await get("inst_1");
-
-    expect(res.status).toBe(502);
-    expect(await res.json()).toMatchObject({ code: "worker_unreachable" });
   });
 
   test("answers 401 for a request with no session", async () => {

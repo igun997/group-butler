@@ -3,7 +3,7 @@ import { MongoMemoryReplSet } from "mongodb-memory-server";
 import { issueSession } from "../../../../../server/auth/session";
 import { closeDb } from "../../../../../server/mongo";
 import { insertInstance } from "../../../../../server/repos/test-helpers";
-import { jsonAnswer, withStubWorker } from "../../../../../server/worker/test-helpers";
+import type * as hermesPairing from "../../../../../server/hermes/pairing";
 import { POST } from "./route";
 
 /** Same request-scoped cookie seam as the group read-model route tests. */
@@ -12,16 +12,31 @@ vi.mock("next/headers", () => ({
   cookies: async () => ({ get: () => (session.token ? { value: session.token } : undefined) }),
 }));
 
-const ownerToken = () => issueSession({ email: "owner@local", organizationId: "org_default" });
+/**
+ * A pairing is a real child process whose state is a log file in the machine's
+ * temp directory — both outlive a test run — so the wizard is pinned here and the
+ * assertions are about what the route does with the status it reports.
+ */
+const wizard = vi.hoisted(() => ({
+  remote: vi.fn(async (): Promise<hermesPairing.HermesPairingStatus | null> => null),
+  local: vi.fn(
+    (): hermesPairing.HermesPairingStatus => ({
+      state: "awaiting_scan",
+      qr: "data:image/png;base64,AAAA",
+      message: null,
+      startedAt: "2026-09-14T01:17:41.497Z",
+    }),
+  ),
+}));
+vi.mock("../../../../../server/hermes/pairing", async (importOriginal) => ({
+  ...(await importOriginal<typeof hermesPairing>()),
+  readHermesPairing: () => null,
+  readHermesPairingAny: async () => null,
+  startHermesPairingRemote: wizard.remote,
+  startHermesPairing: wizard.local,
+}));
 
-const snapshot = {
-  id: "inst_1",
-  label: "Support bot",
-  mode: "qr",
-  status: "pairing",
-  qr: "data:image/png;base64,AAAA",
-  createdAt: "2026-09-14T01:17:41.497553887Z",
-};
+const ownerToken = () => issueSession({ email: "owner@local", organizationId: "org_default" });
 
 let replSet: MongoMemoryReplSet;
 
@@ -35,6 +50,8 @@ beforeAll(async () => {
 
 beforeEach(() => {
   session.token = ownerToken();
+  wizard.remote.mockClear();
+  wizard.local.mockClear();
 });
 
 afterAll(async () => {
@@ -49,54 +66,61 @@ const post = (id: string) =>
   });
 
 describe("POST /api/instances/[id]/pair", () => {
-  test("returns the snapshot the worker reports after re-entering pairing", async () => {
+  test("starts the wizard and answers the pairing snapshot", async () => {
     await insertInstance("org_default", "inst_1", "Support bot");
 
-    await withStubWorker(jsonAnswer(200, snapshot), async (worker) => {
-      const res = await post("inst_1");
+    const res = await post("inst_1");
 
-      expect(res.status).toBe(200);
-      expect(res.headers.get("cache-control")).toBe("no-store");
-      expect(await res.json()).toEqual(snapshot);
-      expect(worker.requests[0]).toMatchObject({
-        method: "POST",
-        url: "/instances/inst_1/pair",
-        authorization: "Bearer worker-secret",
-      });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    // The wizard has only just been spawned, so the QR it will print arrives on
+    // the poll the pairing screen is already doing rather than with this answer.
+    expect(await res.json()).toEqual({
+      id: "inst_1",
+      label: "Support bot",
+      mode: "qr",
+      status: "pairing",
+      qr: "data:image/png;base64,AAAA",
+      createdAt: expect.any(String),
     });
+    expect(wizard.local).toHaveBeenCalledTimes(1);
   });
 
-  test("does not re-pair another organisation's instance", async () => {
+  test("pairs through the Hermes service when this deployment has one", async () => {
+    await insertInstance("org_default", "inst_1", "Support bot");
+    wizard.remote.mockResolvedValue({
+      state: "paired",
+      qr: null,
+      message: null,
+      startedAt: "2026-09-14T01:17:41.497Z",
+    });
+
+    const res = await post("inst_1");
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ id: "inst_1", status: "connected" });
+    expect(wizard.local).not.toHaveBeenCalled();
+  });
+
+  test("does not re-pair another organisation's instance, and starts nothing", async () => {
     await insertInstance("org_other", "inst_9", "Someone else");
 
-    await withStubWorker(jsonAnswer(200, { ...snapshot, id: "inst_9" }), async (worker) => {
-      const res = await post("inst_9");
+    const res = await post("inst_9");
 
-      expect(res.status).toBe(404);
-      expect(await res.json()).toEqual({ error: "not found", code: "not_found" });
-      expect(worker.requests).toHaveLength(0);
-    });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: "not found", code: "not_found" });
+    expect(wizard.remote).not.toHaveBeenCalled();
+    expect(wizard.local).not.toHaveBeenCalled();
   });
 
-  test("maps a worker that refuses to re-pair to invalid_state", async () => {
-    await insertInstance("org_default", "inst_1", "Support bot");
-
-    await withStubWorker(
-      jsonAnswer(409, { code: "invalid_state", error: "instance is already connected" }),
-      async () => {
-        const res = await post("inst_1");
-
-        expect(res.status).toBe(409);
-        expect(await res.json()).toMatchObject({ code: "invalid_state" });
-      },
-    );
-  });
-
-  test("answers 401 for a request with no session, before any worker call", async () => {
+  test("answers 401 for a request with no session, before the wizard is started", async () => {
     session.token = "";
-    await withStubWorker(jsonAnswer(200, snapshot), async (worker) => {
-      expect((await post("inst_1")).status).toBe(401);
-      expect(worker.requests).toHaveLength(0);
-    });
+
+    const res = await post("inst_1");
+
+    expect(res.status).toBe(401);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(wizard.remote).not.toHaveBeenCalled();
+    expect(wizard.local).not.toHaveBeenCalled();
   });
 });

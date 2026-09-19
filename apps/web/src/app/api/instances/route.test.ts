@@ -1,5 +1,8 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
+import { MongoMemoryReplSet } from "mongodb-memory-server";
+import { COLLECTIONS } from "../../../server/collections";
 import { issueSession } from "../../../server/auth/session";
+import { closeDb, getDb } from "../../../server/mongo";
 import { jsonAnswer, truncatedAnswer, withStubWorker } from "../../../server/worker/test-helpers";
 import { GET, POST } from "./route";
 
@@ -21,7 +24,12 @@ const snapshot = {
   createdAt: "2026-09-14T01:17:41.497553887Z",
 };
 
-beforeAll(() => {
+let replSet: MongoMemoryReplSet;
+
+beforeAll(async () => {
+  replSet = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
+  vi.stubEnv("MONGODB_URI", replSet.getUri());
+  vi.stubEnv("MONGODB_DB", "butler_instances_route_test");
   vi.stubEnv("AUTH_SECRET", "test-secret-test-secret-test-secret");
   vi.stubEnv("ORGANIZATION_ID", "org_default");
 });
@@ -30,7 +38,9 @@ beforeEach(() => {
   session.token = ownerToken();
 });
 
-afterAll(() => {
+afterAll(async () => {
+  await closeDb();
+  await replSet.stop();
   vi.unstubAllEnvs();
 });
 
@@ -113,83 +123,74 @@ describe("GET /api/instances", () => {
 });
 
 describe("POST /api/instances", () => {
-  test("creates an instance through the worker and returns the pairing snapshot", async () => {
-    await withStubWorker(jsonAnswer(201, snapshot), async (worker) => {
-      const res = await create({ label: "Support bot", mode: "code", phoneNumber: "628990000001" });
+  test("writes the row itself and answers the new instance's pairing snapshot", async () => {
+    const res = await create({ label: "Support bot", mode: "qr" });
 
-      expect(res.status).toBe(201);
-      expect(res.headers.get("cache-control")).toBe("no-store");
-      expect(await res.json()).toEqual(snapshot);
-      expect(worker.requests[0]).toMatchObject({ method: "POST", url: "/instances" });
-      expect(JSON.parse(worker.requests[0]!.body)).toEqual({
-        label: "Support bot",
-        mode: "code",
-        phoneNumber: "628990000001",
-      });
+    expect(res.status).toBe(201);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    // Hermes pairs by scanning only, and a row nothing has paired yet is
+    // disconnected: those two facts are what the pairing screen reads.
+    expect(await res.json()).toEqual({
+      id: expect.stringMatching(/^[A-Za-z0-9_-]{21}$/),
+      label: "Support bot",
+      mode: "qr",
+      status: "disconnected",
+      createdAt: expect.any(String),
     });
   });
 
-  test("rejects a create without a label before any worker call", async () => {
-    await withStubWorker(jsonAnswer(201, snapshot), async (worker) => {
-      const res = await create({ mode: "qr" });
+  test("stores the row under the owner's organisation, not the body's", async () => {
+    const body = (await (await create({ label: "Support bot", mode: "qr" })).json()) as { id: string };
 
-      expect(res.status).toBe(400);
-      expect(await res.json()).toMatchObject({ code: "invalid_request" });
-      expect(worker.requests).toHaveLength(0);
-    });
+    const stored = await (await getDb()).collection(COLLECTIONS.instances).findOne({ _id: body.id as never });
+    expect(stored).toMatchObject({ organizationId: "org_default", label: "Support bot", deletedAt: null });
   });
 
-  test("requires a phone number for code pairing, as the worker does", async () => {
-    await withStubWorker(jsonAnswer(201, snapshot), async (worker) => {
-      const res = await create({ label: "Support bot", mode: "code" });
+  test("rejects a create without a label", async () => {
+    const res = await create({ mode: "qr" });
 
-      expect(res.status).toBe(400);
-      expect(await res.json()).toMatchObject({ code: "invalid_request" });
-      expect(worker.requests).toHaveLength(0);
-    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ code: "invalid_request" });
   });
 
-  test("rejects a pairing mode the worker does not offer, and unknown fields", async () => {
-    await withStubWorker(jsonAnswer(201, snapshot), async (worker) => {
-      const badMode = await create({ label: "Support bot", mode: "sms" });
-      const unknown = await create({ label: "Support bot", mode: "qr", organizationId: "org_other" });
+  test("requires a phone number for code pairing", async () => {
+    const res = await create({ label: "Support bot", mode: "code" });
 
-      expect(badMode.status).toBe(400);
-      expect(unknown.status).toBe(400);
-      expect(worker.requests).toHaveLength(0);
-    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ code: "invalid_request" });
+  });
+
+  test("rejects a pairing mode this deployment does not offer, and unknown fields", async () => {
+    const badMode = await create({ label: "Support bot", mode: "sms" });
+    const unknown = await create({ label: "Support bot", mode: "qr", organizationId: "org_other" });
+
+    expect(badMode.status).toBe(400);
+    expect(unknown.status).toBe(400);
   });
 
   test("rejects a body that is not JSON", async () => {
-    await withStubWorker(jsonAnswer(201, snapshot), async (worker) => {
-      const res = await POST(
-        new Request("http://localhost/api/instances", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: "{not json",
-        }),
-      );
+    const res = await POST(
+      new Request("http://localhost/api/instances", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{not json",
+      }),
+    );
 
-      expect(res.status).toBe(400);
-      expect(await res.json()).toMatchObject({ code: "invalid_request" });
-      expect(worker.requests).toHaveLength(0);
-    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ code: "invalid_request" });
   });
 
-  test("maps a duplicate label to the code the dashboard explains", async () => {
-    await withStubWorker(jsonAnswer(409, { code: "label_conflict", error: "instance label already exists" }), async () => {
-      const res = await create({ label: "Support bot", mode: "qr" });
-
-      expect(res.status).toBe(409);
-      expect(await res.json()).toEqual({ code: "label_conflict", error: expect.any(String) });
-    });
-  });
-
-  test("answers 401 for a create with no session, before any worker call", async () => {
+  test("answers 401 for a create with no session, before the row is written", async () => {
     session.token = "";
-    await withStubWorker(jsonAnswer(201, snapshot), async (worker) => {
-      expect((await create({ label: "Support bot", mode: "qr" })).status).toBe(401);
-      expect(worker.requests).toHaveLength(0);
-    });
+    const db = await getDb();
+    const before = await db.collection(COLLECTIONS.instances).countDocuments({});
+
+    const res = await create({ label: "Support bot", mode: "qr" });
+
+    expect(res.status).toBe(401);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(await res.json()).toEqual({ error: "unauthorized" });
+    expect(await db.collection(COLLECTIONS.instances).countDocuments({})).toBe(before);
   });
 });

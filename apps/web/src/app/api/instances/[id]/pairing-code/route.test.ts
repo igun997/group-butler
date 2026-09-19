@@ -3,7 +3,6 @@ import { MongoMemoryReplSet } from "mongodb-memory-server";
 import { issueSession } from "../../../../../server/auth/session";
 import { closeDb } from "../../../../../server/mongo";
 import { insertInstance } from "../../../../../server/repos/test-helpers";
-import { jsonAnswer, withStubWorker } from "../../../../../server/worker/test-helpers";
 import { POST } from "./route";
 
 /** Same request-scoped cookie seam as the group read-model route tests. */
@@ -13,16 +12,6 @@ vi.mock("next/headers", () => ({
 }));
 
 const ownerToken = () => issueSession({ email: "owner@local", organizationId: "org_default" });
-
-const snapshot = {
-  id: "inst_1",
-  label: "Support bot",
-  mode: "code",
-  status: "pairing",
-  phoneNumber: "628990000001",
-  pairingCode: "1234-5678",
-  createdAt: "2026-09-14T01:17:41.497553887Z",
-};
 
 let replSet: MongoMemoryReplSet;
 
@@ -50,54 +39,34 @@ const post = (id: string) =>
   });
 
 describe("POST /api/instances/[id]/pairing-code", () => {
-  test("returns the pairing code the worker produced", async () => {
+  test("refuses with the reason the console shows, because Hermes pairs by QR only", async () => {
     await insertInstance("org_default", "inst_1", "Support bot");
 
-    await withStubWorker(jsonAnswer(200, snapshot), async (worker) => {
-      const res = await post("inst_1");
+    const res = await post("inst_1");
 
-      expect(res.status).toBe(200);
-      expect(res.headers.get("cache-control")).toBe("no-store");
-      expect(await res.json()).toEqual(snapshot);
-      expect(worker.requests[0]).toMatchObject({
-        method: "POST",
-        url: "/instances/inst_1/pairing-code",
-        authorization: "Bearer worker-secret",
-      });
+    expect(res.status).toBe(501);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(await res.json()).toEqual({
+      error: "this deployment pairs by QR only — no pairing code is available",
+      code: "unsupported",
     });
   });
 
-  test("does not request a code for another organisation's instance", async () => {
+  test("does not answer for another organisation's instance", async () => {
     await insertInstance("org_other", "inst_9", "Someone else");
 
-    await withStubWorker(jsonAnswer(200, { ...snapshot, id: "inst_9" }), async (worker) => {
-      const res = await post("inst_9");
+    const res = await post("inst_9");
 
-      expect(res.status).toBe(404);
-      expect(await res.json()).toEqual({ error: "not found", code: "not_found" });
-      expect(worker.requests).toHaveLength(0);
-    });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: "not found", code: "not_found" });
   });
 
-  test("maps an instance that is not pairing in code mode to invalid_state", async () => {
-    await insertInstance("org_default", "inst_1", "Support bot");
-
-    await withStubWorker(
-      jsonAnswer(409, { code: "invalid_state", error: "instance is not in code-pairing mode" }),
-      async () => {
-        const res = await post("inst_1");
-
-        expect(res.status).toBe(409);
-        expect(await res.json()).toMatchObject({ code: "invalid_state" });
-      },
-    );
-  });
-
-  test("answers 401 for a request with no session, before any worker call", async () => {
+  test("answers 401 for a request with no session", async () => {
     session.token = "";
-    await withStubWorker(jsonAnswer(200, snapshot), async (worker) => {
-      expect((await post("inst_1")).status).toBe(401);
-      expect(worker.requests).toHaveLength(0);
-    });
+
+    const res = await post("inst_1");
+
+    expect(res.status).toBe(401);
+    expect(res.headers.get("cache-control")).toBe("no-store");
   });
 });
