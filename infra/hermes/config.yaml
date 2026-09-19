@@ -241,7 +241,10 @@ display:
   user_message_preview:
     first_lines: 2
     last_lines: 2
-  interim_assistant_messages: true
+  # The agent narrates its plan between tool calls ('Wait, let's call
+  # vision_analyze directly!'). That is useful in a terminal and wrong in a
+  # WhatsApp chat, where it arrives as a message the owner did not ask for.
+  interim_assistant_messages: false
   tool_progress_command: false
   tool_progress_overrides: {}
   tool_preview_length: 0
