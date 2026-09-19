@@ -23,6 +23,7 @@ TEMPLATE=/opt/hermes/docker/config.yaml
 # placeholders need no templating engine.
 sed -e "s|__AI_BASE_URL__|${AI_BASE_URL:-}|g" \
     -e "s|__AI_MODEL__|${AI_MODEL:-}|g" \
+    -e "s|__AI_VISION_MODEL__|${AI_VISION_MODEL:-${AI_MODEL:-}}|g" \
     -e "s|__MCP_BUTLER_URL__|${MCP_BUTLER_URL:-}|g" \
     -e "s|__MCP_BUTLER_TOKEN__|${MCP_BUTLER_TOKEN:-}|g" \
     "$TEMPLATE" > "$HERMES_HOME/config.yaml"

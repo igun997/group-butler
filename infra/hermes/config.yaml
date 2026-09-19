@@ -130,12 +130,12 @@ bedrock:
     trace: disabled
 auxiliary:
   vision:
-    # The main model on this gateway (ag/claude-sonnet-4-6) silently drops
-    # image parts -- it answers "No image attached." -- so image reads are
-    # routed to a model that actually sees them. api_key stays empty because
-    # key_env resolution for custom endpoints reads OPENAI_API_KEY.
+    # Where image reads are routed. Set AI_VISION_MODEL only if the main model
+    # cannot see images; otherwise it defaults to the main model, so the two can
+    # never drift apart -- which is how this pointed at a model the gateway had
+    # stopped serving while the main model could read images perfectly well.
     provider: custom
-    model: ag/gemini-3-flash
+    model: __AI_VISION_MODEL__
     base_url: https://iai.dev.ciptadusa.com/v1
     api_key: ''
     timeout: 120
