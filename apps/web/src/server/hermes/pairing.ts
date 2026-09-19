@@ -74,6 +74,7 @@ export interface HermesPairingStatus {
   startedAt: string;
 }
 
+// eslint-disable-next-line no-control-regex -- matching an ANSI escape needs the escape character itself.
 const ANSI = /\x1b\[[0-9;?]*[a-zA-Z]/g;
 
 /** The wizard's pid, or `null` when none is recorded. */

@@ -26,6 +26,7 @@ const MODULES_BY_GLYPH: Record<string, readonly [boolean, boolean]> = {
 const MIN_QR_LINE_CHARS = 30;
 
 /** Terminal colour escapes, which a pseudo-terminal interleaves with the picture. */
+// eslint-disable-next-line no-control-regex -- matching an ANSI escape needs the escape character itself.
 const ANSI = /\x1b\[[0-9;?]*[a-zA-Z]/g;
 
 /**

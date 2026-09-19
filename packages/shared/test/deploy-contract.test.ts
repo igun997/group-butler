@@ -71,10 +71,12 @@ describe("production rollout: the pull-only compose wrapper", () => {
     expect(declared.get("web")).toMatch(/ghcr\.io\/.*\/group-butler\/web:/);
   });
 
-  test("keeps the worker's control plane private and the auth store on a volume", () => {
+  test("keeps the worker's control plane private", () => {
     const worker = declared.get("worker")!;
     expect(worker).not.toMatch(/^ *ports:/m);
-    expect(worker).toMatch(/butler-wa:\/data/);
+    // The auth-store volume this used to assert is gone: the worker holds no
+    // WhatsApp session any more, so there is no device credential to keep. What
+    // remains worth pinning is that its control plane stays off the network.
   });
 
   test("points the BFF at the worker over the compose network, not at its own loopback", () => {
