@@ -81,12 +81,19 @@ function overlay(pairing: HermesPairingStatus | null): { status: InstanceStatus;
  * `mode` is always "qr": Hermes pairs by scanning only, and reporting "code"
  * would offer the console a button whose every press fails.
  */
-export function hermesInstanceSnapshot(doc: InstanceDoc, pairing: HermesPairingStatus | null = readHermesPairing()): InstanceSnapshot {
+export function hermesInstanceSnapshot(
+  doc: InstanceDoc,
+  pairing: HermesPairingStatus | null = readHermesPairing(),
+  /** What Hermes reports over HTTP, when the caller could reach it. */
+  gateway: InstanceStatus | null = null,
+): InstanceSnapshot {
   const runtime = doc.runtime ?? {};
   const live = overlay(pairing);
   // A pairing in flight is the most current thing there is; failing that, what
   // Hermes says about the account; only then the row's last recorded status.
-  const status = live?.status ?? gatewayStatus(process.env.HERMES_DATA_DIR) ?? storedStatus(runtime.status);
+  // Hermes owns the session, so its answer wins. The stored status is the last
+  // resort, not the first: it is the old worker's and nothing updates it.
+  const status = live?.status ?? gateway ?? gatewayStatus(process.env.HERMES_DATA_DIR) ?? storedStatus(runtime.status);
   const snapshot: InstanceSnapshot = {
     id: doc._id,
     label: doc.label ?? "",

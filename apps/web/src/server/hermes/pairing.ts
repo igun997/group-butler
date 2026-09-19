@@ -1,3 +1,4 @@
+import type { InstanceStatus } from "@butler/shared";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createWriteStream, existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -273,6 +274,34 @@ export async function startHermesPairingRemote(): Promise<HermesPairingStatus | 
 /** Presses the pairing state, however this deployment can reach it. */
 export async function readHermesPairingAny(): Promise<HermesPairingStatus | null> {
   return (await callService("/pair", "GET")) ?? readHermesPairing();
+}
+
+/**
+ * What Hermes says about the account, over HTTP.
+ *
+ * This is the authoritative answer once Hermes owns the session, and it is why the
+ * instance's own `runtime.status` cannot be trusted: that field was the worker's,
+ * nothing writes it any more, and a row still reading "connected" from months ago
+ * makes the console hide the Pair button on an account nobody has scanned. Reading
+ * it over HTTP also avoids needing Hermes's data directory mounted into the BFF,
+ * which a host like EasyPanel gives no way to do.
+ */
+export async function readHermesGatewayStatus(): Promise<InstanceStatus | null> {
+  const base = process.env[PAIR_URL_ENV];
+  if (!base) return null;
+  try {
+    const response = await fetch(`${base}/status`, { signal: AbortSignal.timeout(10000) });
+    if (!response.ok) return null;
+    const body = (await response.json()) as { whatsapp?: string };
+    if (body.whatsapp === "connected") return "connected";
+    if (body.whatsapp === "connecting" || body.whatsapp === "reconnecting") return "pairing";
+    // Anything else is "not linked yet" rather than a fault: the ordinary cause is
+    // an account nobody has paired, and showing that as an error is what put a red
+    // badge on every freshly created instance.
+    return "disconnected";
+  } catch {
+    return null;
+  }
 }
 
 /** This process's own pairing, when it runs the wizard itself. */

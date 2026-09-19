@@ -1,6 +1,6 @@
 import { guardInstance } from "../../../../../server/instance-guard";
 import { hermesInstanceSnapshot } from "../../../../../server/hermes/instance";
-import { startHermesPairing, startHermesPairingRemote } from "../../../../../server/hermes/pairing";
+import { readHermesGatewayStatus, startHermesPairing, startHermesPairingRemote } from "../../../../../server/hermes/pairing";
 import { getInstanceDoc } from "../../../../../server/repos/instances";
 import { getDb } from "../../../../../server/mongo";
 
@@ -33,5 +33,5 @@ export async function POST(
   // The service is tried first: when Hermes is its own container, this process
   // cannot run the wizard at all. A host-run stack has no service and spawns it.
   const started = (await startHermesPairingRemote()) ?? startHermesPairing();
-  return Response.json(hermesInstanceSnapshot(doc, started), { headers: { "cache-control": "no-store" } });
+  return Response.json(hermesInstanceSnapshot(doc, started, await readHermesGatewayStatus()), { headers: { "cache-control": "no-store" } });
 }

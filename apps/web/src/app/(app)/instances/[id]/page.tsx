@@ -17,7 +17,7 @@ import { getInstanceRuntime, instanceInOrg } from "@/server/repos/instances";
 import { authorizedJidsOf } from "@/server/authorized-jids";
 import { instanceLabel, listInstanceGroups } from "@/server/repos/groups";
 import { hermesInstanceSnapshot } from "@/server/hermes/instance";
-import { readHermesPairingAny } from "@/server/hermes/pairing";
+import { readHermesGatewayStatus, readHermesPairingAny } from "@/server/hermes/pairing";
 import { getInstanceDoc } from "@/server/repos/instances";
 
 /**
@@ -72,7 +72,7 @@ export default async function InstancePage({ params }: { params: Promise<{ id: s
   ]);
 
   const groupSync = runtime?.groupSync ?? { groupsObserved: 0, groupsLeft: 0, lastSyncAt: null, lastError: null };
-  const live = instanceDoc === null ? null : hermesInstanceSnapshot(instanceDoc, await readHermesPairingAny());
+  const live = instanceDoc === null ? null : hermesInstanceSnapshot(instanceDoc, await readHermesPairingAny(), await readHermesGatewayStatus());
   const status = live?.status ?? runtime?.status ?? "disconnected";
 
   return (

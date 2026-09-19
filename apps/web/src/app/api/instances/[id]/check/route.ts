@@ -1,6 +1,6 @@
 import { guardInstance } from "../../../../../server/instance-guard";
 import { hermesInstanceSnapshot } from "../../../../../server/hermes/instance";
-import { readHermesPairingAny } from "../../../../../server/hermes/pairing";
+import { readHermesGatewayStatus, readHermesPairingAny } from "../../../../../server/hermes/pairing";
 import { getInstanceDoc } from "../../../../../server/repos/instances";
 import { getDb } from "../../../../../server/mongo";
 
@@ -29,5 +29,5 @@ export async function POST(
   const doc = await getInstanceDoc(db, guard.organizationId, id);
   if (doc === null) return Response.json({ error: "not found", code: "not_found" }, { status: 404 });
 
-  return Response.json(hermesInstanceSnapshot(doc, await readHermesPairingAny()), { headers: { "cache-control": "no-store" } });
+  return Response.json(hermesInstanceSnapshot(doc, await readHermesPairingAny(), await readHermesGatewayStatus()), { headers: { "cache-control": "no-store" } });
 }
