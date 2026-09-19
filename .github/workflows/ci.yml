@@ -52,8 +52,13 @@ jobs:
       - name: Typecheck
         run: bun run check
 
-      - name: Test the launchers and the shared contract
-        run: bun test scripts/dev.test.ts scripts/prod.test.ts && bun run --cwd packages/shared test
+      # The bridge patch is tested here because it has no home anywhere else: once
+      # spliced it runs inside Hermes's own process, so `infra/hermes/*.test.ts`
+      # evaluates the shipped snippets against stubs. A regression there is
+      # invisible at patch time — the bridge still starts, still connects, and
+      # quietly stops archiving or stops accepting group actions.
+      - name: Test the launchers, the shared contract, and the bridge patch
+        run: bun test scripts/dev.test.ts scripts/prod.test.ts infra/hermes/patch-bridge.test.ts && bun run --cwd packages/shared test
 
       # `--no-file-parallelism` because every suite that touches a database starts
       # its own mongod: run side by side on a two-core runner they contend, and a

@@ -16,3 +16,9 @@ apps/worker/.localdata/
 apps/worker/whatsapp-worker
 # `go build ./...` names the binary after the package directory.
 apps/worker/worker
+
+# Local database dumps taken before a reset; they contain captured messages.
+backups/
+
+# Output of infra/hermes/patch-bridge.mjs; the image builds its own copy.
+infra/hermes/build/

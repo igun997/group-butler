@@ -27,7 +27,6 @@ export const REQUIRED_ENV = [
   "PORT",
   "WORKER_URL",
   "WORKER_SECRET",
-  "WHATSMEOW_DB_URI",
 
   // --- object storage: Cloudflare R2 (real service; endpoint derived) ---
   "R2_ACCOUNT_ID",
@@ -64,14 +63,15 @@ export const REQUIRED_ENV = [
   "RAW_JSON_MAX_BYTES",
   "RAW_SEARCH_MAX_BYTES",
 
+  // --- Hermes bridge ingest (WhatsApp is Hermes's; the worker archives it) ---
+  "HERMES_INSTANCE_ID",
+  "HERMES_DATA_DIR",
+
   // --- worker media ---
   "MEDIA_MAX_BYTES",
   "MEDIA_CONCURRENCY",
   "MEDIA_DOWNLOAD_TIMEOUT",
-  "MEDIA_MAX_ATTEMPTS",
-  "MEDIA_JANITOR_INTERVAL",
   "MEDIA_ENRICH_ENABLED",
-  "HISTORY_SYNC_MAX_DAYS",
   "RETENTION_MESSAGES_DAYS",
 
   // --- group discovery and sync ---

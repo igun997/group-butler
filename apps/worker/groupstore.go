@@ -8,8 +8,6 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
-
-	"go.mau.fi/whatsmeow/types"
 )
 
 // groupConfig is the BFF-owned half of a `groups` document (§5.1). The worker
@@ -37,9 +35,126 @@ type groupDoc struct {
 	UpdatedAt      time.Time   `bson:"updatedAt"`
 }
 
+// now is the clock seam (docs/architecture-draft.md §14.2): every observation
+// timestamp the group path writes is produced here, so tests are deterministic
+// without touching the system clock.
+var now = time.Now
+
+// GroupState is `observed.state` — the membership lifecycle WhatsApp reports
+// (§5.1). A group that disappears from a sync snapshot becomes `left`, it is
+// never deleted: the name it had is still useful history.
+type GroupState string
+
+const (
+	GroupActive    GroupState = "active"
+	GroupLeft      GroupState = "left"
+	GroupDeleted   GroupState = "deleted"
+	GroupSuspended GroupState = "suspended"
+)
+
+// SubjectSource is `observed.subjectSource`: which path produced the current
+// name. It is what makes a rename auditable, and it is also the BFF's own
+// vocabulary (`packages/shared/src/worker-contract.ts`), so the whole set is
+// kept: `event` is what the worker used to write when a rename arrived on the
+// WhatsApp event loop, and nothing produces it now that the session is gone.
+type SubjectSource string
+
+const (
+	SubjectFromSync     SubjectSource = "sync"
+	SubjectFromEvent    SubjectSource = "event"
+	SubjectFromFallback SubjectSource = "fallback"
+)
+
+// SyncSource is `observed.lastSyncSource`: the trigger that last refreshed the
+// snapshot-owned fields (§6.6.2). `connect` and `event` are part of the same
+// shared vocabulary; the worker's remaining triggers are the timer and the
+// operator's manual sync, both of which read the Hermes bridge.
+type SyncSource string
+
+const (
+	SyncOnConnect SyncSource = "connect"
+	SyncOnTimer   SyncSource = "timer"
+	SyncOnManual  SyncSource = "manual"
+	SyncOnEvent   SyncSource = "event"
+	SyncOnMessage SyncSource = "message"
+)
+
+// subjectHistoryMax caps the rename ring (§5.1). The history is newest-first;
+// the oldest entry falls off rather than growing the document without bound.
+const subjectHistoryMax = 20
+
+// SubjectHistoryEntry is one superseded name: what it was, the stamp the worker
+// observed it under, and who set it. The tags are the §5.1 ring spelling.
+type SubjectHistoryEntry struct {
+	Name string    `bson:"name"`
+	At   time.Time `bson:"at"`
+	By   string    `bson:"by"`
+}
+
+// GroupMember is one stored membership entry. Nothing writes it any more: the
+// bridge's snapshot carries a member *count*, not a member list, so the field
+// stays part of the stored document's vocabulary (and is decoded and re-encoded
+// unchanged) rather than being dropped from a row that still holds it.
+type GroupMember struct {
+	JID          string `bson:"jid"`
+	PhoneJID     string `bson:"phoneJid"`
+	LID          string `bson:"lid"`
+	IsAdmin      bool   `bson:"isAdmin"`
+	IsSuperAdmin bool   `bson:"isSuperAdmin"`
+	DisplayName  string `bson:"displayName"`
+}
+
+// Observed is the worker-owned half of a `groups` document (§5.1) in Go form.
+// The BFF's `config.*` is deliberately absent: the worker never writes it. The
+// bson tags are the decode spelling of §5.1; the write path spells the same keys
+// as dotted `$set` entries in groupstore.go, where the ingest-owned counters are
+// filtered out.
+type Observed struct {
+	Subject               string                `bson:"subject"`
+	SubjectSearch         string                `bson:"subjectSearch"`
+	SubjectUpdatedAt      time.Time             `bson:"subjectUpdatedAt"`
+	SubjectObservedAt     time.Time             `bson:"subjectObservedAt"`
+	SubjectSetBy          string                `bson:"subjectSetBy"`
+	SubjectSetByLID       string                `bson:"subjectSetByLid"`
+	SubjectSource         SubjectSource         `bson:"subjectSource"`
+	SubjectHistory        []SubjectHistoryEntry `bson:"subjectHistory"`
+	Topic                 string                `bson:"topic"`
+	TopicUpdatedAt        time.Time             `bson:"topicUpdatedAt"`
+	IsAnnounce            bool                  `bson:"isAnnounce"`
+	IsLocked              bool                  `bson:"isLocked"`
+	IsEphemeral           bool                  `bson:"isEphemeral"`
+	IsDefaultSubGroup     bool                  `bson:"isDefaultSubGroup"`
+	ParticipantCount      int                   `bson:"participantCount"`
+	ParticipantCountDirty bool                  `bson:"participantCountDirty"`
+	Members               []GroupMember         `bson:"members"`
+	GroupCreatedAt        time.Time             `bson:"groupCreatedAt"`
+	State                 GroupState            `bson:"state"`
+	LastActivityAt        time.Time             `bson:"lastActivityAt"`
+	MessageCount          int                   `bson:"messageCount"`
+	MediaStored           int                   `bson:"mediaStored"`
+	LastSyncedAt          time.Time             `bson:"lastSyncedAt"`
+	LastSyncSource        SyncSource            `bson:"lastSyncSource"`
+	LeftDetectedAt        time.Time             `bson:"leftDetectedAt"`
+}
+
+// groupSnapshot is one group as the Hermes bridge reported it: the identity, the
+// name, the two switches and the member count — everything a caller can learn
+// about a group without holding a WhatsApp session.
+//
+// It is deliberately not the bridge's own wire struct: translating the transport
+// shape (hermes_bridge.go) into the worker's own vocabulary is what keeps the
+// merge rules below written against a group, not against a JSON payload.
+type groupSnapshot struct {
+	JID              string
+	Subject          string
+	Announce         bool
+	Locked           bool
+	ParticipantCount int
+}
+
 // groupStore owns the `observed.*` half of the `groups` collection. Every write
 // it makes is a dotted `$set` of the fields this path owns, an upsert keyed on
-// the unique identity triple, so a redelivery or a racing event costs one
+// the unique identity triple, so a redelivery or a racing read costs one
 // idempotent update instead of a duplicate row (§6.6).
 type groupStore struct {
 	coll *mongo.Collection
@@ -119,42 +234,36 @@ func observedFields(o Observed, fromSync bool) bson.D {
 	return fields
 }
 
-// ObservedFromGroupInfo turns one snapshot entry — a `GetJoinedGroups` row or a
-// single `GetGroupInfo` repair — into the observation it stands for (§6.6.1).
-// The name is authoritative here, so it is stamped from the snapshot's own
-// `s_t`/`s_o`, not from the clock.
-func ObservedFromGroupInfo(info *types.GroupInfo, source SyncSource, at time.Time) Observed {
-	pn, lid := subjectProvenance(&info.GroupName)
+// observedFromSnapshot turns one bridge snapshot entry — a `GET /groups` row, or
+// a single `GET /group/:jid` repair — into the observation it stands for
+// (§6.6.1).
+//
+// Only the fields the bridge's contract actually carries are filled. Topic,
+// renamer, creation time and the membership list have no source there, so they
+// stay empty here and the merge below leaves the stored values alone rather than
+// erasing what a richer reader once recorded.
+//
+// The name is stamped with the moment it was observed: WhatsApp's own `s_t` for
+// a rename does not survive the bridge's contract, and the honest value for "when
+// this name was set" is then the moment the worker learnt it (§6.6.4).
+func observedFromSnapshot(snap groupSnapshot, source SyncSource, at time.Time) Observed {
 	subjectSource := SubjectFromSync
-	if info.Name == "" {
+	if snap.Subject == "" {
 		// A snapshot without a subject tells us nothing about the name; the
 		// empty value is labelled a fallback rather than passed off as synced.
 		subjectSource = SubjectFromFallback
 	}
-	state := GroupActive
-	if info.Suspended {
-		state = GroupSuspended
-	}
-	members := make([]GroupMember, 0, len(info.Participants))
-	for _, participant := range info.Participants {
-		members = append(members, GroupMember{
-			JID: participant.JID.String(), PhoneJID: participant.PhoneNumber.ToNonAD().String(), LID: participant.LID.ToNonAD().String(),
-			IsAdmin: participant.IsAdmin, IsSuperAdmin: participant.IsSuperAdmin, DisplayName: participant.DisplayName,
-		})
-	}
 	return Observed{
-		Subject: info.Name, SubjectSearch: foldText(info.Name), SubjectUpdatedAt: info.NameSetAt, SubjectObservedAt: at,
-		SubjectSetBy: pn, SubjectSetByLID: lid, SubjectSource: subjectSource, Topic: info.Topic, TopicUpdatedAt: info.TopicSetAt,
-		IsAnnounce: info.IsAnnounce, IsLocked: info.IsLocked, IsEphemeral: info.IsEphemeral, IsDefaultSubGroup: info.IsDefaultSubGroup,
-		ParticipantCount: info.ParticipantCount, Members: members, GroupCreatedAt: info.GroupCreated, State: state, LastSyncedAt: at, LastSyncSource: source,
+		Subject: snap.Subject, SubjectSearch: foldText(snap.Subject),
+		SubjectUpdatedAt: at, SubjectObservedAt: at, SubjectSource: subjectSource,
+		IsAnnounce: snap.Announce, IsLocked: snap.Locked,
+		ParticipantCount: snap.ParticipantCount,
+		// A group a live read returned is one the account is in, so the
+		// snapshot is the state: `suspended` and `deleted` have no representation
+		// in the bridge's contract and stay as stored.
+		State:        GroupActive,
+		LastSyncedAt: at, LastSyncSource: source,
 	}
-}
-
-// UpsertFromSync persists one snapshot entry under the identity triple,
-// preserving whatever the BFF has configured for that group.
-func (s *groupStore) UpsertFromSync(ctx context.Context, orgID, instanceID string, info *types.GroupInfo, source SyncSource) error {
-	at := now().UTC()
-	return s.UpsertObserved(ctx, orgID, instanceID, info.JID.String(), ObservedFromGroupInfo(info, source, at), true)
 }
 
 // UpsertObserved writes one observation. The filter is the unique index key and
@@ -382,4 +491,19 @@ func nameSource(o Observed) string {
 		return string(SubjectFromFallback)
 	}
 	return string(o.SubjectSource)
+}
+
+// appendSubjectHistory pushes an entry onto the newest-first rename ring and
+// caps it, so a group renamed every day does not grow its document forever.
+func appendSubjectHistory(history []SubjectHistoryEntry, entry SubjectHistoryEntry) []SubjectHistoryEntry {
+	if len(history) > 0 && history[0].Name == entry.Name && history[0].At.Equal(entry.At) {
+		return history
+	}
+	grown := make([]SubjectHistoryEntry, 0, len(history)+1)
+	grown = append(grown, entry)
+	grown = append(grown, history...)
+	if len(grown) > subjectHistoryMax {
+		grown = grown[:subjectHistoryMax]
+	}
+	return grown
 }

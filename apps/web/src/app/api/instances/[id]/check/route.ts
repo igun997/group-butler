@@ -1,15 +1,21 @@
 import { guardInstance } from "../../../../../server/instance-guard";
-import { checkWorkerInstance, workerFailureResponse } from "../../../../../server/worker/client";
+import { hermesInstanceSnapshot } from "../../../../../server/hermes/instance";
+import { readHermesPairingAny } from "../../../../../server/hermes/pairing";
+import { getInstanceDoc } from "../../../../../server/repos/instances";
+import { getDb } from "../../../../../server/mongo";
 
 /**
- * §7.3 `POST /api/instances/[id]/check`: ask the worker to verify the instance's
- * live session rather than re-read the state it last stored. The worker checks
- * the socket and reconnects when the credential is still valid, and answers the
- * resulting snapshot — so "Check now" can report a connection the console would
- * otherwise have gone on showing as stale.
+ * §7.3 `POST /api/instances/[id]/check`: the route the pairing screen polls every
+ * two seconds.
  *
- * The request carries no body: the instance's live state is the worker's fact.
- * The tenant boundary is checked before that call.
+ * It no longer asks a worker to verify a socket — Hermes owns the WhatsApp
+ * connection now — so it reports what the wizard the console started is doing:
+ * the latest QR while a scan is awaited, the connected identity once it lands, or
+ * the wizard's own words when it fails. When nothing is pairing it falls back to
+ * the identity the instance last recorded, which is what makes this route safe to
+ * poll outside a pairing too.
+ *
+ * The tenant boundary is checked before any of that.
  */
 export async function POST(
   _request: Request,
@@ -19,7 +25,9 @@ export async function POST(
   const guard = await guardInstance(id);
   if (!guard.ok) return guard.response;
 
-  const result = await checkWorkerInstance(id);
-  if (!result.ok) return workerFailureResponse(result.failure);
-  return Response.json(result.data, { headers: { "cache-control": "no-store" } });
+  const db = await getDb();
+  const doc = await getInstanceDoc(db, guard.organizationId, id);
+  if (doc === null) return Response.json({ error: "not found", code: "not_found" }, { status: 404 });
+
+  return Response.json(hermesInstanceSnapshot(doc, await readHermesPairingAny()), { headers: { "cache-control": "no-store" } });
 }

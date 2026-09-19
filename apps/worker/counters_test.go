@@ -139,6 +139,42 @@ func TestRecordMediaCountsStoredAndUnparsedPerGroup(t *testing.T) {
 	}
 }
 
+// The flush is where the Hermes path's attachments are counted: the bytes are
+// stored on the way in, so an outcome is already final when the batch is handed
+// over, and the counter has to move with the flush — the runner that used to feed
+// it downloaded from a session this worker no longer has.
+func TestAfterIngestFlushCountsTheAttachmentsItStored(t *testing.T) {
+	stats := &fakeDayCounters{}
+	repo := newFakeInstanceRepo()
+	mgr := testManagerWithDeps(newFakeGroupStore(), stats, repo)
+	mgr.external = &externalIngest{}
+
+	mgr.afterIngestFlush([]MessageDoc{
+		{OrganizationID: "org_default", InstanceID: "inst_1", GroupJID: "group_a@g.us", WaMessageID: "m1",
+			Media: Media{Status: MediaStored}},
+		{OrganizationID: "org_default", InstanceID: "inst_1", GroupJID: "group_a@g.us", WaMessageID: "m2",
+			Media: Media{Status: MediaPending}},
+	})
+
+	waitFor(t, "the stored attachment to be counted", func() bool {
+		return repo.counters["inst_1"][runtimeCounterMediaStored] == 1
+	})
+	if got := repo.counters["inst_1"][runtimeCounterMediaUnparsed]; got != 0 {
+		t.Errorf("unparsed = %d, want 0: only stored and unparsed outcomes are media", got)
+	}
+	for _, call := range stats.recorded() {
+		if call.counter != dayCounterMediaStored || call.groupJID != "group_a@g.us" {
+			t.Errorf("counter write = %+v, want the stored count on the group it belongs to", call)
+		}
+	}
+	// The pending attachment is work not yet done: counting it would report bytes
+	// the bucket does not have (R3).
+	time.Sleep(20 * time.Millisecond)
+	if got := repo.counters["inst_1"][runtimeCounterMediaStored]; got != 1 {
+		t.Errorf("stored = %d, want 1: a pending attachment must not be counted", got)
+	}
+}
+
 // An outcome that holds no media is not media: `pending` is work not yet done,
 // `failed` is work that must be retried, and `unavailable` is media WhatsApp
 // will not give us. Counting any of them as stored or unparsed would claim bytes

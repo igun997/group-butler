@@ -6,8 +6,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"go.mau.fi/whatsmeow/types"
 )
 
 // newTestGroupStore hands each test a `groups` collection with the canonical
@@ -32,34 +30,32 @@ func newTestGroupStore(t *testing.T) (*groupStore, context.Context) {
 	return newGroupStore(db), ctx
 }
 
-func groupInfo(id, name string, participants int) *types.GroupInfo {
-	return &types.GroupInfo{
-		JID:              types.NewJID(id, types.GroupServer),
-		GroupName:        types.GroupName{Name: name, NameSetAt: time.Unix(1757750000, 0)},
-		ParticipantCount: participants,
+// syncSeed writes one snapshot entry the way a sync does: the bridge's own
+// answer, turned into an observation and upserted, so a store test exercises the
+// same path the reconcile uses rather than a hand-built document.
+func syncSeed(t *testing.T, store *groupStore, ctx context.Context, id, name string, participants int, source SyncSource) {
+	t.Helper()
+	entry := groupSnapshot{JID: id + "@g.us", Subject: name, ParticipantCount: participants}
+	if err := store.UpsertObserved(ctx, "org_default", "inst_1", entry.JID, observedFromSnapshot(entry, source, stamp(0)), true); err != nil {
+		t.Fatalf("sync seed %s: %v", entry.JID, err)
 	}
 }
 
 func TestUpsertGroupFromSync_PreservesConfig(t *testing.T) {
 	store, ctx := newTestGroupStore(t)
-	info := groupInfo("120363043123456789", "Ops Team", 12)
-	if err := store.UpsertFromSync(ctx, "org_default", "inst_1", info, SyncOnConnect); err != nil {
-		t.Fatalf("UpsertFromSync: %v", err)
-	}
+	groupJID := "120363043123456789@g.us"
+	syncSeed(t, store, ctx, "120363043123456789", "Ops Team", 12, SyncOnConnect)
 	// The BFF owns config.*: simulate an owner assigning and whitelisting it.
 	if _, err := store.collection().UpdateOne(ctx,
-		map[string]any{"instanceId": "inst_1", "groupJid": info.JID.String()},
+		map[string]any{"instanceId": "inst_1", "groupJid": groupJID},
 		map[string]any{"$set": map[string]any{"config.assigned": true, "config.whitelisted": true, "config.configVersion": int64(7), "config.notes": "keep me"}},
 	); err != nil {
 		t.Fatalf("seed config: %v", err)
 	}
 
-	info.ParticipantCount = 14
-	if err := store.UpsertFromSync(ctx, "org_default", "inst_1", info, SyncOnTimer); err != nil {
-		t.Fatalf("second UpsertFromSync: %v", err)
-	}
+	syncSeed(t, store, ctx, "120363043123456789", "Ops Team", 14, SyncOnTimer)
 
-	doc := store.FindOne(ctx, "org_default", "inst_1", info.JID.String())
+	doc := store.FindOne(ctx, "org_default", "inst_1", groupJID)
 	if doc == nil {
 		t.Fatal("group missing after upsert")
 	}
@@ -83,15 +79,13 @@ func TestUpsertGroupFromSync_PreservesConfig(t *testing.T) {
 
 func TestUpsertGroupFromSync_SeedsDefaultsOnInsert(t *testing.T) {
 	store, ctx := newTestGroupStore(t)
-	info := groupInfo("120363043123456789", "Ops Team", 12)
-	if err := store.UpsertFromSync(ctx, "org_default", "inst_1", info, SyncOnConnect); err != nil {
-		t.Fatalf("UpsertFromSync: %v", err)
-	}
-	doc := store.FindOne(ctx, "org_default", "inst_1", info.JID.String())
+	groupJID := "120363043123456789@g.us"
+	syncSeed(t, store, ctx, "120363043123456789", "Ops Team", 12, SyncOnConnect)
+	doc := store.FindOne(ctx, "org_default", "inst_1", groupJID)
 	if doc == nil {
 		t.Fatal("group missing after upsert")
 	}
-	if doc.OrganizationID != "org_default" || doc.InstanceID != "inst_1" || doc.GroupJID != info.JID.String() {
+	if doc.OrganizationID != "org_default" || doc.InstanceID != "inst_1" || doc.GroupJID != groupJID {
 		t.Errorf("identity = %q/%q/%q, want the org/instance/JID triple", doc.OrganizationID, doc.InstanceID, doc.GroupJID)
 	}
 	if doc.Observed.State != GroupActive {
@@ -111,11 +105,8 @@ func TestUpsertGroupFromSync_SeedsDefaultsOnInsert(t *testing.T) {
 
 func TestUpsertGroupFromSync_IsIdempotent(t *testing.T) {
 	store, ctx := newTestGroupStore(t)
-	info := groupInfo("120363043123456789", "Ops Team", 12)
 	for i := 0; i < 3; i++ {
-		if err := store.UpsertFromSync(ctx, "org_default", "inst_1", info, SyncOnTimer); err != nil {
-			t.Fatalf("UpsertFromSync #%d: %v", i, err)
-		}
+		syncSeed(t, store, ctx, "120363043123456789", "Ops Team", 12, SyncOnTimer)
 	}
 	count, err := store.collection().CountDocuments(ctx, map[string]any{})
 	if err != nil {
@@ -132,21 +123,17 @@ func TestUpsertGroupFromSync_IsIdempotent(t *testing.T) {
 // write (one-writer-per-subdocument, §5.2).
 func TestUpsertGroupFromSync_KeepsIngestOwnedCounters(t *testing.T) {
 	store, ctx := newTestGroupStore(t)
-	info := groupInfo("120363043123456789", "Ops Team", 12)
-	if err := store.UpsertFromSync(ctx, "org_default", "inst_1", info, SyncOnConnect); err != nil {
-		t.Fatalf("UpsertFromSync: %v", err)
-	}
+	groupJID := "120363043123456789@g.us"
+	syncSeed(t, store, ctx, "120363043123456789", "Ops Team", 12, SyncOnConnect)
 	if _, err := store.collection().UpdateOne(ctx,
-		map[string]any{"instanceId": "inst_1", "groupJid": info.JID.String()},
+		map[string]any{"instanceId": "inst_1", "groupJid": groupJID},
 		map[string]any{"$inc": map[string]any{"observed.messageCount": 4211, "observed.mediaStored": 7}},
 	); err != nil {
 		t.Fatalf("count activity: %v", err)
 	}
 
-	if err := store.UpsertFromSync(ctx, "org_default", "inst_1", info, SyncOnTimer); err != nil {
-		t.Fatalf("second UpsertFromSync: %v", err)
-	}
-	doc := store.FindOne(ctx, "org_default", "inst_1", info.JID.String())
+	syncSeed(t, store, ctx, "120363043123456789", "Ops Team", 12, SyncOnTimer)
+	doc := store.FindOne(ctx, "org_default", "inst_1", groupJID)
 	if doc.Observed.MessageCount != 4211 || doc.Observed.MediaStored != 7 {
 		t.Errorf("counters = %d/%d, want 4211/7: the sync write clobbered another writer",
 			doc.Observed.MessageCount, doc.Observed.MediaStored)
@@ -157,14 +144,12 @@ func TestUpsertGroupFromSync_KeepsIngestOwnedCounters(t *testing.T) {
 // not a reason to forget what the group was called (§6.6.5 rule 2).
 func TestMarkLeft_KeepsSubject(t *testing.T) {
 	store, ctx := newTestGroupStore(t)
-	info := groupInfo("120363043123456789", "Ops Team", 12)
-	if err := store.UpsertFromSync(ctx, "org_default", "inst_1", info, SyncOnConnect); err != nil {
-		t.Fatalf("UpsertFromSync: %v", err)
-	}
-	if err := store.MarkLeft(ctx, "org_default", "inst_1", info.JID.String(), GroupLeft); err != nil {
+	groupJID := "120363043123456789@g.us"
+	syncSeed(t, store, ctx, "120363043123456789", "Ops Team", 12, SyncOnConnect)
+	if err := store.MarkLeft(ctx, "org_default", "inst_1", groupJID, GroupLeft); err != nil {
 		t.Fatalf("MarkLeft: %v", err)
 	}
-	doc := store.FindOne(ctx, "org_default", "inst_1", info.JID.String())
+	doc := store.FindOne(ctx, "org_default", "inst_1", groupJID)
 	if doc.Observed.State != GroupLeft || doc.Observed.LeftDetectedAt.IsZero() {
 		t.Errorf("state/leftDetectedAt = %q/%v, want left/stamped", doc.Observed.State, doc.Observed.LeftDetectedAt)
 	}
@@ -237,18 +222,13 @@ func stampRootUpdatedAt(t *testing.T, store *groupStore, ctx context.Context, gr
 
 func TestUpsertObserved_LeavesRootUpdatedAtToTheBFF(t *testing.T) {
 	store, ctx := newTestGroupStore(t)
-	info := groupInfo("120363043123456789", "Ops Team", 12)
-	if err := store.UpsertFromSync(ctx, "org_default", "inst_1", info, SyncOnConnect); err != nil {
-		t.Fatalf("UpsertFromSync: %v", err)
-	}
+	groupJID := "120363043123456789@g.us"
+	syncSeed(t, store, ctx, "120363043123456789", "Ops Team", 12, SyncOnConnect)
 	bffAt := time.Unix(1757800000, 0)
-	stampRootUpdatedAt(t, store, ctx, info.JID.String(), bffAt)
+	stampRootUpdatedAt(t, store, ctx, groupJID, bffAt)
 
-	info.ParticipantCount = 14
-	if err := store.UpsertFromSync(ctx, "org_default", "inst_1", info, SyncOnTimer); err != nil {
-		t.Fatalf("second UpsertFromSync: %v", err)
-	}
-	doc := store.FindOne(ctx, "org_default", "inst_1", info.JID.String())
+	syncSeed(t, store, ctx, "120363043123456789", "Ops Team", 14, SyncOnTimer)
+	doc := store.FindOne(ctx, "org_default", "inst_1", groupJID)
 	if doc == nil {
 		t.Fatal("group missing after upsert")
 	}
@@ -262,17 +242,15 @@ func TestUpsertObserved_LeavesRootUpdatedAtToTheBFF(t *testing.T) {
 
 func TestMarkLeft_LeavesRootUpdatedAtToTheBFF(t *testing.T) {
 	store, ctx := newTestGroupStore(t)
-	info := groupInfo("120363043123456789", "Ops Team", 12)
-	if err := store.UpsertFromSync(ctx, "org_default", "inst_1", info, SyncOnConnect); err != nil {
-		t.Fatalf("UpsertFromSync: %v", err)
-	}
+	groupJID := "120363043123456789@g.us"
+	syncSeed(t, store, ctx, "120363043123456789", "Ops Team", 12, SyncOnConnect)
 	bffAt := time.Unix(1757800000, 0)
-	stampRootUpdatedAt(t, store, ctx, info.JID.String(), bffAt)
+	stampRootUpdatedAt(t, store, ctx, groupJID, bffAt)
 
-	if err := store.MarkLeft(ctx, "org_default", "inst_1", info.JID.String(), GroupLeft); err != nil {
+	if err := store.MarkLeft(ctx, "org_default", "inst_1", groupJID, GroupLeft); err != nil {
 		t.Fatalf("MarkLeft: %v", err)
 	}
-	doc := store.FindOne(ctx, "org_default", "inst_1", info.JID.String())
+	doc := store.FindOne(ctx, "org_default", "inst_1", groupJID)
 	if doc == nil {
 		t.Fatal("group missing after MarkLeft")
 	}
@@ -289,11 +267,9 @@ func TestMarkLeft_LeavesRootUpdatedAtToTheBFF(t *testing.T) {
 // meaningful on the dashboard.
 func TestUpsertObserved_StampsRootTimestampsOnlyOnInsert(t *testing.T) {
 	store, ctx := newTestGroupStore(t)
-	info := groupInfo("120363043123456789", "Ops Team", 12)
-	if err := store.UpsertFromSync(ctx, "org_default", "inst_1", info, SyncOnConnect); err != nil {
-		t.Fatalf("UpsertFromSync: %v", err)
-	}
-	created := store.FindOne(ctx, "org_default", "inst_1", info.JID.String())
+	groupJID := "120363043123456789@g.us"
+	syncSeed(t, store, ctx, "120363043123456789", "Ops Team", 12, SyncOnConnect)
+	created := store.FindOne(ctx, "org_default", "inst_1", groupJID)
 	if created.CreatedAt.IsZero() || created.UpdatedAt.IsZero() {
 		t.Fatalf("createdAt/updatedAt = %v/%v, want the insert branch to stamp them", created.CreatedAt, created.UpdatedAt)
 	}
@@ -301,10 +277,8 @@ func TestUpsertObserved_StampsRootTimestampsOnlyOnInsert(t *testing.T) {
 		t.Errorf("createdAt/updatedAt = %v/%v, want the same insert instant", created.CreatedAt, created.UpdatedAt)
 	}
 
-	if err := store.UpsertFromSync(ctx, "org_default", "inst_1", info, SyncOnTimer); err != nil {
-		t.Fatalf("second UpsertFromSync: %v", err)
-	}
-	updated := store.FindOne(ctx, "org_default", "inst_1", info.JID.String())
+	syncSeed(t, store, ctx, "120363043123456789", "Ops Team", 12, SyncOnTimer)
+	updated := store.FindOne(ctx, "org_default", "inst_1", groupJID)
 	if !updated.CreatedAt.Equal(created.CreatedAt) || !updated.UpdatedAt.Equal(created.UpdatedAt) {
 		t.Errorf("root timestamps moved on an observation update: %v/%v, want %v/%v",
 			updated.CreatedAt, updated.UpdatedAt, created.CreatedAt, created.UpdatedAt)

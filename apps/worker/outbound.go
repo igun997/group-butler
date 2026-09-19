@@ -4,10 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-
-	"go.mau.fi/whatsmeow/proto/waE2E"
-	"go.mau.fi/whatsmeow/types"
-	"google.golang.org/protobuf/proto"
 )
 
 // The two kinds of chat a stored send request can name. A row without the field
@@ -21,19 +17,17 @@ const (
 // being replied to, and the JID of whoever sent it. Both are read from stored
 // rows before the send — the id from the request, the sender from the message it
 // names — because a quote that named the wrong sender would be worse than no
-// quote at all. The quoted message itself is not rebuilt: `ContextInfo.StanzaID`
-// is what WhatsApp resolves the quote with, and reconstructing the tree would
-// need a decoder this worker does not have.
+// quote at all. The quoted message itself is not rebuilt: neither WhatsApp nor the
+// bridge needs its body to resolve a reply, only what it is addressed to.
 type quotedMessage struct {
 	ID          string
 	Participant string
 }
 
-// outboundText is the stored request reduced to the only data a text envelope needs.
+// outboundText is the stored request reduced to the only data a send needs.
 // `GroupJID` carries the chat JID, which for a direct chat is the owner's own
 // user JID; `ChatKind` says which of the two it is.
 type outboundText struct {
-	ID       string
 	GroupJID string
 	ChatKind string
 	Text     string
@@ -42,66 +36,70 @@ type outboundText struct {
 	Quote quotedMessage
 }
 
-// buildTextEnvelope has no network or storage effects, so the exact chat and content
-// sent after a claim are proven before a WhatsApp client is ever called.
-func buildTextEnvelope(request outboundText) (types.JID, *waE2E.Message, error) {
-	if request.ID == "" {
-		return types.EmptyJID, nil, errors.New("send request has no id")
-	}
+// outboundSend is one send as the Hermes bridge is asked for it: the chat, the
+// text, and the reply target. The bridge owns the envelope from here — it decides
+// the WhatsApp id, the chunking and the quoting node — which is why this carries
+// no message tree of its own.
+type outboundSend struct {
+	ChatID string
+	Text   string
+	Reply  quotedMessage
+}
+
+// buildOutboundSend has no network or storage effects, so the exact chat and
+// content sent after a claim are proven before the bridge is ever called: the row
+// says where a message goes, and a row that contradicts itself is refused rather
+// than delivered to whichever half was believed.
+func buildOutboundSend(request outboundText) (outboundSend, error) {
 	text := strings.TrimSpace(request.Text)
 	if text == "" {
-		return types.EmptyJID, nil, errors.New("send request text is empty")
+		return outboundSend{}, errors.New("send request text is empty")
 	}
-	jid, err := types.ParseJID(request.GroupJID)
+	jid, err := parseAddress(request.GroupJID)
 	if err != nil {
-		return types.EmptyJID, nil, fmt.Errorf("send target %q is not a jid: %w", request.GroupJID, err)
+		return outboundSend{}, fmt.Errorf("send target %q is not a jid: %w", request.GroupJID, err)
 	}
 	if err := checkChatKind(request.ChatKind, jid); err != nil {
-		return types.EmptyJID, nil, err
+		return outboundSend{}, err
 	}
 	// A quote carries both halves or it is not a quote: a reply that named a
-	// sender but no message, or a message but no sender, would be sent as
-	// something WhatsApp cannot resolve — worse than the plain text it replaced.
-	quote := quotedMessage{ID: strings.TrimSpace(request.Quote.ID), Participant: strings.TrimSpace(request.Quote.Participant)}
+	// sender but no message, or a message but no sender, would be sent as something
+	// WhatsApp cannot resolve — worse than the plain text it replaced.
+	quote := quotedMessage{
+		ID:          strings.TrimSpace(request.Quote.ID),
+		Participant: strings.TrimSpace(request.Quote.Participant),
+	}
 	if quote.ID == "" && quote.Participant == "" {
-		return jid, &waE2E.Message{Conversation: proto.String(text)}, nil
+		return outboundSend{ChatID: jid.String(), Text: text}, nil
 	}
 	if quote.ID == "" {
-		return types.EmptyJID, nil, errors.New("send request quotes a message without its id")
+		return outboundSend{}, errors.New("send request quotes a message without its id")
 	}
 	if quote.Participant == "" {
-		return types.EmptyJID, nil, fmt.Errorf("quoted message %s has no sender jid", quote.ID)
+		return outboundSend{}, fmt.Errorf("quoted message %s has no sender jid", quote.ID)
 	}
-	participant, err := types.ParseJID(quote.Participant)
-	if err != nil || participant.User == "" {
-		return types.EmptyJID, nil, fmt.Errorf("quoted message %s names an unusable sender %q", quote.ID, quote.Participant)
+	participant, err := parseAddress(quote.Participant)
+	if err != nil || participant.user == "" {
+		return outboundSend{}, fmt.Errorf("quoted message %s names an unusable sender %q", quote.ID, quote.Participant)
 	}
-	// A quote lives in ContextInfo, which only an extended text carries, so a
-	// reply is one rather than the plain Conversation above.
-	return jid, &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
-		Text: proto.String(text),
-		ContextInfo: &waE2E.ContextInfo{
-			StanzaID:    proto.String(quote.ID),
-			Participant: proto.String(participant.String()),
-		},
-	}}, nil
+	return outboundSend{ChatID: jid.String(), Text: text, Reply: quotedMessage{ID: quote.ID, Participant: participant.String()}}, nil
 }
 
 // checkChatKind keeps a row's kind and its JID server in agreement: a group chat
 // is addressed by a group JID, a direct chat by the user's own JID. Without it a
 // mislabelled row would send a group message into a private chat — or the
 // reverse — which is the mistake the stored kind exists to prevent.
-func checkChatKind(kind string, jid types.JID) error {
-	if jid.User == "" {
+func checkChatKind(kind string, jid waAddress) error {
+	if jid.user == "" {
 		return fmt.Errorf("send target %q has no user part", jid)
 	}
 	switch kind {
 	case "", chatKindGroup:
-		if jid.Server != types.GroupServer {
+		if !jid.isGroup() {
 			return fmt.Errorf("send target %q is not a group jid", jid)
 		}
 	case chatKindUser:
-		if jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer {
+		if !jid.isUser() {
 			return fmt.Errorf("send target %q is not a user jid", jid)
 		}
 	default:

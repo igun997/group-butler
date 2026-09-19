@@ -5,10 +5,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"go.mau.fi/whatsmeow/proto/waE2E"
-	"go.mau.fi/whatsmeow/types"
-	"google.golang.org/protobuf/proto"
 )
 
 func TestLoadConfig_LocalDefaults(t *testing.T) {
@@ -37,26 +33,6 @@ func TestLoadConfig_LocalDefaults(t *testing.T) {
 	}
 }
 
-func TestLoadConfig_DevWhatsmeowDBMatchesEnvExample(t *testing.T) {
-	// The unset fallback is the value the dev launcher sources from the root
-	// `.env.example`, i.e. a relative path inside the git-ignored
-	// apps/worker/.localdata/ — never the container's mounted /data path, which
-	// a host process may not even be able to create.
-	setDevEnv(t)
-	t.Setenv("WHATSMEOW_DB_URI", "")
-
-	cfg, err := loadConfig()
-	if err != nil {
-		t.Fatalf("loadConfig: %v", err)
-	}
-	if want := envExampleValue(t, "WHATSMEOW_DB_URI"); cfg.WhatsmeowDB != want {
-		t.Errorf("WhatsmeowDB = %q, want %q from .env.example", cfg.WhatsmeowDB, want)
-	}
-}
-
-// setDevEnv pins every variable loadConfig reads to a documentedly valid
-// development value, so a test can never be perturbed by what the developer's
-// shell happens to export (PORT, ORGANIZATION_ID, GROUP_SYNC_PRUNE, any knob).
 func setDevEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("ENVIRONMENT", developmentEnv)
@@ -66,7 +42,6 @@ func setDevEnv(t *testing.T) {
 		"PORT",
 		"ORGANIZATION_ID",
 		"MONGODB_DB",
-		"WHATSMEOW_DB_URI",
 		"LOG_LEVEL",
 		"R2_ACCOUNT_ID",
 		"R2_ACCESS_KEY_ID",
@@ -83,17 +58,12 @@ func setDevEnv(t *testing.T) {
 		"INGEST_QUEUE_SIZE",
 		"INGEST_FLUSH_MS",
 		"INGEST_FLUSH_MAX",
-		"EVENT_QUEUE_SIZE",
-		"EVENT_WORKERS",
 		"RAW_JSON_MAX_BYTES",
 		"RAW_SEARCH_MAX_BYTES",
 		"MEDIA_MAX_BYTES",
 		"MEDIA_CONCURRENCY",
 		"MEDIA_DOWNLOAD_TIMEOUT",
-		"MEDIA_MAX_ATTEMPTS",
-		"MEDIA_JANITOR_INTERVAL",
 		"MEDIA_ENRICH_ENABLED",
-		"HISTORY_SYNC_MAX_DAYS",
 		"GROUP_SYNC_INTERVAL",
 		"GROUP_STALE_AFTER",
 		"GROUP_SYNC_PRUNE",
@@ -133,41 +103,11 @@ func TestLoadConfigProductionRejectsDevelopmentMemoryCallbackSecret(t *testing.T
 	setDevEnv(t)
 	t.Setenv("ENVIRONMENT", productionEnv)
 	t.Setenv("WORKER_SECRET", "production-secret-from-the-secret-store")
-	t.Setenv("WHATSMEOW_DB_URI", "file:/data/whatsmeow.db?_foreign_keys=on")
 	t.Setenv("MEMORY_CALLBACK_URL", "https://memory.example.test/batches")
 	t.Setenv("MEMORY_CALLBACK_SECRET", devMemoryCallbackSecret)
 	if _, err := loadConfig(); err == nil {
 		t.Fatal("loadConfig accepted the documented development memory callback secret in production")
 	}
-}
-
-func TestLoadConfig_ProductionWhatsmeowDB(t *testing.T) {
-	const prodSecret = "production-secret-from-the-secret-store"
-
-	t.Run("rejects an unset WHATSMEOW_DB_URI", func(t *testing.T) {
-		setDevEnv(t)
-		t.Setenv("ENVIRONMENT", productionEnv)
-		t.Setenv("WORKER_SECRET", prodSecret)
-
-		if _, err := loadConfig(); err == nil {
-			t.Fatal("loadConfig fell back to the development auth store in production")
-		}
-	})
-
-	t.Run("accepts the declared mounted auth path", func(t *testing.T) {
-		setDevEnv(t)
-		t.Setenv("ENVIRONMENT", productionEnv)
-		t.Setenv("WORKER_SECRET", prodSecret)
-		t.Setenv("WHATSMEOW_DB_URI", "file:/data/whatsmeow.db?_foreign_keys=on")
-
-		cfg, err := loadConfig()
-		if err != nil {
-			t.Fatalf("loadConfig: %v", err)
-		}
-		if cfg.WhatsmeowDB != "file:/data/whatsmeow.db?_foreign_keys=on" {
-			t.Errorf("WhatsmeowDB = %q", cfg.WhatsmeowDB)
-		}
-	})
 }
 
 func TestLoadConfig_RejectsNonPositiveLimits(t *testing.T) {
@@ -184,9 +124,6 @@ func TestLoadConfig_RejectsNonPositiveLimits(t *testing.T) {
 		{"MEDIA_MAX_BYTES", "0"},
 		{"MEDIA_CONCURRENCY", "0"},
 		{"MEDIA_DOWNLOAD_TIMEOUT", "0"},
-		{"MEDIA_MAX_ATTEMPTS", "0"},
-		{"MEDIA_JANITOR_INTERVAL", "0"},
-		{"HISTORY_SYNC_MAX_DAYS", "0"},
 		{"GROUP_SYNC_INTERVAL", "0"},
 		{"GROUP_STALE_AFTER", "0"},
 		{"DISPATCH_INTERVAL", "0"},
@@ -210,13 +147,13 @@ func TestLoadConfig_NonPositiveDurationErrorIsOperatorReadable(t *testing.T) {
 	// A rejected interval must name the variable and print the duration the way
 	// it was configured, not as raw nanoseconds.
 	setDevEnv(t)
-	t.Setenv("MEDIA_JANITOR_INTERVAL", "-1s")
+	t.Setenv("MEDIA_DOWNLOAD_TIMEOUT", "-1s")
 
 	_, err := loadConfig()
 	if err == nil {
-		t.Fatal("loadConfig accepted MEDIA_JANITOR_INTERVAL=-1s")
+		t.Fatal("loadConfig accepted MEDIA_DOWNLOAD_TIMEOUT=-1s")
 	}
-	if !strings.Contains(err.Error(), "MEDIA_JANITOR_INTERVAL") || !strings.Contains(err.Error(), "-1s") {
+	if !strings.Contains(err.Error(), "MEDIA_DOWNLOAD_TIMEOUT") || !strings.Contains(err.Error(), "-1s") {
 		t.Errorf("error = %q, want the variable name and the duration", err)
 	}
 }
@@ -289,22 +226,19 @@ func TestLoadConfigBindsRawCapsToParser(t *testing.T) {
 			rawJSONMaxBytes, rawSearchMaxBytes, cfg.RawJSONMaxBytes, cfg.RawSearchMax)
 	}
 
-	// The same caps must reach the parse itself, not just the variables.
-	msg := &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
-		Caption:       proto.String("quarterly chart"),
-		Mimetype:      proto.String("image/jpeg"),
-		JPEGThumbnail: make([]byte, 4096),
-	}}
-	doc, err := parseInbound(
-		evtMessage(types.NewJID("120363043123456789", types.GroupServer), types.NewJID("628990000001", types.DefaultUserServer), "3EB0E1", msg),
-		"org_default", "inst_1",
-	)
+	// The same caps must reach the mapping itself, not just the variables: the
+	// Hermes ingest path is the one producer left, and it prunes the stored tree
+	// with exactly these limits.
+	raw, rawSearch, err := externalRaw(externalEvent{
+		MessageID: "3EB0E1", ChatID: "120363043123456789@g.us", SenderID: "628990000001@s.whatsapp.net",
+		Body: strings.Repeat("quarterly chart ", 512),
+	})
 	if err != nil {
-		t.Fatalf("parseInbound: %v", err)
+		t.Fatalf("externalRaw: %v", err)
 	}
-	if !doc.Raw.Truncated || len(doc.RawSearch) > 64 {
+	if !raw.Truncated || len(rawSearch) > 64 {
 		t.Errorf("raw truncated=%v (%d bytes), rawSearch=%d bytes, want the configured caps applied",
-			doc.Raw.Truncated, doc.Raw.Bytes, len(doc.RawSearch))
+			raw.Truncated, raw.Bytes, len(rawSearch))
 	}
 }
 

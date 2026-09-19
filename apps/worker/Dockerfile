@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# Production image for the Go whatsmeow worker.
+# Production image for the Go worker.
 #
 #   docker build -f apps/worker/Dockerfile -t butler-worker:dev apps/worker
 #
@@ -9,9 +9,9 @@
 # worker as a host process and the architecture forbids using an image for local
 # development (docs/architecture-draft.md §4, §13).
 #
-# CGO is mandatory — mattn/go-sqlite3 (the whatsmeow auth store) links libc — so
-# the build runs on the Debian-based golang image and the runtime must be
-# glibc-based (docs/architecture-draft.md §12.1).
+# The worker holds no WhatsApp session (main.go): every dependency is pure Go, so
+# CGO is OFF and the binary is static. There is no auth store to link a SQLite
+# driver for — the linked device lives in the Hermes container, not here.
 
 # The builder tracks the language version `go.mod` requires, because the Golang
 # images pin GOTOOLCHAIN=local: with an older builder the toolchain cannot fetch
@@ -20,7 +20,7 @@
 FROM golang:1.26-bookworm AS builder
 
 WORKDIR /src
-ENV CGO_ENABLED=1 GOOS=linux
+ENV CGO_ENABLED=0 GOOS=linux
 
 # Manifests first so `go mod download` is cached across source edits.
 COPY go.mod go.sum ./
@@ -35,29 +35,24 @@ RUN go build -trimpath -ldflags="-s -w" -o /out/worker .
 
 FROM debian:bookworm-slim AS production
 
-# ca-certificates: TLS to MongoDB, Cloudflare R2 and the WhatsApp servers.
+# ca-certificates: TLS to MongoDB, Cloudflare R2 and the Hermes bridge.
 # curl: the HEALTHCHECK below — the slim base ships no HTTP client.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd --system --gid 10001 butler \
  && useradd --system --uid 10001 --gid butler --home-dir /app --shell /usr/sbin/nologin butler \
- && mkdir -p /app /data \
- && chown -R butler:butler /app /data
+ && mkdir -p /app \
+ && chown -R butler:butler /app
 
 WORKDIR /app
 ENV PORT=4000
 
 COPY --from=builder /out/worker /usr/local/bin/worker
 
-# The whatsmeow auth store lives on this volume, so a container restart never
-# loses the linked device. A named volume inherits this directory's ownership
-# (butler:butler) when Docker first creates it; a bind mount does not, so an
-# operator using one must chown it. WHATSMEOW_DB_URI has to point inside /data
-# (see apps/worker/.env.production.example): the worker rejects the relative
-# development default once ENVIRONMENT=production, and a path outside the volume
-# would re-pair the device on every restart.
-VOLUME ["/data"]
+# There is deliberately no data volume: the linked-device keys are Hermes's, and
+# this container's only durable dependency is MongoDB. A worker that still kept a
+# credential on disk would race the console's own session for the same account.
 
 USER butler
 

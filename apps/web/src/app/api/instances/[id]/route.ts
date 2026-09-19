@@ -3,8 +3,11 @@ import { clientKey } from "../../../../server/auth/client";
 import { guardInstance } from "../../../../server/instance-guard";
 import { getDb } from "../../../../server/mongo";
 import { logFailure } from "../../../../server/log-failure";
+import { hermesInstanceSnapshot } from "../../../../server/hermes/instance";
+import { readHermesPairingAny } from "../../../../server/hermes/pairing";
+import { getInstanceDoc } from "../../../../server/repos/instances";
 import { updateInstanceConfig, WHITELIST_MAX_GROUPS } from "../../../../server/repos/instance-config";
-import { deleteWorkerInstance, getWorkerInstance, workerFailureResponse } from "../../../../server/worker/client";
+import { deleteWorkerInstance, workerFailureResponse } from "../../../../server/worker/client";
 
 /**
  * §7.3 `/api/instances/[id]`: one instance's live control-plane state, proxied
@@ -56,9 +59,10 @@ export async function GET(
   const guard = await guardInstance(id);
   if (!guard.ok) return guard.response;
 
-  const result = await getWorkerInstance(id);
-  if (!result.ok) return workerFailureResponse(result.failure);
-  return Response.json(result.data, { headers: { "cache-control": "no-store" } });
+  const db = await getDb();
+  const doc = await getInstanceDoc(db, guard.organizationId, id);
+  if (doc === null) return Response.json({ error: "not found", code: "not_found" }, { status: 404 });
+  return Response.json(hermesInstanceSnapshot(doc, await readHermesPairingAny()), { headers: { "cache-control": "no-store" } });
 }
 
 export async function PATCH(

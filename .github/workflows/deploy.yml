@@ -57,6 +57,15 @@ jobs:
             context: apps/worker
             file: apps/worker/Dockerfile
             cache-scope: worker
+          # Hermes is published so a deployment pulls a bridge that already carries
+          # the group-butler patch. Shipping it any other way — mounting a file, or
+          # `docker cp` into a running container — is undone by the next recreate,
+          # and the failure is silent: the bridge still starts and still connects,
+          # it just stops archiving and stops accepting group actions.
+          - image: hermes
+            context: infra/hermes
+            file: infra/hermes/Dockerfile
+            cache-scope: hermes
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

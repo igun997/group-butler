@@ -1,7 +1,13 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { SESSION_COOKIE } from "./server/auth/cookie";
 
-const OPEN_API_PATHS = ["/api/auth/login", "/api/health", "/api/internal/reply-jobs"];
+/**
+ * Paths that authenticate themselves and so must reach their handler without a
+ * console session: the login handshake, the health probe, the worker's callback
+ * (shared secret), and the MCP endpoint (bearer token). A cookie is not the only
+ * credential this server accepts.
+ */
+const OPEN_API_PATHS = ["/api/auth/login", "/api/health", "/api/internal/reply-jobs", "/api/mcp"];
 
 /** The one page the public shell serves. Everything else needs a session. */
 const PUBLIC_PAGES = new Set(["/login"]);

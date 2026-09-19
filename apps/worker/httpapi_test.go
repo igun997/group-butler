@@ -3,23 +3,31 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
-
-	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/types"
 )
 
-func newTestAPI(t *testing.T, client groupClient) (*api, *groupStore, context.Context) {
+// The control plane's group surface talks to exactly one live thing — the Hermes
+// bridge — so these tests point a real api at a real HTTP server standing where
+// the container does. A route that works here works in production.
+
+// newTestAPI wires the group surface the way a running worker is wired: a manager
+// whose configured bridge is this server. A nil bridge is a worker that has none,
+// which every live route answers as `instance_offline`.
+func newTestAPI(t *testing.T, bridge *fakeBridge) (*api, *groupStore, context.Context) {
 	t.Helper()
 	store, ctx := newTestGroupStore(t)
-	return &api{
-		store: store, clientFor: func(string) groupClient { return client }, orgID: "org_default",
+	handler := &api{
+		store: store, orgID: "org_default",
 		secret: "dev-secret", prune: true, staleAfter: time.Hour,
-	}, store, ctx
+	}
+	if bridge != nil {
+		handler.bridge = bridge.client(t)
+	}
+	return handler, store, ctx
 }
 
 // call drives the handler with the bearer token the control plane requires.
@@ -33,11 +41,21 @@ func call(handler *api, method, path string, token string) *httptest.ResponseRec
 	return rec
 }
 
-func TestGetInstanceGroups_HTTP(t *testing.T) {
-	handler, store, ctx := newTestAPI(t, &fakeGroupClient{})
-	if err := store.UpsertFromSync(ctx, "org_default", "inst_1", groupInfo("120363043123456789", "Ops Team", 12), SyncOnConnect); err != nil {
-		t.Fatalf("seed: %v", err)
+// groupReadAnswer is the bridge's own payload for `GET /group/:jid`: the subject,
+// the two switches and the membership, with the badges WhatsApp gave each member.
+func groupReadAnswer(subject string, announce, locked bool, participants ...bridgeParticipant) string {
+	body, err := json.Marshal(map[string]any{
+		"ok": true, "subject": subject, "announce": announce, "locked": locked, "participants": participants,
+	})
+	if err != nil {
+		panic(err)
 	}
+	return string(body)
+}
+
+func TestGetInstanceGroups_HTTP(t *testing.T) {
+	handler, store, ctx := newTestAPI(t, newFakeBridge(t))
+	storeSeed(t, store, ctx, "120363043123456789@g.us", "Ops Team", 12)
 	// A group whose subject WhatsApp has not given us yet.
 	if err := store.UpsertObserved(ctx, "org_default", "inst_1", "120363043999999999@g.us",
 		Observed{Subject: "", State: GroupActive, SubjectSource: SubjectFromFallback}, false); err != nil {
@@ -87,7 +105,7 @@ func TestGetInstanceGroups_HTTP(t *testing.T) {
 }
 
 func TestGroupEndpoints_RequireBearer(t *testing.T) {
-	handler, _, _ := newTestAPI(t, &fakeGroupClient{})
+	handler, _, _ := newTestAPI(t, newFakeBridge(t))
 	for _, token := range []string{"", "wrong-secret"} {
 		rec := call(handler, http.MethodGet, "/instances/inst_1/groups", token)
 		if rec.Code != http.StatusUnauthorized {
@@ -104,14 +122,12 @@ func TestGroupEndpoints_RequireBearer(t *testing.T) {
 }
 
 func TestGroupSyncEndpoint_Summary(t *testing.T) {
-	client := &fakeGroupClient{groups: []*types.GroupInfo{
-		groupInfo("120363043000000001", "A", 3),
-		groupInfo("120363043000000002", "B", 4),
-	}}
-	handler, store, ctx := newTestAPI(t, client)
-	if err := store.UpsertFromSync(ctx, "org_default", "inst_1", groupInfo("120363043000000003", "C", 5), SyncOnConnect); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
+	bridge := newFakeBridge(t).answering(http.StatusOK, groupsAnswer(
+		bridgeGroup("120363043000000001", "A", 3),
+		bridgeGroup("120363043000000002", "B", 4),
+	))
+	handler, store, ctx := newTestAPI(t, bridge)
+	storeSeed(t, store, ctx, "120363043000000003@g.us", "C", 5)
 
 	rec := call(handler, http.MethodPost, "/instances/inst_1/groups/sync", "dev-secret")
 	if rec.Code != http.StatusOK {
@@ -136,13 +152,37 @@ func TestGroupSyncEndpoint_Summary(t *testing.T) {
 	if doc := store.FindOne(ctx, "org_default", "inst_1", "120363043000000003@g.us"); doc == nil || doc.Observed.State != GroupLeft {
 		t.Errorf("C = %+v, want state left", doc)
 	}
+	if call := bridge.only(t); call.path != "/groups" {
+		t.Errorf("the sync asked %s, want the group list endpoint", call.path)
+	}
 }
 
-func TestGroupSyncEndpoint_OfflineInstance(t *testing.T) {
+// The bridge *is* the WhatsApp connection the sync would have used, so a worker
+// without one — or one whose bridge cannot be reached — answers `instance_offline`
+// rather than serving a snapshot that never arrived.
+func TestGroupSyncEndpoint_NoBridgeIsOffline(t *testing.T) {
 	handler, _, _ := newTestAPI(t, nil)
 	rec := call(handler, http.MethodPost, "/instances/offline/groups/sync", "dev-secret")
 	if rec.Code != http.StatusConflict {
-		t.Errorf("status = %d, want 409 when the instance has no live client", rec.Code)
+		t.Errorf("status = %d, want 409 when there is no live session to ask", rec.Code)
+	}
+	var body struct {
+		Code string `json:"code"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
+	if body.Code != "instance_offline" {
+		t.Errorf("code = %q, want instance_offline", body.Code)
+	}
+}
+
+func TestGroupSyncEndpoint_UnreachableBridgeIsOffline(t *testing.T) {
+	bridge := newFakeBridge(t)
+	handler, _, _ := newTestAPI(t, bridge)
+	handler.bridge = bridge.closedClient(t)
+
+	rec := call(handler, http.MethodPost, "/instances/inst_1/groups/sync", "dev-secret")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 for a bridge nothing is listening on: %s", rec.Code, rec.Body.String())
 	}
 	var body struct {
 		Code string `json:"code"`
@@ -154,21 +194,20 @@ func TestGroupSyncEndpoint_OfflineInstance(t *testing.T) {
 }
 
 func TestGroupSyncEndpoint_FailedSyncIsReported(t *testing.T) {
-	handler, store, ctx := newTestAPI(t, &fakeGroupClient{err: errors.New("iq timeout")})
-	if err := store.UpsertFromSync(ctx, "org_default", "inst_1", groupInfo("120363043000000001", "A", 3), SyncOnConnect); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
+	handler, store, ctx := newTestAPI(t, newFakeBridge(t).refusing("rate-overlimit"))
+	storeSeed(t, store, ctx, "120363043000000001@g.us", "A", 3)
+
 	rec := call(handler, http.MethodPost, "/instances/inst_1/groups/sync", "dev-secret")
 	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502 for a failed sync", rec.Code)
+		t.Fatalf("status = %d, want 502 for a refused sync", rec.Code)
 	}
 	var body struct {
 		Error string `json:"error"`
 		Code  string `json:"code"`
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &body)
-	if body.Code != "group_sync_failed" || body.Error == "" {
-		t.Errorf("body = %+v, want a group_sync_failed error", body)
+	if body.Code != "group_admin_failed" || body.Error == "" {
+		t.Errorf("body = %+v, want the group-failure code the group surface uses", body)
 	}
 	if doc := store.FindOne(ctx, "org_default", "inst_1", "120363043000000001@g.us"); doc == nil || doc.Observed.State != GroupActive {
 		t.Errorf("A = %+v, want it untouched by the failed sync", doc)
@@ -176,10 +215,8 @@ func TestGroupSyncEndpoint_FailedSyncIsReported(t *testing.T) {
 }
 
 func TestGroupEndpoints_MethodAndRouteErrors(t *testing.T) {
-	handler, store, ctx := newTestAPI(t, &fakeGroupClient{})
-	if err := store.UpsertFromSync(ctx, "org_default", "inst_1", groupInfo("120363043123456789", "Ops Team", 12), SyncOnConnect); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
+	handler, store, ctx := newTestAPI(t, newFakeBridge(t))
+	storeSeed(t, store, ctx, "120363043123456789@g.us", "Ops Team", 12)
 	cases := []struct {
 		method string
 		path   string
@@ -189,7 +226,6 @@ func TestGroupEndpoints_MethodAndRouteErrors(t *testing.T) {
 		{http.MethodGet, "/instances/inst_1/groups/sync", http.StatusMethodNotAllowed},
 		{http.MethodGet, "/instances/inst_1/groups/120363043999999999@g.us", http.StatusNotFound},
 		{http.MethodGet, "/instances/inst_1/messages", http.StatusNotFound},
-		{http.MethodGet, "/instances/inst_1", http.StatusNotFound},
 	}
 	for _, tc := range cases {
 		rec := call(handler, tc.method, tc.path, "dev-secret")
@@ -203,12 +239,10 @@ func TestGroupEndpoints_MethodAndRouteErrors(t *testing.T) {
 // dashboard: assigned groups first, most recently active within each band, and
 // every row carrying both the ID and the current name.
 func TestGroupList_OrderingAndShape(t *testing.T) {
-	handler, store, ctx := newTestAPI(t, &fakeGroupClient{})
-	seedGroups(t, store, ctx,
-		groupInfo("120363043000000001", "Quiet", 3),
-		groupInfo("120363043000000002", "Busy", 4),
-		groupInfo("120363043000000003", "Assigned", 5),
-	)
+	handler, store, ctx := newTestAPI(t, newFakeBridge(t))
+	storeSeed(t, store, ctx, "120363043000000001@g.us", "Quiet", 3)
+	storeSeed(t, store, ctx, "120363043000000002@g.us", "Busy", 4)
+	storeSeed(t, store, ctx, "120363043000000003@g.us", "Assigned", 5)
 	// lastActivityAt/messageCount belong to ingest, so the fixtures set them the
 	// way ingest does: a raw field update, not a group-store write.
 	if _, err := store.collection().UpdateOne(ctx, map[string]any{"groupJid": "120363043000000001@g.us"},
@@ -273,13 +307,13 @@ func TestGroupList_OrderingAndShape(t *testing.T) {
 	}
 }
 
-// A stale group is repaired from WhatsApp on demand (§6.6.2), and the row the
+// A stale group is repaired from the bridge on demand (§6.6.2), and the row the
 // dashboard receives is the repaired one.
 func TestGroupByJID_RepairsStaleGroup(t *testing.T) {
 	jid := "120363043123456789@g.us"
-	info := groupInfo("120363043123456789", "Repaired", 9)
-	info.NameSetAt = stamp(5)
-	handler, store, ctx := newTestAPI(t, &fakeGroupClient{info: map[string]*types.GroupInfo{jid: info}})
+	bridge := newFakeBridge(t).answering(http.StatusOK,
+		groupReadAnswer("Repaired", false, false, bridgeParticipant{JID: "628990000009@s.whatsapp.net", Admin: participantSuperAdmin}))
+	handler, store, ctx := newTestAPI(t, bridge)
 	if err := store.UpsertObserved(ctx, "org_default", "inst_1", jid, Observed{
 		Subject: "Stale", SubjectSearch: "stale", SubjectSource: SubjectFromSync,
 		State: GroupActive, LastSyncedAt: stamp(0), LastSyncSource: SyncOnConnect,
@@ -299,8 +333,11 @@ func TestGroupByJID_RepairsStaleGroup(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &row); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if row.Name != "Repaired" || row.ParticipantCount != 9 || row.GroupJID != jid {
+	if row.Name != "Repaired" || row.ParticipantCount != 1 || row.GroupJID != jid {
 		t.Errorf("row = %+v, want the repaired group", row)
+	}
+	if call := bridge.only(t); call.path != "/group/"+jid {
+		t.Errorf("the repair asked %s, want the single-group read", call.path)
 	}
 	doc := store.FindOne(ctx, "org_default", "inst_1", jid)
 	if doc == nil || doc.Observed.Subject != "Repaired" {
@@ -311,45 +348,37 @@ func TestGroupByJID_RepairsStaleGroup(t *testing.T) {
 	}
 }
 
+// A group the account can no longer see is marked gone, keeping the name it had.
+// The bridge reports "removed" and "deleted" as the same not-found, and `left` is
+// the honest state of the pair: the row survives with its history and a later
+// snapshot can reactivate it.
 func TestGroupByJID_RepairNotFoundMarksState(t *testing.T) {
-	cases := []struct {
-		name string
-		err  error
-		want GroupState
-	}{
-		{"removed from the group", whatsmeow.ErrNotInGroup, GroupLeft},
-		{"group no longer exists", whatsmeow.ErrGroupNotFound, GroupDeleted},
+	jid := "120363043123456789@g.us"
+	handler, store, ctx := newTestAPI(t, newFakeBridge(t).refusing("item-not-found"))
+	if err := store.UpsertObserved(ctx, "org_default", "inst_1", jid, Observed{
+		Subject: "Ops Team", SubjectSearch: "ops team", SubjectSource: SubjectFromSync,
+		State: GroupActive, LastSyncedAt: stamp(0), LastSyncSource: SyncOnConnect,
+	}, true); err != nil {
+		t.Fatalf("seed: %v", err)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			jid := "120363043123456789@g.us"
-			handler, store, ctx := newTestAPI(t, &fakeGroupClient{infoErr: map[string]error{jid: tc.err}})
-			if err := store.UpsertObserved(ctx, "org_default", "inst_1", jid, Observed{
-				Subject: "Ops Team", SubjectSearch: "ops team", SubjectSource: SubjectFromSync,
-				State: GroupActive, LastSyncedAt: stamp(0), LastSyncSource: SyncOnConnect,
-			}, true); err != nil {
-				t.Fatalf("seed: %v", err)
-			}
 
-			rec := call(handler, http.MethodGet, "/instances/inst_1/groups/"+jid, "dev-secret")
-			if rec.Code != http.StatusOK {
-				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
-			}
-			var row struct {
-				Name  string `json:"name"`
-				State string `json:"state"`
-			}
-			_ = json.Unmarshal(rec.Body.Bytes(), &row)
-			if row.State != string(tc.want) {
-				t.Errorf("state = %q, want %q", row.State, tc.want)
-			}
-			if row.Name != "Ops Team" {
-				t.Errorf("name = %q, want the retained name", row.Name)
-			}
-			if doc := store.FindOne(ctx, "org_default", "inst_1", jid); doc == nil || doc.Observed.State != tc.want {
-				t.Errorf("stored = %+v, want state %q persisted", doc, tc.want)
-			}
-		})
+	rec := call(handler, http.MethodGet, "/instances/inst_1/groups/"+jid, "dev-secret")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var row struct {
+		Name  string `json:"name"`
+		State string `json:"state"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &row)
+	if row.State != string(GroupLeft) {
+		t.Errorf("state = %q, want %q", row.State, GroupLeft)
+	}
+	if row.Name != "Ops Team" {
+		t.Errorf("name = %q, want the retained name", row.Name)
+	}
+	if doc := store.FindOne(ctx, "org_default", "inst_1", jid); doc == nil || doc.Observed.State != GroupLeft {
+		t.Errorf("stored = %+v, want the state persisted", doc)
 	}
 }
 
@@ -357,7 +386,7 @@ func TestGroupByJID_RepairNotFoundMarksState(t *testing.T) {
 // error: the dashboard shows what we know and the next read retries.
 func TestGroupByJID_RepairFailureServesStoredRow(t *testing.T) {
 	jid := "120363043123456789@g.us"
-	handler, store, ctx := newTestAPI(t, &fakeGroupClient{infoErr: map[string]error{jid: errors.New("iq timeout")}})
+	handler, store, ctx := newTestAPI(t, newFakeBridge(t).refusing("rate-overlimit"))
 	if err := store.UpsertObserved(ctx, "org_default", "inst_1", jid, Observed{
 		Subject: "Ops Team", SubjectSearch: "ops team", SubjectSource: SubjectFromSync,
 		State: GroupActive, LastSyncedAt: stamp(0), LastSyncSource: SyncOnConnect,
@@ -382,7 +411,7 @@ func TestGroupByJID_RepairFailureServesStoredRow(t *testing.T) {
 	}
 }
 
-func TestGroupByJID_OfflineInstanceServesStoredRow(t *testing.T) {
+func TestGroupByJID_NoBridgeServesStoredRow(t *testing.T) {
 	jid := "120363043123456789@g.us"
 	handler, store, ctx := newTestAPI(t, nil)
 	if err := store.UpsertObserved(ctx, "org_default", "inst_1", jid, Observed{
@@ -392,19 +421,118 @@ func TestGroupByJID_OfflineInstanceServesStoredRow(t *testing.T) {
 	}
 	rec := call(handler, http.MethodGet, "/instances/inst_1/groups/"+jid, "dev-secret")
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want the persisted row even with no live client", rec.Code)
+		t.Fatalf("status = %d, want the persisted row even with no live session", rec.Code)
+	}
+}
+
+// ---- the retired pairing surface -----------------------------------------
+
+// Every route that used to link a device into this worker's own session answers a
+// refusal that names where pairing went, rather than a 404 a caller would read as
+// a broken deployment.
+func TestPairingRoutesRefuseAndNameHermes(t *testing.T) {
+	handler, _, _ := newTestAPI(t, newFakeBridge(t))
+	handler.manager = testManagerWithDeps(newFakeGroupStore(), nil, nil)
+
+	cases := []struct {
+		method string
+		path   string
+		body   string
+		want   int
+	}{
+		{http.MethodPost, "/instances", `{"label":"work","mode":"qr"}`, http.StatusConflict},
+		{http.MethodPost, "/instances/inst_1/pair", "", http.StatusConflict},
+		{http.MethodPost, "/instances/inst_1/pairing-code", "", http.StatusConflict},
+		{http.MethodPost, "/instances/inst_1/check", "", http.StatusConflict},
+	}
+	for _, tc := range cases {
+		rec := callJSON(t, handler, tc.method, tc.path, "dev-secret", tc.body)
+		if rec.Code != tc.want {
+			t.Errorf("%s %s = %d, want %d", tc.method, tc.path, rec.Code, tc.want)
+		}
+		var body struct {
+			Error string `json:"error"`
+			Code  string `json:"code"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode %s: %v", rec.Body.String(), err)
+		}
+		if body.Code != "invalid_state" {
+			t.Errorf("%s %s code = %q, want invalid_state (the BFF's vocabulary for this)", tc.method, tc.path, body.Code)
+		}
+		if !strings.Contains(body.Error, "Hermes") {
+			t.Errorf("%s %s error = %q, want a refusal that names where pairing moved", tc.method, tc.path, body.Error)
+		}
+	}
+}
+
+// Creating an instance is the one route the console's own form still calls; its
+// refusal must not be a 404 or a 500 that would read as a broken deployment.
+func TestCreateInstanceRefusesWithoutTouchingWhatsApp(t *testing.T) {
+	bridge := newFakeBridge(t)
+	handler, _, _ := newTestAPI(t, bridge)
+	handler.manager = testManagerWithDeps(newFakeGroupStore(), nil, nil)
+
+	rec := callJSON(t, handler, http.MethodPost, "/instances", "dev-secret", `{"label":"work","mode":"code","phoneNumber":"628990000001"}`)
+	if rec.Code == http.StatusCreated {
+		t.Fatal("the worker created an instance it can no longer pair")
+	}
+	if calls := bridge.recorded(); len(calls) != 0 {
+		t.Errorf("bridge calls = %d, want none: pairing is not a bridge operation either", len(calls))
+	}
+}
+
+// GET /instances is what the console lists, and it must keep answering the row.
+func TestListInstancesServesTheStoredRows(t *testing.T) {
+	handler, _, _ := newTestAPI(t, newFakeBridge(t))
+	handler.manager = testManagerWithDeps(newFakeGroupStore(), nil, newFakeInstanceRepo(InstanceRow{
+		ID: "inst_1", OrganizationID: "org_default", Label: "work", Mode: "qr",
+		Status: stateConnected, PhoneNumber: "628990000001", CreatedAt: stamp(1),
+	}))
+
+	rec := call(handler, http.MethodGet, "/instances", "dev-secret")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Instances []instanceSnapshot `json:"instances"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Instances) != 1 || body.Instances[0].ID != "inst_1" || body.Instances[0].Status != string(stateConnected) {
+		t.Fatalf("instances = %+v, want the stored row", body.Instances)
+	}
+}
+
+// DELETE still removes the row — the credential it used to invalidate belongs to
+// the Hermes session now — and it must not reach for anything WhatsApp-side.
+func TestDeleteInstanceSoftDeletesTheRow(t *testing.T) {
+	repo := newFakeInstanceRepo(InstanceRow{ID: "inst_1", OrganizationID: "org_default", Label: "work", Mode: "qr", Status: stateConnected})
+	bridge := newFakeBridge(t)
+	handler, _, _ := newTestAPI(t, bridge)
+	handler.manager = testManagerWithDeps(newFakeGroupStore(), nil, repo)
+
+	rec := call(handler, http.MethodDelete, "/instances/inst_1", "dev-secret")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if rows, _ := repo.List(context.Background(), "org_default"); len(rows) != 0 {
+		t.Errorf("rows = %+v, want the instance gone from every read", rows)
+	}
+	if calls := bridge.recorded(); len(calls) != 0 {
+		t.Errorf("bridge calls = %d, want none", len(calls))
 	}
 }
 
 // ---- GET /scheduler: what the loops are doing (§6.5 reports queues, not cadences) ----
 
 func TestSchedulerEndpointReportsEachLoop(t *testing.T) {
-	mgr := testManager(newFakeInstanceRepo(), newFakePairingStore(), &fakeDeviceStore{}, newFakeClient())
-	defer mgr.shutdown(context.Background())
+	mgr := testManagerWithDeps(newFakeGroupStore(), nil, nil)
 	at := time.Date(2026, 9, 14, 10, 0, 0, 0, time.UTC)
 	mgr.loops.declare("group-sync", 30*time.Minute)
-	mgr.loops.declare("media-janitor", 5*time.Minute)
-	mgr.loops.pass("group-sync", at, errors.New("iq timeout"))
+	mgr.loops.declare("send-dispatch", 5*time.Minute)
+	mgr.loops.pass("group-sync", at, context.DeadlineExceeded)
 
 	rec := callJSON(t, mgr.api(), http.MethodGet, "/scheduler", "dev-secret", "")
 
@@ -421,7 +549,7 @@ func TestSchedulerEndpointReportsEachLoop(t *testing.T) {
 		t.Fatalf("loops = %d, want the two declared", len(body.Loops))
 	}
 	first := body.Loops[0]
-	if first.Name != "group-sync" || first.Runs != 1 || first.LastError != "iq timeout" {
+	if first.Name != "group-sync" || first.Runs != 1 || first.LastError != "context deadline exceeded" {
 		t.Fatalf("first loop = %+v, want the failed pass it recorded", first)
 	}
 	if first.LastRunAt == nil || !first.LastRunAt.Equal(at) {
@@ -433,8 +561,7 @@ func TestSchedulerEndpointReportsEachLoop(t *testing.T) {
 }
 
 func TestSchedulerEndpointRequiresTheToken(t *testing.T) {
-	mgr := testManager(newFakeInstanceRepo(), newFakePairingStore(), &fakeDeviceStore{}, newFakeClient())
-	defer mgr.shutdown(context.Background())
+	mgr := testManagerWithDeps(newFakeGroupStore(), nil, nil)
 	mgr.loops.declare("group-sync", 30*time.Minute)
 
 	rec := callJSON(t, mgr.api(), http.MethodGet, "/scheduler", "not-the-secret", "")

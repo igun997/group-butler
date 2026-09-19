@@ -799,7 +799,7 @@ never forwards raw worker JSON to the browser.
 | `MONGODB_URI` | `mongodb://127.0.0.1:27017/group_butler?replicaSet=rs0` | dev; Atlas `mongodb+srv://…` in prod |
 | `MONGODB_DB` | `group_butler` | |
 | `ORGANIZATION_ID` | `org_default` | stamped on everything the worker writes |
-| `WHATSMEOW_DB_URI` | `file:/data/whatsmeow.db?_foreign_keys=on` | sqlite on the mounted volume |
+| ~~`WHATSMEOW_DB_URI`~~ | — | retired: the worker holds no WhatsApp session, so it has no auth store. Pairing is the Hermes wizard ({{§6.1}}) |
 | `R2_ACCOUNT_ID` | *(required for media)* | account-scoped endpoint `https://<account>.r2.cloudflarestorage.com` |
 | `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_PUBLIC_URL` | — | unconfigured ⇒ media handling disabled, logged loudly |
 | `MEDIA_*` | `26214400` / `4` / `45s` / `5m` | max bytes, concurrency, timeout, janitor interval |
@@ -1172,9 +1172,9 @@ Group messages are **attacker-controlled data**. The rules:
 - Regexes over user data are anchored/bounded; `rawSearch` truncation caps pathological payloads.
 
 ### 11.6 Secrets, privacy, retention
-- `whatsmeow.db` holds linked-device keys: a high-value secret. It lives only on the worker's
-  `/data` volume (uid-restricted, never in an image, never in Mongo, never in logs). Losing the
-  volume means re-pairing.
+- The linked-device keys hold the WhatsApp session. They are Hermes's now: they live on the
+  Hermes container's data volume, never in an image, never in Mongo, never in logs, and never in
+  the Go worker (which has no auth store to lose). Losing them means re-pairing.
 - Mongo credentials, R2 keys, `AUTH_SECRET`, `WORKER_SECRET`, and the owner's password hash are
   env-only; `.env` is git-ignored; `.env.example` carries names and placeholder values only.
 - Phone numbers and message content are personal data. Controls: `RETENTION_MESSAGES_DAYS` prunes
@@ -1237,7 +1237,7 @@ both containers look healthy from the outside.
 docker network create butler
 
 docker run -d --name butler-worker --network butler --restart unless-stopped \
-  -v butler-wa:/data --env-file .env.worker \
+  --env-file .env.worker \
   ghcr.io/<owner>/group-butler/worker:latest
 docker run -d --name butler-web --network butler --restart unless-stopped \
   -p 3000:3000 --env-file .env.web \
@@ -1259,8 +1259,7 @@ cp apps/web/.env.production.example   infra/prod/.env.web       # then fill ever
 BUTLER_GHCR_OWNER=<owner> docker compose -f infra/prod/docker-compose.ghcr.yml up -d
 ````
 It pins `WORKER_URL=http://worker:4000` itself — the service name on its own bridge, which is what
-Compose's `environment` overriding the `env_file` entry is for — keeps the same `butler-wa:/data`
-volume, publishes only the web port, and starts the web service only once the worker image's own
+Compose's `environment` overriding the `env_file` entry is for — publishes only the web port, and starts the web service only once the worker image's own
 `/health` probe is passing. Neither image requires it.
 
 ---

@@ -1,17 +1,22 @@
 import { guardInstance } from "../../../../../server/instance-guard";
-import { pairWorkerInstance, workerFailureResponse } from "../../../../../server/worker/client";
+import { hermesInstanceSnapshot } from "../../../../../server/hermes/instance";
+import { startHermesPairing, startHermesPairingRemote } from "../../../../../server/hermes/pairing";
+import { getInstanceDoc } from "../../../../../server/repos/instances";
+import { getDb } from "../../../../../server/mongo";
 
 /**
  * §7.3 `POST /api/instances/[id]/pair`: put an instance back into pairing so a
- * device that was unlinked — or a session the worker can no longer revive — can
- * be linked again from the console. The worker answers with the same snapshot
- * shape `GET /api/instances/[id]` does, so the dashboard polls one shape through
- * the whole pairing flow.
+ * device that was unlinked — or a session that cannot be revived — can be linked
+ * again from the console.
  *
- * The request carries no body: whether this instance may pair at all, and which
- * payload it produces, are the worker's facts, and it answers `invalid_state`
- * when the instance is already connected. The tenant boundary is checked before
- * that call.
+ * Pairing is now Hermes's wizard rather than a worker session, and it takes the
+ * WhatsApp session lock for as long as it runs, so this only starts the attempt:
+ * the QR arrives on the poll the pairing screen already does. The answer is the
+ * same snapshot shape `GET /api/instances/[id]` returns, so the dashboard polls
+ * one shape through the whole flow.
+ *
+ * The request carries no body: whether this instance may pair at all is the
+ * backend's fact. The tenant boundary is checked before anything is started.
  */
 export async function POST(
   _request: Request,
@@ -21,7 +26,12 @@ export async function POST(
   const guard = await guardInstance(id);
   if (!guard.ok) return guard.response;
 
-  const result = await pairWorkerInstance(id);
-  if (!result.ok) return workerFailureResponse(result.failure);
-  return Response.json(result.data, { headers: { "cache-control": "no-store" } });
+  const db = await getDb();
+  const doc = await getInstanceDoc(db, guard.organizationId, id);
+  if (doc === null) return Response.json({ error: "not found", code: "not_found" }, { status: 404 });
+
+  // The service is tried first: when Hermes is its own container, this process
+  // cannot run the wizard at all. A host-run stack has no service and spawns it.
+  const started = (await startHermesPairingRemote()) ?? startHermesPairing();
+  return Response.json(hermesInstanceSnapshot(doc, started), { headers: { "cache-control": "no-store" } });
 }

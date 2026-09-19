@@ -1,0 +1,172 @@
+# The whole stack, from a clean machine, with one command:
+#
+#   docker compose up -d --build
+#
+# What runs, and why each piece is separate:
+#
+#   mongo   the replica set every other service writes to (a replica set, not a
+#           standalone: the app uses transactions, which a standalone cannot do)
+#   hermes  Hermes Agent with group-butler's WhatsApp bridge patch baked in. It
+#           owns the WhatsApp account and runs the agent.
+#   worker  the Go worker: message ingest and storage, group reads and actions. It
+#           holds no WhatsApp session of its own — every WhatsApp call it makes is
+#           an HTTP call to hermes.
+#   web     the Next.js console and the MCP endpoint Hermes consumes.
+#
+# Addresses here are service names on the compose network, not IPs. That is the
+# point: the bridge refuses non-loopback Host headers and the worker's own default
+# points at 127.0.0.1, both of which are wrong the moment the services are in
+# different containers. Naming them here is what makes this work rather than
+# needing a published port and a firewall rule per hop.
+#
+# Two things this file cannot do for you:
+#   - WhatsApp pairing, and the ORDER matters. Hermes exits when WhatsApp is
+#     enabled but unpaired, so the hermes service restarts in a loop until a
+#     session exists -- and `docker compose exec` cannot reach a container that is
+#     restarting. Pair with a one-off container against the same volume instead,
+#     THEN start the service:
+#
+#       docker compose run --rm hermes hermes whatsapp   # scan the QR
+#       docker compose up -d hermes
+#
+#   - Secrets. `.env` supplies them; see `.env.example`. The Hermes-side values it
+#     does not carry are in `infra/hermes/hermes.env.example`.
+
+name: group-butler
+
+services:
+  mongo:
+    image: mongo:7
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      # Published only so you can reach it with mongosh from the host.
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      # A single-node replica set must be initiated before anything can write, and
+      # every dependent service waits on this being healthy rather than on the
+      # container merely being up.
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.runCommand({ping:1}).ok' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  mongo-init:
+    image: mongo:7
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: "no"
+    entrypoint:
+      - bash
+      - -c
+      - |
+        mongosh --host mongo --quiet --eval '
+          try { rs.status() } catch (e) { rs.initiate({_id:"rs0",members:[{_id:0,host:"mongo:27017"}]}) }
+        '
+
+  hermes:
+    build:
+      context: ./infra/hermes
+      target: production
+    image: group-butler/hermes:local
+    restart: unless-stopped
+    # The pairing service runs beside the gateway. Both live in this container
+    # because both need the Hermes CLI and a TTY, which is exactly what the console
+    # and the worker lack.
+    command: ["/opt/hermes/docker/butler-start.sh", "hermes", "gateway", "run"]
+    env_file:
+      - ./infra/hermes/.env
+    environment:
+      # These four fill the config template at start-up, so `.env` stays the one
+      # place a model, an endpoint or the MCP wiring is configured. Left unset, the
+      # template's placeholders are replaced with empty strings and the deployment
+      # comes up with no model at all.
+      AI_BASE_URL: ${AI_BASE_URL}
+      AI_MODEL: ${AI_MODEL}
+      MCP_BUTLER_URL: ${MCP_BUTLER_URL:-http://web:3000/api/mcp}
+      MCP_BUTLER_TOKEN: ${MCP_BUTLER_TOKEN}
+      # The archive endpoint is the worker, by service name. Without this the
+      # bridge has nowhere to forward and passive listening silently does nothing.
+      WHATSAPP_ARCHIVE_URL: http://worker:4000/ingest
+      # The services that call the bridge send their own Host header, so the
+      # bridge's rebinding allowlist has to name them.
+      WHATSAPP_BRIDGE_BIND: 0.0.0.0
+      WHATSAPP_BRIDGE_ALLOWED_HOSTS: hermes,worker,web,localhost,127.0.0.1
+    volumes:
+      - hermes-data:/opt/data
+    ports:
+      # The console, and only the console. The bridge's own port is deliberately
+      # NOT published: it has no authentication, and the Host allowlist above is
+      # the only thing standing between it and anything that can reach it.
+      - "127.0.0.1:9119:9119"
+    depends_on:
+      worker:
+        condition: service_started
+
+    # Hermes owns its data directory 0700 as uid 10000, and its s6 fix-attrs
+    # re-applies that on every boot -- so a chmod, or a POSIX ACL, is undone. The
+    # cheap way in is to BE that uid: remapping Hermes instead would re-chown its
+    # 3 GB tree on every container create, which is minutes per `up`.
+  worker:
+    user: "10000:10000"
+    build:
+      context: ./apps/worker
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      MONGODB_URI: mongodb://mongo:27017/?replicaSet=rs0
+      # Every WhatsApp call the worker makes goes here. Loopback would be its own
+      # container, which is why the default in config.go is overridden.
+      HERMES_BRIDGE_URL: http://hermes:3000
+      # So the worker can read attachments the Hermes container wrote.
+      HERMES_DATA_DIR: /hermes-data
+    volumes:
+      - hermes-data:/hermes-data:ro
+    ports:
+      - "127.0.0.1:4000:4000"
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
+
+  web:
+    # Same reason as the worker: this is how it reads the gateway state that says
+    # whether the account is actually connected.
+    user: "10000:10000"
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      target: production
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      # `.env` carries PORT=4000 for the worker, and env_file hands it to every
+      # service -- so Next bound 4000 and the published 3000 pointed at nothing.
+      PORT: "3000"
+      MONGODB_URI: mongodb://mongo:27017/?replicaSet=rs0
+      WORKER_URL: http://worker:4000
+      # Where it reads the account's live state, so the console stops showing a
+      # status frozen at whatever the old worker last wrote.
+      HERMES_DATA_DIR: /hermes-data
+      # Pairing runs inside the Hermes container, where the CLI and a PTY exist,
+      # and is reached over HTTP. This process has neither, so it cannot drive the
+      # wizard itself -- and no longer needs to.
+      HERMES_PAIR_URL: http://hermes:3010
+    volumes:
+      - hermes-data:/hermes-data:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
+      worker:
+        condition: service_started
+
+volumes:
+  mongo-data:
+  hermes-data:

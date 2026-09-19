@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net/http"
 	"testing"
 	"time"
 
@@ -17,7 +18,12 @@ type storedSend struct {
 	} `bson:"dispatch"`
 }
 
-func newTestDispatcher(t *testing.T) (*sendDispatcher, *manager, *sendRecorder, context.Context) {
+// sentMessageID is the acknowledgement the fake bridge gives a send. It is the
+// bridge's own id — the worker no longer chooses one — so every assertion below
+// reads the id the bridge would have assigned.
+const sentMessageID = "wa_sent_1"
+
+func newTestDispatcher(t *testing.T) (*sendDispatcher, *manager, *fakeBridge, context.Context) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), integrationTimeout)
 	t.Cleanup(cancel)
@@ -38,12 +44,10 @@ func newTestDispatcher(t *testing.T) (*sendDispatcher, *manager, *sendRecorder, 
 	cfg.SendMaxAttempts = 3
 	cfg.DispatchInterval = time.Hour
 	dispatcher := newSendDispatcher(db, cfg)
-	mgr := testManagerWithDeps(newFakeGroupStore(), nil, nil)
-	recorder := &sendRecorder{fakeClient: newFakeClient()}
-	session := testSession(mgr, recorder)
-	session.status = stateConnected
-	mgr.put(session)
-	return dispatcher, mgr, recorder, ctx
+	// The send goes through the Hermes bridge now, so the fake stands where the
+	// process that owns the WhatsApp socket does.
+	bridge := newFakeBridge(t).answering(http.StatusOK, `{"success":true,"messageId":"`+sentMessageID+`","messageIds":["`+sentMessageID+`"]}`)
+	return dispatcher, bridge.manager(t, newFakeGroupStore(), newFakeInstanceRepo()), bridge, ctx
 }
 
 func TestDispatcherClaimsDueApprovalAndStoresWhatsAppAcknowledgement(t *testing.T) {
@@ -67,7 +71,7 @@ func TestDispatcherClaimsDueApprovalAndStoresWhatsAppAcknowledgement(t *testing.
 	if got, want := stored.Status, "sent"; got != want {
 		t.Fatalf("status = %v, want %q", got, want)
 	}
-	if got, want := stored.Dispatch.WaMessageID, "sent_by_fake"; got != want {
+	if got, want := stored.Dispatch.WaMessageID, sentMessageID; got != want {
 		t.Fatalf("waMessageId = %v, want %q", got, want)
 	}
 	if got, want := stored.Dispatch.Attempts, 1; got != want {
@@ -76,7 +80,7 @@ func TestDispatcherClaimsDueApprovalAndStoresWhatsAppAcknowledgement(t *testing.
 }
 
 func TestDispatcherDoesNotClaimFutureSchedule(t *testing.T) {
-	dispatcher, mgr, _, ctx := newTestDispatcher(t)
+	dispatcher, mgr, bridge, ctx := newTestDispatcher(t)
 	_, err := dispatcher.requests.InsertOne(ctx, bson.M{
 		"id": "send_future", "organizationId": "org_default", "instanceId": "inst_1",
 		"groupJid": "120363043123456789@g.us", "text": "Later", "status": "scheduled", "scheduledFor": time.Now().Add(time.Hour),
@@ -98,33 +102,52 @@ func TestDispatcherDoesNotClaimFutureSchedule(t *testing.T) {
 	if got, want := stored.Dispatch.Attempts, 0; got != want {
 		t.Fatalf("attempts = %v, want %v", got, want)
 	}
+	if calls := bridge.recorded(); len(calls) != 0 {
+		t.Errorf("a request that is not due reached the bridge: %+v", calls)
+	}
 }
 
 // The send numbers the console shows are written by the dispatch path itself, in
-// both directions: this drives a due claim for a connected instance and one for
-// an instance with no live session, and reads the counters each produced.
+// both directions: this drives a due claim the bridge accepts and one it refuses
+// because its WhatsApp session is down, and reads the counters each produced.
 func TestDispatcherCountsBothSendOutcomes(t *testing.T) {
-	dispatcher, mgr, _, ctx := newTestDispatcher(t)
+	dispatcher, mgr, bridge, ctx := newTestDispatcher(t)
 	stats := &fakeDayCounters{}
 	repo := newFakeInstanceRepo()
 	mgr.stats = stats
 	mgr.instances = repo
 
-	seed := func(id, instanceID string) {
+	// The first claimed request is refused — the bridge is the only place that knows
+	// whether WhatsApp is connected now, and its 503 is the refusal a deployment
+	// with a disconnected phone produces. Queue order is the schedule, so the
+	// refused one is seeded first to make the pairing deterministic.
+	var sends int
+	bridge.mu.Lock()
+	bridge.answer = func(call bridgeCall) (int, string) {
+		if call.path != "/send" {
+			return http.StatusOK, `{"ok":true}`
+		}
+		sends++
+		if sends == 1 {
+			return http.StatusServiceUnavailable, `{"ok":false,"error":"whatsapp is not connected"}`
+		}
+		return http.StatusOK, `{"success":true,"messageId":"` + sentMessageID + `"}`
+	}
+	bridge.mu.Unlock()
+
+	seed := func(id, instanceID string, at time.Time) {
 		t.Helper()
 		_, err := dispatcher.requests.InsertOne(ctx, bson.M{
 			"id": id, "organizationId": "org_default", "instanceId": instanceID,
-			"groupJid": "120363043123456789@g.us", "text": "Ship it", "status": "approved", "scheduledFor": time.Now().UTC(),
+			"groupJid": "120363043123456789@g.us", "text": "Ship it", "status": "approved", "scheduledFor": at,
 			"dispatch": bson.M{"attempts": 0, "lockedAt": nil, "lockedBy": nil},
 		})
 		if err != nil {
 			t.Fatalf("seed %s: %v", id, err)
 		}
 	}
-	seed("send_ok", "inst_1")
-	// No session for this id: the dispatcher's own offline classification is the
-	// failure path a real deployment hits on a disconnected phone.
-	seed("send_failed", "inst_gone")
+	seed("send_failed", "inst_gone", time.Now().UTC().Add(-time.Minute))
+	seed("send_ok", "inst_1", time.Now().UTC())
 
 	if err := dispatcher.dispatchDue(ctx, mgr); err != nil {
 		t.Fatalf("dispatchDue: %v", err)
@@ -247,12 +270,12 @@ func seedSend(t *testing.T, dispatcher *sendDispatcher, ctx context.Context, id,
 	}
 }
 
-// A send that answers a stored message leaves as a quoted reply to it: the id is
-// the request row's, and the participant is the sender of the message that id
-// names, read from the stored message. Nothing here is decided by the dispatcher
-// itself.
+// A send that answers a stored message leaves with that message named in the reply
+// target: the id comes from the request row, and the participant is the sender of
+// the message that id names, read from the stored message. Nothing here is decided
+// by the dispatcher itself.
 func TestDispatcherQuotesTheStoredMessageBeingAnswered(t *testing.T) {
-	dispatcher, mgr, recorder, ctx := newTestDispatcher(t)
+	dispatcher, mgr, bridge, ctx := newTestDispatcher(t)
 	const (
 		group       = "120363043123456789@g.us"
 		answered    = "3EB0OWNER"
@@ -270,15 +293,13 @@ func TestDispatcherQuotesTheStoredMessageBeingAnswered(t *testing.T) {
 		t.Fatalf("dispatchDue: %v", err)
 	}
 
-	if len(recorder.sent) != 1 {
-		t.Fatalf("sends = %d, want 1", len(recorder.sent))
+	call := bridge.only(t)
+	if call.path != "/send" {
+		t.Fatalf("call = %s, want POST /send", call.path)
 	}
-	context := recorder.sent[0].message.GetExtendedTextMessage().GetContextInfo()
-	if got, want := context.GetStanzaID(), answered; got != want {
-		t.Errorf("StanzaID = %q, want %q", got, want)
-	}
-	if got, want := context.GetParticipant(), participant; got != want {
-		t.Errorf("Participant = %q, want %q", got, want)
+	want := map[string]any{"messageId": answered, "participant": participant}
+	if !equalJSON(call.body["replyTo"], want) {
+		t.Errorf("replyTo = %#v, want %#v", call.body["replyTo"], want)
 	}
 	var stored storedSend
 	if err := dispatcher.requests.FindOne(ctx, bson.M{"id": "send_123"}).Decode(&stored); err != nil {
@@ -289,24 +310,22 @@ func TestDispatcherQuotesTheStoredMessageBeingAnswered(t *testing.T) {
 	}
 }
 
-// A row with no reply provenance keeps the plain envelope: this is what every
-// send written before the field existed looks like, and it must not change.
+// A row with no reply provenance keeps the plain send: this is what every send
+// written before the field existed looks like, and it must not change.
 func TestDispatcherLeavesSendsWithoutReplyProvenancePlain(t *testing.T) {
-	dispatcher, mgr, recorder, ctx := newTestDispatcher(t)
+	dispatcher, mgr, bridge, ctx := newTestDispatcher(t)
 	seedSend(t, dispatcher, ctx, "send_123", "Ship it", "")
 
 	if err := dispatcher.dispatchDue(ctx, mgr); err != nil {
 		t.Fatalf("dispatchDue: %v", err)
 	}
 
-	if len(recorder.sent) != 1 {
-		t.Fatalf("sends = %d, want 1", len(recorder.sent))
+	call := bridge.only(t)
+	if got := call.body["message"]; got != "Ship it" {
+		t.Errorf("message = %v, want Ship it", got)
 	}
-	if got := recorder.sent[0].message.GetConversation(); got != "Ship it" {
-		t.Errorf("Conversation = %q, want Ship it", got)
-	}
-	if got := recorder.sent[0].message.GetExtendedTextMessage(); got != nil {
-		t.Errorf("extended text = %v, want no quote at all", got)
+	if _, ok := call.body["replyTo"]; ok {
+		t.Errorf("replyTo = %v, want none for a row without provenance", call.body["replyTo"])
 	}
 }
 
@@ -314,15 +333,15 @@ func TestDispatcherLeavesSendsWithoutReplyProvenancePlain(t *testing.T) {
 // than sent unquoted: the row says the send answers that message, so delivering
 // it as a plain send would drop part of the instruction while looking delivered.
 func TestDispatcherRefusesAQuoteItCannotResolve(t *testing.T) {
-	dispatcher, mgr, recorder, ctx := newTestDispatcher(t)
+	dispatcher, mgr, bridge, ctx := newTestDispatcher(t)
 	seedSend(t, dispatcher, ctx, "send_123", "Answered", "3EB0GONE")
 
 	if err := dispatcher.dispatchDue(ctx, mgr); err != nil {
 		t.Fatalf("dispatchDue: %v", err)
 	}
 
-	if len(recorder.sent) != 0 {
-		t.Fatalf("an unresolvable quote reached the client: %+v", recorder.sent)
+	if calls := bridge.recorded(); len(calls) != 0 {
+		t.Fatalf("an unresolvable quote reached the bridge: %+v", calls)
 	}
 	var stored storedSend
 	if err := dispatcher.requests.FindOne(ctx, bson.M{"id": "send_123"}).Decode(&stored); err != nil {
@@ -331,7 +350,7 @@ func TestDispatcherRefusesAQuoteItCannotResolve(t *testing.T) {
 	if got, want := stored.Status, "failed"; got != want {
 		t.Fatalf("status = %q, want %q", got, want)
 	}
-	// Nothing was handed to WhatsApp, so the retry a `rejected` row offers is
+	// Nothing was handed to the bridge, so the retry a `rejected` row offers is
 	// safe: it cannot double-post.
 	if got, want := stored.Dispatch.ErrorClass, "rejected"; got != want {
 		t.Errorf("errorClass = %q, want %q", got, want)

@@ -10,10 +10,6 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
-
-	"go.mau.fi/whatsmeow/proto/waE2E"
-	"go.mau.fi/whatsmeow/types"
-	"google.golang.org/protobuf/proto"
 )
 
 func TestEnqueueIngestIsBoundedAndCountsDrops(t *testing.T) {
@@ -254,19 +250,19 @@ func TestSaveMessageEnvelopeRoundTrip(t *testing.T) {
 	defer func() { _, _ = coll.DeleteMany(ctx, key) }()
 
 	mention := "628990000002@s.whatsapp.net"
-	evt := evtMessage(
-		types.NewJID("120363043123456789", types.GroupServer),
-		types.NewJID("628990000001", types.DefaultUserServer),
-		"3EB0ENVELOPE",
-		&waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
-			Text:        proto.String("Deploy is green, see https://status.test/deploy"),
-			ContextInfo: &waE2E.ContextInfo{MentionedJID: []string{mention}},
-		}},
-	)
-	evt.Info.IsFromMe = true
-	doc, err := parseInbound(evt, "org_default", "inst_envelope")
+	doc, err := externalDoc(externalEvent{
+		MessageID:    "3EB0ENVELOPE",
+		ChatID:       "120363043123456789@g.us",
+		SenderID:     "628990000001@s.whatsapp.net",
+		SenderName:   "Nadia",
+		IsGroup:      true,
+		FromMe:       true,
+		Body:         "Deploy is green, see https://status.test/deploy",
+		MentionedIDs: []string{mention},
+		Timestamp:    externalTimestamp(stamp(1).Unix()),
+	}, "org_default", "inst_envelope", stamp(1))
 	if err != nil {
-		t.Fatalf("parseInbound: %v", err)
+		t.Fatalf("externalDoc: %v", err)
 	}
 	store := newMessageStore(db)
 	if _, err := store.Save(ctx, []MessageDoc{doc}); err != nil {
@@ -286,7 +282,7 @@ func TestSaveMessageEnvelopeRoundTrip(t *testing.T) {
 	if got.SenderJID != "628990000001@s.whatsapp.net" || !got.FromMe || got.PushName != "Nadia" {
 		t.Errorf("sender = %q fromMe=%v pushName=%q", got.SenderJID, got.FromMe, got.PushName)
 	}
-	if !got.Timestamp.Equal(evt.Info.Timestamp.UTC()) || got.ReceivedAt.IsZero() || got.ServerSkewMs == 0 {
+	if !got.Timestamp.Equal(stamp(1)) || got.ReceivedAt.IsZero() || got.ServerSkewMs == 0 {
 		t.Errorf("timestamps: %v / %v skew=%d", got.Timestamp, got.ReceivedAt, got.ServerSkewMs)
 	}
 	if got.Kind != string(KindText) || got.Text != "Deploy is green, see https://status.test/deploy" {
@@ -299,7 +295,7 @@ func TestSaveMessageEnvelopeRoundTrip(t *testing.T) {
 		t.Errorf("raw = %+v rawSearch=%q", got.Raw, got.RawSearch)
 	}
 	if len(got.Raw.Message) == 0 {
-		t.Error("raw.message is empty: the protobuf tree was not persisted")
+		t.Error("raw.message is empty: the event payload was not persisted")
 	}
 	if got.Links == nil || len(got.Links) != 1 || got.Links[0] != "https://status.test/deploy" {
 		t.Errorf("links = %v, want one-element array (never null)", got.Links)
@@ -330,19 +326,18 @@ func TestSaveMessageEnvelopeRoundTrip(t *testing.T) {
 	// a better parse of it (a name learned later) is worth storing. The
 	// redelivery is parsed again, so its observation time is strictly later —
 	// which is exactly what `$setOnInsert` has to refuse.
-	redelivered := evtMessage(
-		types.NewJID("120363043123456789", types.GroupServer),
-		types.NewJID("628990000001", types.DefaultUserServer),
-		"3EB0ENVELOPE",
-		&waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
-			Text: proto.String("Deploy is green"),
-		}},
-	)
-	redelivered.Info.PushName = "Nadia (work)"
-	redelivered.Info.IsFromMe = true
-	second, err := parseInbound(redelivered, "org_default", "inst_envelope")
+	second, err := externalDoc(externalEvent{
+		MessageID:  "3EB0ENVELOPE",
+		ChatID:     "120363043123456789@g.us",
+		SenderID:   "628990000001@s.whatsapp.net",
+		SenderName: "Nadia (work)",
+		IsGroup:    true,
+		FromMe:     true,
+		Body:       "Deploy is green",
+		Timestamp:  externalTimestamp(stamp(2).Unix()),
+	}, "org_default", "inst_envelope", stamp(2))
 	if err != nil {
-		t.Fatalf("parseInbound(redelivery): %v", err)
+		t.Fatalf("externalDoc(redelivery): %v", err)
 	}
 	if !second.ReceivedAt.After(doc.ReceivedAt) {
 		t.Fatal("the redelivery was not observed later; the test would not detect a rewritten receivedAt")
@@ -376,7 +371,10 @@ func TestSaveMessageEnvelopeRoundTrip(t *testing.T) {
 // TestPendingMediaScanAndAttemptCounting pins the janitor's scan contract
 // (§6.3.5): only retryable attachments are returned, a message that never got a
 // first attempt still qualifies, and each saved attempt advances the budget.
-func TestPendingMediaScanAndAttemptCounting(t *testing.T) {
+// The attempt counter is still live: every media outcome the Hermes path records
+// increments it, so a record says how many times the worker tried rather than
+// only what the last try concluded.
+func TestSaveMediaCountsAttempts(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), integrationTimeout)
 	defer cancel()
 	client, db, err := connectMongo(ctx, testMongoURI(t), "group_butler_test")
@@ -393,54 +391,22 @@ func TestPendingMediaScanAndAttemptCounting(t *testing.T) {
 	if _, err := coll.DeleteMany(ctx, map[string]any{"organizationId": org}); err != nil {
 		t.Fatalf("clean: %v", err)
 	}
-
-	seed := func(id string, media Media, truncated bool, attempts int) {
-		t.Helper()
-		doc := MessageDoc{
-			OrganizationID: org, InstanceID: "inst_1", GroupJID: "120363043123456789@g.us",
-			WaMessageID: id, Kind: KindImage, Media: media,
-			Raw: RawMessage{Message: map[string]any{"imageMessage": map[string]any{}}, Truncated: truncated},
-		}
-		if _, err := store.Save(ctx, []MessageDoc{doc}); err != nil {
-			t.Fatalf("seed %s: %v", id, err)
-		}
-		if attempts > 0 {
-			if _, err := coll.UpdateOne(ctx, map[string]any{"waMessageId": id}, bson.D{{Key: "$set", Value: bson.D{{Key: "media.attempts", Value: attempts}}}}); err != nil {
-				t.Fatalf("seed attempts %s: %v", id, err)
-			}
-		}
+	if _, err := store.Save(ctx, []MessageDoc{{
+		OrganizationID: org, InstanceID: "inst_1", GroupJID: "120363043123456789@g.us",
+		WaMessageID: "3EB0PEND", Kind: KindImage, Media: Media{Status: MediaPending, Kind: KindImage},
+	}}); err != nil {
+		t.Fatalf("seed: %v", err)
 	}
 
-	seed("3EB0PEND", Media{Status: MediaPending, Kind: KindImage}, false, 0)   // candidate despite no attempts field
-	seed("3EB0TRUNC", Media{Status: MediaPending, Kind: KindImage}, true, 0)   // pruned: not retryable
-	seed("3EB0STORED", Media{Status: MediaStored, Kind: KindImage}, false, 1)  // terminal
-	seed("3EB0EXHAUST", Media{Status: MediaFailed, Kind: KindImage}, false, 3) // budget spent
-
-	ids := func() map[string]bool {
-		candidates, err := store.pendingMedia(ctx, org, 3)
-		if err != nil {
-			t.Fatalf("pendingMedia: %v", err)
-		}
-		out := map[string]bool{}
-		for _, c := range candidates {
-			out[c.WaMessageID] = true
-		}
-		return out
-	}
-
-	got := ids()
-	if len(got) != 1 || !got["3EB0PEND"] {
-		t.Fatalf("candidates = %v, want exactly the pending, unpruned, unexhausted message", got)
-	}
-
-	// One saved attempt must not exhaust the budget, and must be cumulative.
 	for i := 1; i <= 3; i++ {
-		if err := store.saveMedia(ctx, MessageDoc{OrganizationID: org, InstanceID: "inst_1", WaMessageID: "3EB0PEND"}, Media{Status: MediaFailed, Kind: KindImage}); err != nil {
+		if err := store.saveMedia(ctx, MessageDoc{OrganizationID: org, InstanceID: "inst_1", WaMessageID: "3EB0PEND"}, Media{Status: MediaStored, Kind: KindImage, R2Key: "k.png"}); err != nil {
 			t.Fatalf("saveMedia #%d: %v", i, err)
 		}
 		var doc struct {
 			Media struct {
-				Attempts int `bson:"attempts"`
+				Status   string `bson:"status"`
+				R2Key    string `bson:"r2Key"`
+				Attempts int    `bson:"attempts"`
 			} `bson:"media"`
 		}
 		if err := coll.FindOne(ctx, map[string]any{"organizationId": org, "waMessageId": "3EB0PEND"}).Decode(&doc); err != nil {
@@ -449,9 +415,9 @@ func TestPendingMediaScanAndAttemptCounting(t *testing.T) {
 		if doc.Media.Attempts != i {
 			t.Fatalf("attempts after %d save(s) = %d", i, doc.Media.Attempts)
 		}
-	}
-	if got := ids(); len(got) != 0 {
-		t.Fatalf("candidates after the budget was spent = %v, want none", got)
+		if doc.Media.Status != string(MediaStored) || doc.Media.R2Key != "k.png" {
+			t.Fatalf("media = %+v, want the stored outcome recorded", doc.Media)
+		}
 	}
 }
 

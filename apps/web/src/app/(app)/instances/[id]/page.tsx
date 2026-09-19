@@ -16,7 +16,9 @@ import { readInstanceConfig } from "@/server/repos/instance-config";
 import { getInstanceRuntime, instanceInOrg } from "@/server/repos/instances";
 import { authorizedJidsOf } from "@/server/authorized-jids";
 import { instanceLabel, listInstanceGroups } from "@/server/repos/groups";
-import { getWorkerInstance } from "@/server/worker/client";
+import { hermesInstanceSnapshot } from "@/server/hermes/instance";
+import { readHermesPairingAny } from "@/server/hermes/pairing";
+import { getInstanceDoc } from "@/server/repos/instances";
 
 /**
  * Whether this instance belongs to the organisation, asked once per request.
@@ -54,12 +56,15 @@ export default async function InstancePage({ params }: { params: Promise<{ id: s
   if (!(await ownsInstance(owner.organizationId, id))) notFound();
   const db = await getDb();
 
-  const [label, runtime, config, groups, live, organization] = await Promise.all([
+  const [label, runtime, config, groups, instanceDoc, organization] = await Promise.all([
     instanceLabel(db, owner.organizationId, id),
     getInstanceRuntime(db, owner.organizationId, id),
     readInstanceConfig(db, owner.organizationId, id),
     listInstanceGroups(db, owner.organizationId, id),
-    getWorkerInstance(id),
+    // The session belongs to Hermes, so the worker cannot answer for it — asking
+    // it here would show a console that disagrees with the pairing route behind
+    // the same page.
+    getInstanceDoc(db, owner.organizationId, id),
     db.collection<{ config?: { autoReplyAuthorizedJids?: unknown } }>(COLLECTIONS.organizations).findOne(
       { _id: owner.organizationId as never },
       { projection: { _id: 0, "config.autoReplyAuthorizedJids": 1 } },
@@ -67,7 +72,8 @@ export default async function InstancePage({ params }: { params: Promise<{ id: s
   ]);
 
   const groupSync = runtime?.groupSync ?? { groupsObserved: 0, groupsLeft: 0, lastSyncAt: null, lastError: null };
-  const status = live.ok ? live.data.status : (runtime?.status ?? "disconnected");
+  const live = instanceDoc === null ? null : hermesInstanceSnapshot(instanceDoc, await readHermesPairingAny());
+  const status = live?.status ?? runtime?.status ?? "disconnected";
 
   return (
     <div className="mx-auto flex w-full max-w-5xl flex-col gap-6">
@@ -85,22 +91,15 @@ export default async function InstancePage({ params }: { params: Promise<{ id: s
         <p className="font-mono text-xs break-all text-muted-foreground">{id}</p>
       </header>
 
-      {live.ok ? null : (
-        <p className="rounded-xl border border-warning/30 bg-warning/10 px-4 py-3 text-sm text-warning">
-          The worker is not answering, so pairing and session facts cannot be read. Everything else here is what was
-          last stored.
-        </p>
-      )}
-
-      {live.ok ? (
-        <PairingLive instanceId={id} initial={live.data} />
-      ) : (
+      {live === null ? (
         <section className="rounded-xl border border-border p-4">
           <h2 className="text-sm font-medium">Pairing</h2>
           <p className="mt-2 text-sm text-muted-foreground">
-            Not readable while the worker is down. The status above is the last one it wrote.
+            This instance has no stored row, so there is nothing to pair. The status above is what was last recorded.
           </p>
         </section>
+      ) : (
+        <PairingLive instanceId={id} initial={live} />
       )}
 
       <ScopeForm

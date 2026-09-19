@@ -4,15 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
-	"sync"
 	"time"
 
-	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/store"
-	"go.mau.fi/whatsmeow/types"
-	waLog "go.mau.fi/whatsmeow/util/log"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -20,6 +14,12 @@ import (
 
 // sessionState is the §5.1 `instances.runtime.status` vocabulary. It is the
 // same set the reference worker used, so the BFF maps one enum to one badge.
+//
+// The whole set is kept even though this worker can no longer enter any of these
+// states by itself: the row's status is written by whoever owns the WhatsApp
+// link — the Hermes pairing wizard through the BFF — and the worker must be able
+// to read and report every value the shared contract defines
+// (`packages/shared/src/worker-contract.ts`).
 type sessionState string
 
 const (
@@ -30,40 +30,22 @@ const (
 	stateError        sessionState = "error"
 )
 
-// pairing modes accepted by POST /instances (§6.5).
-const (
-	modeQR   = "qr"
-	modeCode = "code"
-)
-
-// pairingMaterialTTL bounds how long a QR data URL or pairing code is offered
-// to the BFF. The TTL index in `pairingSessions` deletes it after that, so a
-// forgotten pairing attempt cannot be presented as current hours later.
-const pairingMaterialTTL = 5 * time.Minute
-
 // Accepted errors the HTTP layer maps to stable codes.
 var (
 	errInstanceNotFound = errors.New("instance not found")
 	errInvalidRequest   = errors.New("invalid request")
-	errLabelConflict    = errors.New("instance label already exists")
-	errWrongMode        = errors.New("instance is not in code-pairing mode")
-	errPairingNotReady  = errors.New("pairing is not ready for a code yet")
 
-	// Re-pairing a linked account is refused, not performed: pairing a fresh
-	// device means unlinking the one WhatsApp already honours.
-	errAlreadyConnected = errors.New("instance is already connected; re-pairing would unlink the account")
-
-	// Cleanup errors are recoverable: DELETE failed, but the instance and its
-	// credentials are still in the state they were, so the owner can retry.
-	errLogoutFailed       = errors.New("logout failed")
-	errDeviceDeleteFailed = errors.New("delete auth device failed")
-	errCleanupFailed      = errors.New("cleanup failed")
+	// errPairingMoved is the refusal every route that used to link a device into
+	// this worker's own session answers with. It names where pairing went, so an
+	// operator reading the worker's answer is not left guessing whether the
+	// console is broken.
+	errPairingMoved = errors.New("pairing is handled by the Hermes pairing wizard; this worker holds no whatsapp session")
 )
 
 // InstanceRow is the worker's view of one `instances` document: the identity
 // and the worker-owned `runtime.*` state, without the BFF's `config.*`. It is
-// deliberately flat because the lifecycle rules below are pure functions over
-// it (§14.2) and Mongo spelling belongs to the repository, not the rules.
+// deliberately flat because the rules over it are pure functions (§14.2) and
+// Mongo spelling belongs to the repository, not the rules.
 type InstanceRow struct {
 	ID             string
 	OrganizationID string
@@ -81,19 +63,9 @@ type InstanceRow struct {
 	UpdatedAt      time.Time
 }
 
-// phoneDigitsFromJID extracts the phone number from a user JID. Group JIDs
-// carry no phone number and yield ""; an AD device suffix (`:12`, or the
-// `user.agent:device` spelling) is stripped, because the same account appears
-// under several device JIDs and they must not look like several instances.
-func phoneDigitsFromJID(jid types.JID) string {
-	if jid.Server != types.DefaultUserServer {
-		return ""
-	}
-	return nonADUser(jid)
-}
-
 // normalizePhone strips a JID suffix and surrounding space from a stored phone
-// number, so the value compared against auth devices is always bare digits.
+// number, so the value compared against WhatsApp's own identity is always bare
+// digits.
 func normalizePhone(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if i := strings.IndexAny(raw, "@:"); i >= 0 {
@@ -102,176 +74,12 @@ func normalizePhone(raw string) string {
 	return raw
 }
 
-// deviceOwnedByOther reports whether a device is already owned by a different
-// live session. Comparing the non-AD form means the phone number and its
-// per-device JID spellings are recognised as the same account — the reference
-// bug that let one linked device back two instances (§6.1, §14).
-func deviceOwnedByOther(live map[string]types.JID, selfID string, device types.JID) bool {
-	target := device.ToNonAD()
-	if target.IsEmpty() || target.User == "" {
-		return false
-	}
-	for id, owned := range live {
-		if id == selfID {
-			continue
-		}
-		if owned.ToNonAD() == target {
-			return true
-		}
-	}
-	return false
-}
-
-// restorableInstances decides which persisted rows reconnect at boot. A row is
-// restorable only when it has a phone number, is not logged out, and its own
-// auth device still exists. The `hasDevice` lookup is per-phone on purpose:
-// falling back to "the only registered device" is exactly the shortcut that
-// made one account appear as several instances (§6.1).
-func restorableInstances(rows []InstanceRow, hasDevice func(phone string) bool) []string {
-	ids := make([]string, 0, len(rows))
-	for _, row := range rows {
-		if row.Status == stateLoggedOut || !row.DeletedAt.IsZero() {
-			continue
-		}
-		phone := normalizePhone(row.PhoneNumber)
-		if phone == "" || !hasDevice(phone) {
-			continue
-		}
-		ids = append(ids, row.ID)
-	}
-	return ids
-}
-
-// session is one live WhatsApp client plus the state the API reads. Every
-// mutable field is behind the mutex: whatsmeow event handlers mutate it from
-// its own goroutines while HTTP handlers read snapshots.
-type session struct {
-	mu   sync.Mutex
-	mgr  *manager
-	id   string
-	mode string
-
-	client    whatsmeowClient
-	device    *store.Device
-	handlerID uint32
-
-	status       sessionState
-	phoneNumber  string
-	botJID       string
-	botLID       string
-	pairingError string
-	qrDataURL    string
-	pairingCode  string
-	connectedAt  time.Time
-	lastSeenAt   time.Time
-
-	// pairingReady is closed once the login websocket has produced its first
-	// QR payload, which is the moment whatsmeow documents for PairPhone.
-	pairingReady chan struct{}
-	readyOnce    sync.Once
-}
-
-func newSession(mgr *manager, row InstanceRow, device *store.Device, client whatsmeowClient) *session {
-	return &session{
-		mgr:          mgr,
-		id:           row.ID,
-		mode:         row.Mode,
-		client:       client,
-		device:       device,
-		status:       statePairing,
-		phoneNumber:  normalizePhone(row.PhoneNumber),
-		pairingReady: make(chan struct{}),
-	}
-}
-
-// sessionSnapshot is the race-free read of a session (§6.1). Callers never see
-// a half-written field.
-type sessionSnapshot struct {
-	Status       sessionState
-	PhoneNumber  string
-	BotJID       string
-	BotLID       string
-	PairingError string
-	QRDataURL    string
-	PairingCode  string
-	ConnectedAt  time.Time
-	LastSeenAt   time.Time
-}
-
-func (s *session) snapshot() sessionSnapshot {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return sessionSnapshot{
-		Status:       s.status,
-		PhoneNumber:  s.phoneNumber,
-		BotJID:       s.botJID,
-		BotLID:       s.botLID,
-		PairingError: s.pairingError,
-		QRDataURL:    s.qrDataURL,
-		PairingCode:  s.pairingCode,
-		ConnectedAt:  s.connectedAt,
-		LastSeenAt:   s.lastSeenAt,
-	}
-}
-
-func (s *session) deviceJID() types.JID {
-	if s.device == nil {
-		return types.EmptyJID
-	}
-	return s.device.GetJID()
-}
-
-// touch records the last activity the session observed, so a status poll can
-// show a live-but-quiet instance.
-func (s *session) touch(at time.Time) {
-	s.mu.Lock()
-	s.lastSeenAt = at
-	s.mu.Unlock()
-}
-
-// setStatus flips the in-memory status only; the persisted transition belongs to
-// a lifecycle job.
-func (s *session) setStatus(status sessionState, pairingError string) {
-	s.mu.Lock()
-	s.status = status
-	s.pairingError = pairingError
-	s.mu.Unlock()
-}
-
-// reportedStatus is the status a read reports for a live session. The field on
-// the session is what the events left behind — `events.Disconnected` deliberately
-// records nothing, because auto-reconnect is whatsmeow's job — so a session that
-// is still in the map is asked directly. Only a session that claims `connected`
-// has that claim checked: `pairing`, a recorded failure and a session that has
-// not authenticated yet are the session's own state, not a statement about the
-// socket.
-func (s *session) reportedStatus() sessionState {
-	s.mu.Lock()
-	status, client := s.status, s.client
-	s.mu.Unlock()
-	if client == nil || status != stateConnected {
-		return status
-	}
-	switch {
-	case !client.IsLoggedIn():
-		// The credential is revoked or refused: the link is gone, not merely
-		// offline.
-		return stateLoggedOut
-	case !client.IsConnected():
-		return stateDisconnected
-	default:
-		return stateConnected
-	}
-}
-
 // groupStoreAPI is every `groups` write and read the worker performs. It is an
-// interface so the event-handler routing (what runs off the whatsmeow callback)
-// is provable without Mongo, and *groupStore satisfies it as-is.
+// interface so the sync and the read model are provable without Mongo, and
+// *groupStore satisfies it as-is.
 type groupStoreAPI interface {
 	FindOne(ctx context.Context, orgID, instanceID, groupJID string) *groupDoc
-	Touch(ctx context.Context, orgID, instanceID, groupJID string, at time.Time) error
 	UpsertObserved(ctx context.Context, orgID, instanceID, groupJID string, observed Observed, fromSync bool) error
-	UpsertFromSync(ctx context.Context, orgID, instanceID string, info *types.GroupInfo, source SyncSource) error
 	MarkLeft(ctx context.Context, orgID, instanceID, groupJID string, state GroupState) error
 	KnownGroupJIDs(ctx context.Context, orgID, instanceID string) ([]string, error)
 	CountLeft(ctx context.Context, orgID, instanceID string) (int, error)
@@ -287,8 +95,9 @@ type dayCounters interface {
 	bump(ctx context.Context, orgID, instanceID, groupJID, counter string, count int64, at time.Time) error
 }
 
-// manager owns every live session, its auth device and its pairing material
-// (§6.1). It is the only component that talks to whatsmeow.
+// manager owns the worker's dependencies and the instance rows it reports. It
+// holds no WhatsApp session, no auth device and no pairing material: WhatsApp is
+// Hermes's, and every live call leaves through the bridge (hermes_bridge.go).
 type manager struct {
 	cfg    Config
 	orgID  string
@@ -296,28 +105,20 @@ type manager struct {
 
 	groups    groupStoreAPI
 	instances instanceRepo
-	pairing   pairingStore
 	stats     dayCounters
 	audit     *auditStore
 	ingest    *ingestQueue
-	media     *mediaRunner
-	devices   deviceStore
 
-	// owners is the BFF-owned reply-owner list, read through a TTL cache. It is
-	// the only thing that lets a direct message into storage: a nil list (a
-	// manager built without one, which is every test that is not about direct
-	// chats) authorizes nobody, so the direct-chat path fails closed.
-	owners ownerAllowlist
+	// external is the Hermes ingest path: the bridge in the Hermes container owns
+	// WhatsApp now, and forwards every message it observes — including the ones the
+	// agent ignores — to this worker, which owns the row shape and the bucket.
+	external *externalIngest
 
-	// persist carries Mongo work that originates on the whatsmeow event loop
-	// onto its own bounded workers, so the protocol goroutine never waits on the
-	// database (§6.2).
-	persist *persistQueue
-
-	// lifecycle carries instance state transitions (connected, logged out) the
-	// same way, but on a single consumer: those transitions are ordered, so a
-	// logout can never be overtaken by the connect that preceded it.
-	lifecycle *lifecycleQueue
+	// bridge is the worker's WhatsApp connection: every live group read, group
+	// write and outbound send goes through it (hermes_bridge.go). It is built once
+	// at startup because it holds one HTTP client with the per-call deadline, and
+	// it is nil only in a worker assembled without a bridge address.
+	bridge *hermesBridge
 
 	// loops is where the scheduled loops record their last pass, so the console
 	// can show a cadence this worker owns rather than only its queues (§6.5).
@@ -326,179 +127,48 @@ type manager struct {
 	// ping is the `/health` database reachability check (§6.5).
 	ping func(ctx context.Context) error
 
-	// newClient is the whatsmeow seam: the production value builds a real
-	// client, tests inject a fake so lifecycle and pairing are provable without
-	// a socket or a live account.
-	newClient func(*store.Device, waLog.Logger) whatsmeowClient
-
 	// newTicker is the periodic-loop seam: production returns a time.Ticker,
-	// tests push ticks by hand so the group-sync scheduler and media janitor
-	// are provable without sleeping.
+	// tests push ticks by hand so the group-sync scheduler is provable without
+	// sleeping.
 	newTicker func(time.Duration) (<-chan time.Time, func())
-
-	ctx    context.Context
-	cancel context.CancelFunc
-
-	mu       sync.Mutex
-	sessions map[string]*session
-	wg       sync.WaitGroup
 }
 
-// newManager builds the manager and the background context pairing goroutines
-// run under. It starts nothing: restoreInstances and the HTTP server are the
-// caller's next steps, so a failed restore can still be served and diagnosed.
-func newManager(cfg Config, groups groupStoreAPI, instances instanceRepo, pairing pairingStore, ingest *ingestQueue, devices deviceStore) *manager {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &manager{
+// newManager builds the manager. It starts nothing: the HTTP server and the
+// scheduled loops are the caller's next steps, so a bridge this worker cannot
+// call is still diagnosable over the control plane.
+func newManager(cfg Config, groups groupStoreAPI, instances instanceRepo, ingest *ingestQueue) *manager {
+	mgr := &manager{
 		cfg:       cfg,
 		orgID:     cfg.OrganizationID,
 		secret:    cfg.WorkerSecret,
 		groups:    groups,
 		instances: instances,
-		pairing:   pairing,
 		ingest:    ingest,
-		devices:   devices,
-		persist:   newPersistQueue(cfg.EventQueueSize, cfg.EventWorkers),
-		lifecycle: newLifecycleQueue(),
 		loops:     newLoopRegistry(),
-		newClient: func(device *store.Device, log waLog.Logger) whatsmeowClient {
-			return whatsmeowNewClient(device, log)
-		},
 		newTicker: func(d time.Duration) (<-chan time.Time, func()) {
 			ticker := time.NewTicker(d)
 			return ticker.C, ticker.Stop
 		},
-		ctx:      ctx,
-		cancel:   cancel,
-		sessions: make(map[string]*session),
 	}
-}
-
-// enqueuePersist hands Mongo work to the persistence queue. A nil queue (a test
-// manager that never touches Mongo) drops the job rather than writing inline —
-// the callback must never fall back to synchronous I/O.
-func (m *manager) enqueuePersist(job persistJob) {
-	m.persist.enqueue(job)
-}
-
-// enqueueLifecycle queues an ordered instance transition. A false result means
-// admission had already closed: the queue has counted it, /health is degraded
-// and the next start reconciles the row, so the caller has a deterministic
-// outcome rather than a silently lost transition.
-func (m *manager) enqueueLifecycle(job persistJob) bool {
-	return m.lifecycle.enqueue(job)
-}
-
-func (m *manager) get(id string) *session {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.sessions[id]
-}
-
-func (m *manager) put(s *session) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.sessions[s.id] = s
-}
-
-func (m *manager) remove(id string) *session {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	s := m.sessions[id]
-	delete(m.sessions, id)
-	return s
-}
-
-// listActive returns the live sessions in a stable order so list responses and
-// restores are deterministic.
-func (m *manager) listActive() []*session {
-	m.mu.Lock()
-	out := make([]*session, 0, len(m.sessions))
-	for _, s := range m.sessions {
-		out = append(out, s)
+	bridge, err := newHermesBridge(cfg.HermesBridgeURL)
+	switch {
+	case err == nil:
+		mgr.bridge = bridge
+	case cfg.HermesBridgeURL != "":
+		// loadConfig refuses a URL the worker cannot call, so this is a deployment
+		// that got past validation with something unusable. Say so here: every group
+		// route would otherwise answer "offline" with no clue why.
+		logf("hermes bridge %q is unusable: %v", cfg.HermesBridgeURL, err)
 	}
-	m.mu.Unlock()
-	sort.Slice(out, func(i, j int) bool { return out[i].id < out[j].id })
-	return out
+	return mgr
 }
 
-func (m *manager) snapshot(id string) (sessionSnapshot, bool) {
-	s := m.get(id)
-	if s == nil {
-		return sessionSnapshot{}, false
-	}
-	return s.snapshot(), true
-}
-
-// liveDevices maps each live session to the device JID it owns. It backs the
-// duplicate-ownership guard.
-func (m *manager) liveDevices() map[string]types.JID {
-	out := make(map[string]types.JID)
-	for _, s := range m.listActive() {
-		if jid := s.deviceJID(); !jid.IsEmpty() {
-			out[s.id] = jid
-		}
-	}
-	return out
-}
-
-// liveClient is the one liveness rule the group surfaces share: a session that
-// is connected and owns a client. A session that exists but is pairing, errored
-// or disconnected has no client any route may call.
-func (m *manager) liveClient(instanceID string) whatsmeowClient {
-	s := m.get(instanceID)
-	if s == nil {
-		return nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.status != stateConnected || s.client == nil {
-		return nil
-	}
-	return s.client
-}
-
-// groupClient returns the live client for an instance, or nil when the
-// instance has no connected session. The group endpoints answer 409 on nil
-// rather than pretending an empty membership arrived (§6.6.6).
-func (m *manager) groupClient(instanceID string) groupClient {
-	if client := m.liveClient(instanceID); client != nil {
-		return client
-	}
-	return nil
-}
-
-// groupAdminClient returns the same live client as the write surface the
-// group-admin route needs. It is the same session and the same liveness rule:
-// the two names exist so a read path cannot reach a write by accident.
-func (m *manager) groupAdminClient(instanceID string) groupAdminClient {
-	if client := m.liveClient(instanceID); client != nil {
-		return client
-	}
-	return nil
-}
-
-// botIdentity is the linked account's own addressing, which is how the live
-// group read reports whether the bot itself is an admin. It comes from the
-// session rather than the stored row because a connected session is the only
-// place those JIDs are known to be current.
-func (m *manager) botIdentity(instanceID string) botIdentity {
-	s := m.get(instanceID)
-	if s == nil {
-		return botIdentity{}
-	}
-	snapshot := s.snapshot()
-	return botIdentity{JID: jidOrEmpty(snapshot.BotJID), LID: jidOrEmpty(snapshot.BotLID)}
-}
-
-// api builds the control-plane handler with the manager's dependencies and
-// live-client lookup (§6.5).
+// api builds the control-plane handler with the manager's dependencies and the
+// bridge every live group call goes through (§6.5).
 func (m *manager) api() *api {
 	return &api{
 		store:      m.groups,
-		clientFor:  m.groupClient,
-		adminFor:   m.groupAdminClient,
-		botFor:     m.botIdentity,
+		bridge:     m.bridge,
 		manager:    m,
 		orgID:      m.orgID,
 		secret:     m.secret,
@@ -506,45 +176,15 @@ func (m *manager) api() *api {
 		staleAfter: m.cfg.GroupStaleAfter,
 		ping:       m.ping,
 		queue:      m.ingest,
-		persist:    m.persist,
-		lifecycle:  m.lifecycle,
 	}
-}
-
-// shutdown disconnects every client without logging out (§6.1): a deploy must
-// not invalidate every linked device. It stops the pairing goroutines first so
-// nothing reconnects while the process is leaving.
-func (m *manager) shutdown(context.Context) {
-	m.cancel()
-	for _, s := range m.listActive() {
-		s.mu.Lock()
-		client := s.client
-		s.mu.Unlock()
-		if client != nil {
-			client.Disconnect()
-		}
-	}
-	m.wg.Wait()
-}
-
-// discard tears one session down locally: its event handler stops receiving
-// events and the map no longer reports it. The auth device is left alone —
-// callers that mean to invalidate a device must log out first.
-func (m *manager) discard(s *session) {
-	if s == nil {
-		return
-	}
-	if s.client != nil {
-		s.client.RemoveEventHandler(s.handlerID)
-	}
-	m.remove(s.id)
 }
 
 // ---- API snapshots -------------------------------------------------------
 
-// instanceSnapshot is the §6.5 JSON the BFF polls. QR data and the pairing code
-// are exposed only while the instance is pairing, so a connected instance never
-// carries stale pairing material.
+// instanceSnapshot is the §6.5 JSON the BFF reads. It is the stored row: this
+// worker has no live session to overlay, and pairing material belongs to the
+// wizard that produces it, so `qr`, `pairingCode` and `pairingError` are only
+// ever reported if a row (or a deployment's own writer) holds them.
 type instanceSnapshot struct {
 	ID           string     `json:"id"`
 	Label        string     `json:"label"`
@@ -554,8 +194,6 @@ type instanceSnapshot struct {
 	BotJID       string     `json:"botJid,omitempty"`
 	BotLID       string     `json:"botLid,omitempty"`
 	PairingError string     `json:"pairingError,omitempty"`
-	QR           string     `json:"qr,omitempty"`
-	PairingCode  string     `json:"pairingCode,omitempty"`
 	ConnectedAt  *time.Time `json:"connectedAt,omitempty"`
 	LastSeenAt   *time.Time `json:"lastSeenAt,omitempty"`
 	CreatedAt    time.Time  `json:"createdAt"`
@@ -565,9 +203,8 @@ type instanceListResponse struct {
 	Instances []instanceSnapshot `json:"instances"`
 }
 
-// mergedSnapshot overlays the live session and the persisted pairing material
-// on a stored row, which is what the BFF polls during pairing.
-func (m *manager) mergedSnapshot(ctx context.Context, row InstanceRow) instanceSnapshot {
+// rowSnapshot projects a stored row into the wire snapshot.
+func rowSnapshot(row InstanceRow) instanceSnapshot {
 	snap := instanceSnapshot{
 		ID:           row.ID,
 		Label:        row.Label,
@@ -587,62 +224,10 @@ func (m *manager) mergedSnapshot(ctx context.Context, row InstanceRow) instanceS
 		t := row.LastSeenAt
 		snap.LastSeenAt = &t
 	}
-	if s := m.get(row.ID); s != nil {
-		live := s.snapshot()
-		// The client is the truth while the session is live: a cached
-		// `connected` for a socket that quietly died would otherwise be served
-		// to the dashboard as fact.
-		status := s.reportedStatus()
-		snap.Status = string(status)
-		for _, v := range []struct {
-			dst *string
-			src string
-		}{
-			{&snap.PhoneNumber, live.PhoneNumber},
-			{&snap.BotJID, live.BotJID},
-			{&snap.BotLID, live.BotLID},
-			{&snap.PairingError, live.PairingError},
-		} {
-			if v.src != "" {
-				*v.dst = v.src
-			}
-		}
-		if !live.ConnectedAt.IsZero() {
-			t := live.ConnectedAt
-			snap.ConnectedAt = &t
-		}
-		if !live.LastSeenAt.IsZero() {
-			t := live.LastSeenAt
-			snap.LastSeenAt = &t
-		}
-		if status == statePairing {
-			snap.QR = live.QRDataURL
-			snap.PairingCode = live.PairingCode
-		}
-	}
-	// Pairing material outlives a process restart in `pairingSessions`; a
-	// connected instance has already had it cleared.
-	if ps, err := m.pairing.Get(ctx, m.orgID, row.ID); err == nil && ps != nil {
-		if ps.Error != "" && snap.PairingError == "" {
-			snap.PairingError = ps.Error
-		}
-		// Only a live QR payload or code makes an instance "pairing"; a row
-		// that holds nothing but a recorded failure must not look pairable.
-		pairable := ps.Error == "" && (ps.QRDataURL != "" || ps.PairingCode != "")
-		if pairable && snap.Status != string(stateConnected) {
-			snap.Status = string(statePairing)
-			if ps.QRDataURL != "" {
-				snap.QR = ps.QRDataURL
-			}
-			if ps.PairingCode != "" {
-				snap.PairingCode = ps.PairingCode
-			}
-		}
-	}
 	return snap
 }
 
-// listInstances reports every non-deleted instance, live state merged in.
+// listInstances reports every non-deleted instance.
 func (m *manager) listInstances(ctx context.Context) ([]instanceSnapshot, error) {
 	rows, err := m.instances.List(ctx, m.orgID)
 	if err != nil {
@@ -650,7 +235,7 @@ func (m *manager) listInstances(ctx context.Context) ([]instanceSnapshot, error)
 	}
 	out := make([]instanceSnapshot, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, m.mergedSnapshot(ctx, row))
+		out = append(out, rowSnapshot(row))
 	}
 	return out, nil
 }
@@ -664,72 +249,17 @@ func (m *manager) getInstance(ctx context.Context, id string) (instanceSnapshot,
 	if row == nil {
 		return instanceSnapshot{}, errInstanceNotFound
 	}
-	return m.mergedSnapshot(ctx, *row), nil
+	return rowSnapshot(*row), nil
 }
 
-type createInstanceRequest struct {
-	Label       string `json:"label"`
-	Mode        string `json:"mode"`
-	PhoneNumber string `json:"phoneNumber"`
-}
-
-func (r createInstanceRequest) validate() error {
-	if strings.TrimSpace(r.Label) == "" {
-		return fmt.Errorf("%w: label is required", errInvalidRequest)
-	}
-	switch r.Mode {
-	case modeQR:
-	case modeCode:
-		if normalizePhone(r.PhoneNumber) == "" {
-			return fmt.Errorf("%w: phoneNumber is required for code pairing", errInvalidRequest)
-		}
-	default:
-		return fmt.Errorf("%w: mode must be %q or %q", errInvalidRequest, modeQR, modeCode)
-	}
-	return nil
-}
-
-// createInstance persists the row, then links a fresh device and starts
-// pairing. The returned snapshot is the pairing state, which the BFF polls
-// until it turns connected or errors.
-func (m *manager) createInstance(ctx context.Context, req createInstanceRequest) (instanceSnapshot, error) {
-	if err := req.validate(); err != nil {
-		return instanceSnapshot{}, err
-	}
-	at := now().UTC()
-	row := InstanceRow{
-		ID:             newID(),
-		OrganizationID: m.orgID,
-		Label:          strings.TrimSpace(req.Label),
-		Mode:           req.Mode,
-		Status:         statePairing,
-		PhoneNumber:    normalizePhone(req.PhoneNumber),
-		CreatedAt:      at,
-		UpdatedAt:      at,
-	}
-	if err := m.instances.Create(ctx, row); err != nil {
-		if mongo.IsDuplicateKeyError(err) {
-			return instanceSnapshot{}, errLabelConflict
-		}
-		return instanceSnapshot{}, err
-	}
-	if _, err := m.beginPairing(row); err != nil {
-		// The row exists but could not begin pairing: record why so the
-		// dashboard can show it instead of a silent stuck "pairing".
-		if markErr := m.markStatus(context.WithoutCancel(ctx), row.ID, stateError, err.Error()); markErr != nil {
-			logf("instance %s: record pairing error: %v", row.ID, markErr)
-		}
-		return instanceSnapshot{}, err
-	}
-	return m.getInstance(ctx, row.ID)
-}
-
-// deleteInstance is the one path that must invalidate a device: log out,
-// delete the auth device, clear pairing material and soft-delete the row
-// (§6.5). Each step is a precondition for the next: a failed logout or device
-// deletion leaves the row and the session untouched so the owner can retry,
-// because claiming a soft-delete over a live credential would hide a device
-// that still exists. Graceful shutdown deliberately does none of this.
+// deleteInstance soft-deletes one instance row (§6.5).
+//
+// It used to be the path that invalidated a linked device — log out, delete the
+// stored credential. There is no credential here any more: the device belongs to
+// the Hermes session, and refusing to forget the row until that session is gone
+// would be claiming an authority this worker no longer has. What remains is what
+// this worker actually owns: the row stops being listed, and the audit trail
+// records who removed it.
 func (m *manager) deleteInstance(ctx context.Context, id string) error {
 	row, err := m.instances.Get(ctx, m.orgID, id)
 	if err != nil {
@@ -738,56 +268,16 @@ func (m *manager) deleteInstance(ctx context.Context, id string) error {
 	if row == nil {
 		return errInstanceNotFound
 	}
-	if s := m.get(id); s != nil {
-		if err := m.logoutSession(ctx, s); err != nil {
-			return err
-		}
-	}
-	if err := m.deleteAuthDevice(ctx, *row); err != nil {
+	if err := m.instances.SoftDelete(ctx, m.orgID, id); err != nil {
 		return err
 	}
-	if err := m.pairing.Clear(ctx, m.orgID, id); err != nil {
-		return fmt.Errorf("%w: clear pairing material: %v", errCleanupFailed, err)
-	}
-	return m.instances.SoftDelete(ctx, m.orgID, id)
-}
-
-// logoutSession invalidates one linked device. ErrNotLoggedIn means there is
-// nothing to unlink — an unpaired instance — which is a success, not a failure;
-// any other error leaves the session live and is reported so DELETE can refuse.
-func (m *manager) logoutSession(ctx context.Context, s *session) error {
-	s.mu.Lock()
-	client := s.client
-	s.mu.Unlock()
-	if client == nil {
-		m.discard(s)
-		return nil
-	}
-	if err := client.Logout(ctx); err != nil && !errors.Is(err, whatsmeow.ErrNotLoggedIn) {
-		return fmt.Errorf("%w: %v", errLogoutFailed, err)
-	}
-	m.discard(s)
-	return nil
-}
-
-// deleteAuthDevice removes the stored credential for the instance's own phone.
-// A successful Logout already deleted it, so this only finds work in the
-// not-logged-in case (an orphaned device row); a store error is reported rather
-// than ignored.
-func (m *manager) deleteAuthDevice(ctx context.Context, row InstanceRow) error {
-	phone := normalizePhone(row.PhoneNumber)
-	if phone == "" {
-		return nil
-	}
-	device, err := m.deviceForPhone(ctx, phone)
-	if err != nil {
-		return fmt.Errorf("%w: %v", errDeviceDeleteFailed, err)
-	}
-	if device == nil {
-		return nil
-	}
-	if err := m.devices.DeleteDevice(ctx, device); err != nil {
-		return fmt.Errorf("%w: %v", errDeviceDeleteFailed, err)
+	if m.audit != nil {
+		meta := bson.M{"deletedAt": now().UTC()}
+		if err := m.audit.append(ctx, m.orgID, "instance.deleted", "instance", id, meta); err != nil {
+			// The row is already gone from every read; a failed audit write is
+			// reported, not turned into a failed DELETE the owner would retry.
+			logf("instance %s: audit delete: %v", id, err)
+		}
 	}
 	return nil
 }
@@ -797,12 +287,16 @@ func (m *manager) deleteAuthDevice(ctx context.Context, row InstanceRow) error {
 // instanceRepo is the worker's write surface over `instances.runtime.*`. The
 // BFF owns `config.*` and the document root timestamps; every write here touches
 // only the worker-owned subdocument (§5.2, one writer per subdocument).
+//
+// There is no `Create` and no `SetConnected` any more: an `instances` row is
+// created by whoever runs the pairing wizard, and the identity fields
+// (`phoneNumber`, `botJid`, `botLid`, `connectedAt`) are facts only the process
+// holding the WhatsApp session can observe. The worker keeps the reads and the
+// status/summary writes it owns.
 type instanceRepo interface {
-	Create(ctx context.Context, row InstanceRow) error
 	Get(ctx context.Context, orgID, id string) (*InstanceRow, error)
 	List(ctx context.Context, orgID string) ([]InstanceRow, error)
 	SetStatus(ctx context.Context, orgID, id string, status sessionState, pairingError string) error
-	SetConnected(ctx context.Context, orgID, id, phoneNumber, botJID, botLID string) error
 	BumpCounters(ctx context.Context, orgID, id string, counters map[string]int64) error
 	SetGroupSync(ctx context.Context, orgID, id string, sync groupSyncState) error
 	SetGroupSyncError(ctx context.Context, orgID, id, message string) error
@@ -881,33 +375,6 @@ func liveInstanceFilter(orgID, id string) bson.D {
 	}
 }
 
-func (r *instanceMongo) Create(ctx context.Context, row InstanceRow) error {
-	at := row.CreatedAt
-	if at.IsZero() {
-		at = now().UTC()
-	}
-	_, err := r.coll.InsertOne(ctx, bson.D{
-		{Key: "_id", Value: row.ID},
-		{Key: "organizationId", Value: row.OrganizationID},
-		{Key: "label", Value: row.Label},
-		{Key: "mode", Value: row.Mode},
-		{Key: "runtime", Value: bson.D{
-			{Key: "status", Value: string(row.Status)},
-			{Key: "phoneNumber", Value: normalizePhone(row.PhoneNumber)},
-			{Key: "botJid", Value: ""},
-			{Key: "botLid", Value: ""},
-			{Key: "pairingError", Value: nil},
-		}},
-		{Key: "deletedAt", Value: nil},
-		{Key: "createdAt", Value: at},
-		{Key: "updatedAt", Value: at},
-	})
-	if err != nil {
-		return fmt.Errorf("create instance: %w", err)
-	}
-	return nil
-}
-
 func (r *instanceMongo) Get(ctx context.Context, orgID, id string) (*InstanceRow, error) {
 	var doc instanceDoc
 	err := r.coll.FindOne(ctx, liveInstanceFilter(orgID, id)).Decode(&doc)
@@ -954,25 +421,6 @@ func (r *instanceMongo) SetStatus(ctx context.Context, orgID, id string, status 
 	})
 	if err != nil {
 		return fmt.Errorf("set instance %s status: %w", id, err)
-	}
-	return nil
-}
-
-func (r *instanceMongo) SetConnected(ctx context.Context, orgID, id, phoneNumber, botJID, botLID string) error {
-	at := now().UTC()
-	_, err := r.coll.UpdateOne(ctx, liveInstanceFilter(orgID, id), bson.D{
-		{Key: "$set", Value: bson.D{
-			{Key: "runtime.status", Value: string(stateConnected)},
-			{Key: "runtime.phoneNumber", Value: phoneNumber},
-			{Key: "runtime.botJid", Value: botJID},
-			{Key: "runtime.botLid", Value: botLID},
-			{Key: "runtime.pairingError", Value: nil},
-			{Key: "runtime.connectedAt", Value: at},
-			{Key: "runtime.lastSeenAt", Value: at},
-		}},
-	})
-	if err != nil {
-		return fmt.Errorf("set instance %s connected: %w", id, err)
 	}
 	return nil
 }
@@ -1038,77 +486,6 @@ func (r *instanceMongo) SetGroupSyncError(ctx context.Context, orgID, id, messag
 	})
 	if err != nil {
 		return fmt.Errorf("set instance group sync error %s: %w", id, err)
-	}
-	return nil
-}
-
-// pairingSession is the §5.1 `pairingSessions` document: transient pairing
-// material kept outside `instances` so the TTL index can never delete an
-// instance.
-type pairingSession struct {
-	InstanceID     string    `bson:"_id"`
-	OrganizationID string    `bson:"organizationId"`
-	Mode           string    `bson:"mode"`
-	QRDataURL      string    `bson:"qrDataUrl"`
-	PairingCode    string    `bson:"pairingCode"`
-	Error          string    `bson:"error"`
-	ExpiresAt      time.Time `bson:"expiresAt"`
-	UpdatedAt      time.Time `bson:"updatedAt"`
-}
-
-type pairingStore interface {
-	Put(ctx context.Context, ps pairingSession) error
-	Get(ctx context.Context, orgID, id string) (*pairingSession, error)
-	Clear(ctx context.Context, orgID, id string) error
-}
-
-type pairingMongo struct {
-	coll *mongo.Collection
-}
-
-func newPairingMongo(db *mongo.Database) *pairingMongo {
-	return &pairingMongo{coll: db.Collection(collPairingSession)}
-}
-
-func (p *pairingMongo) Put(ctx context.Context, ps pairingSession) error {
-	at := now().UTC()
-	_, err := p.coll.UpdateOne(ctx,
-		bson.D{{Key: "_id", Value: ps.InstanceID}, {Key: "organizationId", Value: ps.OrganizationID}},
-		bson.D{
-			{Key: "$set", Value: bson.D{
-				{Key: "organizationId", Value: ps.OrganizationID},
-				{Key: "mode", Value: ps.Mode},
-				{Key: "qrDataUrl", Value: ps.QRDataURL},
-				{Key: "pairingCode", Value: ps.PairingCode},
-				{Key: "error", Value: ps.Error},
-				{Key: "expiresAt", Value: at.Add(pairingMaterialTTL)},
-				{Key: "updatedAt", Value: at},
-			}},
-		},
-		options.UpdateOne().SetUpsert(true),
-	)
-	if err != nil {
-		return fmt.Errorf("put pairing session %s: %w", ps.InstanceID, err)
-	}
-	return nil
-}
-
-func (p *pairingMongo) Get(ctx context.Context, orgID, id string) (*pairingSession, error) {
-	var ps pairingSession
-	err := p.coll.FindOne(ctx, bson.D{{Key: "_id", Value: id}, {Key: "organizationId", Value: orgID}}).Decode(&ps)
-	if errors.Is(err, mongo.ErrNoDocuments) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("get pairing session %s: %w", id, err)
-	}
-	return &ps, nil
-}
-
-func (p *pairingMongo) Clear(ctx context.Context, orgID, id string) error {
-	_, err := p.coll.DeleteOne(ctx, bson.D{{Key: "_id", Value: id}, {Key: "organizationId", Value: orgID}})
-	if err != nil {
-		return fmt.Errorf("clear pairing session %s: %w", id, err)
 	}
 	return nil
 }

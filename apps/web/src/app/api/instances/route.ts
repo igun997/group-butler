@@ -1,10 +1,9 @@
+import type { OwnerIdentity } from "../../../server/auth/owner";
 import { UnauthorizedError, requireOwner } from "../../../server/auth/owner";
-import {
-  CreateInstanceRequestSchema,
-  createWorkerInstance,
-  listWorkerInstances,
-  workerFailureResponse,
-} from "../../../server/worker/client";
+import { hermesInstanceSnapshot } from "../../../server/hermes/instance";
+import { getDb } from "../../../server/mongo";
+import { createInstance } from "../../../server/repos/instances";
+import { CreateInstanceRequestSchema, listWorkerInstances, workerFailureResponse } from "../../../server/worker/client";
 
 /**
  * §7.3 `/api/instances`: the owner's instances, proxied to the worker control
@@ -46,8 +45,9 @@ export async function GET(): Promise<Response> {
 }
 
 export async function POST(request: Request): Promise<Response> {
+  let owner: OwnerIdentity;
   try {
-    await requireOwner();
+    owner = await requireOwner();
   } catch (error) {
     if (!(error instanceof UnauthorizedError)) throw error;
     return unauthorized();
@@ -62,7 +62,11 @@ export async function POST(request: Request): Promise<Response> {
   const parsed = CreateInstanceRequestSchema.safeParse(body);
   if (!parsed.success) return invalidRequest(parsed.error.issues[0]?.message ?? "the request body is not a create request");
 
-  const result = await createWorkerInstance(parsed.data);
-  if (!result.ok) return workerFailureResponse(result.failure);
-  return Response.json(result.data, { status: 201, headers: NO_STORE });
+  // The row is the console's own record and the BFF writes it. The worker used to
+  // because it owned the device the row described; pairing now belongs to Hermes,
+  // so what remains is a label, a mode and a tenant — and asking a worker with no
+  // WhatsApp session to create one would be asking the wrong service entirely.
+  const db = await getDb();
+  const doc = await createInstance(db, owner.organizationId, { label: parsed.data.label, mode: parsed.data.mode });
+  return Response.json(hermesInstanceSnapshot(doc, null), { status: 201, headers: NO_STORE });
 }

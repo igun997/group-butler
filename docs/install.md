@@ -154,9 +154,9 @@ A managed MongoDB (Atlas, most PaaS add-ons) is already a replica set; check wit
    whitelisted groups are ever read, stored, or answered in — and the worker stores
    messages only for those, plus the owner's own direct messages.
 
-The worker's session lives in its `whatsmeow` store (`apps/worker/.localdata` by default,
-or `WHATSMEOW_DB_URI`). Losing it means pairing again; in Docker it is the `butler-wa`
-named volume for that reason.
+The linked device belongs to Hermes, not to this worker: the session keys live in the
+Hermes container's data volume. The Go worker holds no WhatsApp session at all — losing
+anything of the worker's loses no pairing.
 
 ## 5. Checks
 

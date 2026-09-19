@@ -8,59 +8,35 @@ import (
 	"net/http"
 	"strings"
 	"time"
-
-	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/types"
 )
 
-// api is the worker control plane (§6.5). `store` serves the persisted group
-// read model, `clientFor` resolves the live client for an instance (nil when it
-// has none), and `manager` owns the instance lifecycle routes. A nil manager
-// leaves those routes answering 404, which keeps the group surface testable on
-// its own.
+// api is the worker control plane (§6.5). `store` serves the persisted group read
+// model, `bridge` is the WhatsApp connection every live group call goes through,
+// and `manager` owns the instance routes. A nil manager leaves those routes
+// answering 404, which keeps the group surface testable on its own.
 type api struct {
-	store     groupStoreAPI
-	clientFor func(instanceID string) groupClient
-	// adminFor resolves the same live client as `clientFor`, but as the write
-	// surface the group-admin route needs: the reads a dashboard performs are
-	// safe, so the two capabilities are kept apart by their types.
-	adminFor func(instanceID string) groupAdminClient
-	// botFor resolves the linked account's own JIDs, which is how a group read
-	// answers whether the bot itself is an admin.
-	botFor     func(instanceID string) botIdentity
+	store groupStoreAPI
+	// bridge is the Hermes bridge: the process that owns the linked device answers
+	// these calls, so no route on this surface needs a session of its own.
+	bridge     *hermesBridge
 	manager    *manager
 	orgID      string
 	secret     string
 	prune      bool
 	staleAfter time.Duration
 
-	// Health dependencies. `ping` is the database reachability check and
-	// `queue`/`persist`/`lifecycle` are the bounded queues whose state the probe
-	// reports (§6.5).
-	ping      func(ctx context.Context) error
-	queue     *ingestQueue
-	persist   *persistQueue
-	lifecycle *lifecycleQueue
+	// Health dependencies. `ping` is the database reachability check and `queue`
+	// is the bounded ingest queue whose state the probe reports (§6.5).
+	ping  func(ctx context.Context) error
+	queue *ingestQueue
 }
 
 // healthResponse is the §6.5 liveness payload: `ok` is the aggregate a load
 // balancer acts on, and the parts say which dependency degraded.
 type healthResponse struct {
-	OK        bool            `json:"ok"`
-	Mongo     string          `json:"mongo"`
-	Queue     queueHealth     `json:"queue"`
-	Persist   persistHealth   `json:"persist"`
-	Lifecycle lifecycleHealth `json:"lifecycle"`
-}
-
-type lifecycleHealth struct {
-	Depth     int    `json:"depth"`
-	Applied   int64  `json:"applied"`
-	Failed    int64  `json:"failed"`
-	Abandoned int64  `json:"abandoned"`
-	Rejected  int64  `json:"rejected"`
-	Stopped   bool   `json:"stopped"`
-	Error     string `json:"error,omitempty"`
+	OK    bool        `json:"ok"`
+	Mongo string      `json:"mongo"`
+	Queue queueHealth `json:"queue"`
 }
 
 type queueHealth struct {
@@ -69,13 +45,6 @@ type queueHealth struct {
 	Dropped  int64  `json:"dropped"`
 	Stopped  bool   `json:"stopped"`
 	Error    string `json:"error,omitempty"`
-}
-
-type persistHealth struct {
-	Depth   int    `json:"depth"`
-	Dropped int64  `json:"dropped"`
-	Failed  int64  `json:"failed"`
-	Error   string `json:"error,omitempty"`
 }
 
 // healthTimeout bounds the probe: a hung database must fail the check, not hang
@@ -125,10 +94,56 @@ func (a *api) routes() http.Handler {
 	// The scheduled loops are operational detail, so they sit behind the same
 	// bearer token as the instance surface rather than beside the open probe.
 	mux.HandleFunc("/scheduler", a.auth(a.handleScheduler))
+	// The Hermes bridge posts every message it sees here, with the same shared
+	// token: it is another service of this deployment, not a public collector.
+	mux.HandleFunc("/ingest", a.auth(a.handleIngest))
 	instances := a.auth(a.handleInstanceSubresource)
 	mux.HandleFunc("/instances", instances)
 	mux.HandleFunc("/instances/", instances)
 	return mux
+}
+
+// externalEventBodyMaxBytes bounds one bridge event. It is far larger than the rest
+// of the control plane because the body is a WhatsApp message — a long text plus
+// its mention list — rather than a command, and still finite, because the route is
+// reachable with a token that could be leaked.
+const externalEventBodyMaxBytes = 128 * 1024
+
+// handleIngest is the worker's second ingest door (§6.2): the Hermes bridge POSTs
+// one event per inbound WhatsApp message, and this accepts it into the same queue
+// whatever the agent decides to do with the message.
+//
+// 202 — not 200 — because nothing is durable yet: the row is accepted into memory
+// and written with the batch behind it, which is what keeps this answer fast enough
+// for a bridge whose callback is not allowed to stall. A malformed body and an event
+// that cannot be identified are 400 (the bridge should fix the payload); a worker
+// that is shutting down, or one built without this path, is 503 (the bridge should
+// keep the event for a later attempt).
+func (a *api) handleIngest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST /ingest")
+		return
+	}
+	if a.manager == nil {
+		writeError(w, http.StatusServiceUnavailable, "ingest_unavailable", "this worker has no ingest path")
+		return
+	}
+	var evt externalEvent
+	if !decodeBodyLimited(w, r, &evt, externalEventBodyMaxBytes) {
+		return
+	}
+	if err := a.manager.ingestExternalEvent(r.Context(), evt); err != nil {
+		switch {
+		case errors.Is(err, errInvalidRequest):
+			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		case errors.Is(err, errIngestClosed):
+			writeError(w, http.StatusServiceUnavailable, "ingest_closed", err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "messageId": evt.MessageID})
 }
 
 // handleScheduler reports what this worker's timers are doing: each loop's
@@ -147,7 +162,7 @@ func (a *api) handleScheduler(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleHealth is the §6.5 probe: `/health` stays open for container probes and
-// reports the database and the two bounded queues. `ok` is false — with 503 —
+// reports the database and the bounded ingest queue. `ok` is false — with 503 —
 // when a dependency the worker cannot function without has failed, so a load
 // balancer stops routing here instead of sending work into a stalled worker.
 func (a *api) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -162,45 +177,6 @@ func (a *api) handleHealth(w http.ResponseWriter, r *http.Request) {
 		if body.Queue.Stopped {
 			body.OK = false
 			body.Queue.Error = "ingest consumer stopped"
-		}
-	}
-	if a.persist != nil {
-		body.Persist = persistHealth{
-			Depth:   a.persist.Depth(),
-			Dropped: a.persist.Dropped(),
-			Failed:  a.persist.Failed(),
-		}
-	}
-	if a.lifecycle != nil {
-		body.Lifecycle = lifecycleHealth{
-			Depth:     a.lifecycle.Depth(),
-			Applied:   a.lifecycle.Applied(),
-			Failed:    a.lifecycle.Failed(),
-			Abandoned: a.lifecycle.Abandoned(),
-			Rejected:  a.lifecycle.Rejected(),
-			Stopped:   a.lifecycle.Stopped(),
-		}
-		switch {
-		case body.Lifecycle.Stopped:
-			// No consumer: transitions would pile up unapplied, so this worker
-			// must not be routed more work.
-			body.OK = false
-			body.Lifecycle.Error = "lifecycle consumer stopped"
-		case body.Lifecycle.Abandoned > 0:
-			// A previous drain could not apply transitions; the startup
-			// reconcile repairs them, but the state is degraded until then.
-			body.OK = false
-			body.Lifecycle.Error = "lifecycle transitions were abandoned"
-		case body.Lifecycle.Rejected > 0:
-			// Transitions arrived after admission closed: their rows stay stale
-			// until the next start reconciles them, so this is not healthy.
-			body.OK = false
-			body.Lifecycle.Error = "lifecycle transitions were rejected"
-		case body.Lifecycle.Depth >= lifecycleWarnDepth:
-			// Lifecycle transitions are rare, so a backlog this deep means the
-			// consumer is stalled, not merely busy.
-			body.OK = false
-			body.Lifecycle.Error = "lifecycle consumer stalled"
 		}
 	}
 	if a.ping != nil {
@@ -218,15 +194,6 @@ func (a *api) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, body)
 }
 
-// client resolves the live whatsmeow client for an instance. A nil resolver
-// (the group-surface-only test harness) means no live client.
-func (a *api) client(instanceID string) groupClient {
-	if a.clientFor == nil {
-		return nil
-	}
-	return a.clientFor(instanceID)
-}
-
 // auth is the §11.2 bearer check. The comparison is constant-time so a wrong
 // token cannot be searched for byte by byte.
 func (a *api) auth(next http.HandlerFunc) http.HandlerFunc {
@@ -241,8 +208,12 @@ func (a *api) auth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // handleInstanceSubresource routes `/instances[/{id}[/{subresource}]]`. The
-// first segment selects the lifecycle surface or, for a known instance, one of
-// its subresources (groups, pairing-code, pair, check).
+// first segment selects the instance surface or, for a known instance, one of its
+// subresources (groups, and the pairing routes that now refuse).
+//
+// The pairing subresources are still routed rather than removed so a caller gets
+// a refusal that names where pairing went instead of a bare 404. The BFF keeps
+// calling this worker's `POST /instances`; its answer is now the honest one.
 func (a *api) handleInstanceSubresource(w http.ResponseWriter, r *http.Request) {
 	tail := splitPath(r.URL.Path)
 	switch {
@@ -257,19 +228,19 @@ func (a *api) handleInstanceSubresource(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST /instances/{id}/pairing-code")
 			return
 		}
-		a.handlePairingCode(w, r, tail[0])
+		a.refusePairing(w)
 	case len(tail) == 2 && tail[0] != "" && tail[1] == "pair":
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST /instances/{id}/pair")
 			return
 		}
-		a.handleRepairPairing(w, r, tail[0])
+		a.refusePairing(w)
 	case len(tail) == 2 && tail[0] != "" && tail[1] == "check":
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST /instances/{id}/check")
 			return
 		}
-		a.handleCheckConnection(w, r, tail[0])
+		a.refusePairing(w)
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "unknown worker route")
 	}
@@ -287,7 +258,7 @@ func splitPath(path string) []string {
 
 func (a *api) handleInstanceCollection(w http.ResponseWriter, r *http.Request) {
 	if a.manager == nil {
-		writeError(w, http.StatusNotFound, "not_found", "instance lifecycle is not available")
+		writeError(w, http.StatusNotFound, "not_found", "instance surface is not available")
 		return
 	}
 	switch r.Method {
@@ -299,24 +270,29 @@ func (a *api) handleInstanceCollection(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, instanceListResponse{Instances: instances})
 	case http.MethodPost:
-		var req createInstanceRequest
-		if !decodeBody(w, r, &req) {
-			return
-		}
-		snap, err := a.manager.createInstance(r.Context(), req)
-		if err != nil {
-			a.writeInstanceError(w, err)
-			return
-		}
-		writeJSON(w, http.StatusCreated, snap)
+		// Creating an instance used to mean "link a device": mint a row, open an
+		// auth-store device, start a QR/pairing-code attempt. The credential is
+		// Hermes's now, so there is nothing here to pair — the BFF's wizard
+		// (apps/web/src/server/hermes/pairing.ts) starts the attempt and the
+		// console reads the QR from its own poll.
+		a.refusePairing(w)
 	default:
-		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "GET or POST /instances")
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "GET /instances")
 	}
+}
+
+// refusePairing answers every route that used to link a device into a WhatsApp
+// session held by this worker. `invalid_state` is the BFF's vocabulary for "the
+// instance is not in a state that allows this" — the closest honest code, since
+// the operation itself has moved — and the message names where pairing went so an
+// operator reading the worker's answer knows the console is not broken.
+func (a *api) refusePairing(w http.ResponseWriter) {
+	writeError(w, http.StatusConflict, "invalid_state", errPairingMoved.Error())
 }
 
 func (a *api) handleInstanceItem(w http.ResponseWriter, r *http.Request, instanceID string) {
 	if a.manager == nil {
-		writeError(w, http.StatusNotFound, "not_found", "instance lifecycle is not available")
+		writeError(w, http.StatusNotFound, "not_found", "instance surface is not available")
 		return
 	}
 	switch r.Method {
@@ -338,52 +314,12 @@ func (a *api) handleInstanceItem(w http.ResponseWriter, r *http.Request, instanc
 	}
 }
 
-func (a *api) handlePairingCode(w http.ResponseWriter, r *http.Request, instanceID string) {
-	snap, err := a.manager.requestPairingCode(r.Context(), instanceID)
-	if err != nil {
-		a.writeInstanceError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, snap)
-}
-
-// handleRepairPairing starts pairing again for an instance whose link is gone or
-// broken (§6.5 POST /instances/{id}/pair). The body is empty: which instance and
-// which mode are already persisted.
-func (a *api) handleRepairPairing(w http.ResponseWriter, r *http.Request, instanceID string) {
-	snap, err := a.manager.repairPairing(r.Context(), instanceID)
-	if err != nil {
-		a.writeInstanceError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, snap)
-}
-
-// handleCheckConnection answers what an instance's connection actually is (§6.5
-// POST /instances/{id}/check). It is a query in POST clothing because it may
-// reconnect: a truthful answer can require opening a socket.
-func (a *api) handleCheckConnection(w http.ResponseWriter, r *http.Request, instanceID string) {
-	snap, err := a.manager.verifyConnection(r.Context(), instanceID)
-	if err != nil {
-		a.writeInstanceError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, snap)
-}
-
 // writeInstanceError maps the manager's sentinel errors to the §6.5 stable
 // codes the BFF turns into UI messages.
 func (a *api) writeInstanceError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, errInstanceNotFound):
 		writeError(w, http.StatusNotFound, "not_found", err.Error())
-	case errors.Is(err, errLabelConflict):
-		writeError(w, http.StatusConflict, "label_conflict", err.Error())
-	case errors.Is(err, errWrongMode), errors.Is(err, errPairingNotReady), errors.Is(err, errAlreadyConnected):
-		writeError(w, http.StatusConflict, "invalid_state", err.Error())
-	case errors.Is(err, errLogoutFailed), errors.Is(err, errDeviceDeleteFailed), errors.Is(err, errCleanupFailed):
-		// Recoverable: nothing was soft-deleted, so the owner may retry.
-		writeError(w, http.StatusBadGateway, "instance_cleanup_failed", err.Error())
 	case errors.Is(err, errInvalidRequest):
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 	default:
@@ -487,21 +423,27 @@ func (a *api) handleGroupByJID(w http.ResponseWriter, r *http.Request, instanceI
 // handleGroupSync forces a full sync. A failure is reported, never disguised as
 // an empty membership — the caller must not act on a snapshot that never
 // arrived.
+//
+// The snapshot comes from the bridge's `GET /groups`: every group the linked
+// account participates in, which is the one question a per-JID read cannot
+// answer. A bridge this worker cannot reach is `instance_offline` — there is no
+// live session to ask, on either side of the loopback — and a bridge that
+// answered with a refusal is a failed sync, recorded against the instance so the
+// dashboard shows the failure the operator just triggered.
 func (a *api) handleGroupSync(w http.ResponseWriter, r *http.Request, instanceID string) {
-	client := a.client(instanceID)
-	if client == nil {
-		writeError(w, http.StatusConflict, "instance_offline", "instance has no live whatsapp client")
+	if _, ok := a.groupInstance(w, r, instanceID); !ok {
 		return
 	}
-	summary, err := runGroupSync(r.Context(), client, a.store, a.orgID, instanceID, SyncOnManual, a.prune)
+	bridge, ok := a.liveBridge(w)
+	if !ok {
+		return
+	}
+	summary, err := runGroupSync(r.Context(), bridge, a.store, a.orgID, instanceID, SyncOnManual, a.prune)
 	if err != nil {
-		// A manual sync that was refused is recorded like a timer-driven one, so
-		// the dashboard's "last sync error" reflects the failure the operator
-		// just triggered instead of the last success.
 		if a.manager != nil {
 			a.manager.recordGroupSyncError(r.Context(), instanceID, err.Error())
 		}
-		writeError(w, http.StatusBadGateway, "group_sync_failed", err.Error())
+		a.writeGroupReadError(w, classifyGroupFailure(err))
 		return
 	}
 	// A manual sync describes the membership just as a timer-driven one does, so
@@ -514,33 +456,44 @@ func (a *api) handleGroupSync(w http.ResponseWriter, r *http.Request, instanceID
 }
 
 // repairStale refreshes one group from WhatsApp when the stored observation is
-// nameless or older than GROUP_STALE_AFTER. A repair that fails for any other
-// reason serves what we already have: the dashboard must not lose a row because
-// WhatsApp was slow, and the next read retries.
+// nameless or older than GROUP_STALE_AFTER. The read is the bridge's
+// `GET /group/:jid`, the same call the admin surface's info route makes, so what
+// lands in the read model is what the console sees.
+//
+// A repair that fails for any other reason serves what we already have: the
+// dashboard must not lose a row because WhatsApp was slow, and the next read
+// retries. A group the account can no longer see is marked gone instead —
+// keeping the name it had — because that is a fact, not a failure.
 func (a *api) repairStale(ctx context.Context, instanceID string, doc *groupDoc) *groupDoc {
-	client := a.client(instanceID)
-	if client == nil || !a.stale(doc.Observed) {
+	if a.bridge == nil || !a.stale(doc.Observed) {
 		return doc
 	}
-	jid, err := types.ParseJID(doc.GroupJID)
-	if err != nil {
+	address, err := parseAddress(doc.GroupJID)
+	if err != nil || !address.isGroup() {
 		logf("group %s: unparseable JID, serving stored row: %v", doc.GroupJID, err)
 		return doc
 	}
-	info, err := client.GetGroupInfo(ctx, jid)
+	info, err := a.bridge.GroupInfo(ctx, address.String())
 	switch {
-	case errors.Is(err, whatsmeow.ErrNotInGroup):
-		// The account was removed: §6.6.5 rule 5 applies the same marking as a
-		// snapshot that no longer lists the group.
+	case errors.Is(classifyGroupFailure(err), errGroupNotFound):
+		// The account was removed, or the group no longer exists. The bridge's
+		// contract collapses the two — every group call answers the same
+		// not-found — and `left` is the honest one of the pair: it keeps the
+		// name the group had, and a later snapshot that lists the group again
+		// moves it back to `active` (§6.6.5 rule 5).
 		return a.markGone(ctx, instanceID, doc, GroupLeft)
-	case errors.Is(err, whatsmeow.ErrGroupNotFound):
-		return a.markGone(ctx, instanceID, doc, GroupDeleted)
 	case err != nil:
 		logf("group %s: repair failed, serving stored row: %v", doc.GroupJID, err)
 		return doc
 	}
 	repaired := *doc
-	repaired.Observed, _, _ = mergeSnapshot(doc.Observed, info, SyncOnManual, now().UTC())
+	repaired.Observed, _ = mergeSnapshot(doc.Observed, groupSnapshot{
+		JID:              address.String(),
+		Subject:          info.Subject,
+		Announce:         info.Announce,
+		Locked:           info.Locked,
+		ParticipantCount: len(info.Participants),
+	}, SyncOnManual, now().UTC())
 	if err := a.store.UpsertObserved(ctx, a.orgID, instanceID, doc.GroupJID, repaired.Observed, true); err != nil {
 		logf("group %s: repair write failed, serving stored row: %v", doc.GroupJID, err)
 		return doc

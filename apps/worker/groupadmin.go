@@ -7,9 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-
-	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/types"
 )
 
 // This file is the group-admin surface: the two live reads that tell the BFF
@@ -17,13 +14,21 @@ import (
 // the single action a human approved. Nothing here stages, approves or retries
 // anything — the BFF owns that, and this layer executes exactly what it is told.
 //
+// The live side of that is the Hermes bridge now (hermes_bridge.go): the worker
+// holds no session, so a read is `GET /group/:jid` and a write is one POST on the
+// same surface. What does not change is everything the BFF sees — the routes, the
+// response bodies, the per-JID membership semantics, and the codes WhatsApp's
+// refusals are reported as.
+//
 // Every way WhatsApp can say no is reported as one of the documented codes
 // below, so a refusal is a message the owner can act on rather than a 500.
 const (
 	// codeNotFound: no such instance.
 	codeNotFound = "not_found"
 	// codeInstanceOffline: the instance is known but has no live WhatsApp
-	// client, so nothing could be asked of it.
+	// client, so nothing could be asked of it. With Hermes owning the connection
+	// this is also what an unreachable bridge answers: there is no live session
+	// to ask, whichever side of the loopback it would have run on.
 	codeInstanceOffline = "instance_offline"
 	// codeGroupNotFound: the linked account cannot see the group — it was
 	// removed, or the group no longer exists. Nothing was changed.
@@ -67,6 +72,12 @@ const maxGroupPhotoBytes = 4 << 20
 // bytes it encodes, hence the headroom above maxGroupPhotoBytes.
 const groupAdminBodyMaxBytes = 6 << 20
 
+// The admin flags WhatsApp reports for one participant, as the bridge spells them.
+const (
+	participantSuperAdmin = "superadmin"
+	participantAdmin      = "admin"
+)
+
 // The refusals of this surface, before they are mapped to a code. They are
 // deliberately separate from the ones manager.go already has: a group write can
 // fail in ways an instance lifecycle cannot.
@@ -77,26 +88,12 @@ var (
 	errRevokeFailed     = errors.New("whatsapp did not confirm the revoke")
 )
 
-// groupAdminClient is the whatsmeow write surface the admin route needs. It is
-// deliberately narrower than groupClient — and separate from it — because every
-// method here changes a group on WhatsApp: keeping the two apart means a read
-// path cannot reach a write by accident. *whatsmeow.Client satisfies it as-is.
-type groupAdminClient interface {
-	SetGroupName(ctx context.Context, jid types.JID, name string) error
-	SetGroupPhoto(ctx context.Context, jid types.JID, avatar []byte) (string, error)
-	SetGroupAnnounce(ctx context.Context, jid types.JID, announce bool) error
-	SetGroupLocked(ctx context.Context, jid types.JID, locked bool) error
-	UpdateGroupParticipants(ctx context.Context, jid types.JID, participantChanges []types.JID, action whatsmeow.ParticipantChange) ([]types.GroupParticipant, error)
-	LeaveGroup(ctx context.Context, jid types.JID) error
-	RevokeMessage(ctx context.Context, chat types.JID, id types.MessageID) (whatsmeow.SendResponse, error)
-}
-
 // botIdentity is the linked account's own addressing. A group may list the bot
 // under either address — the phone JID or its LID — so both are matched when the
 // reads report whether the bot itself is an admin.
 type botIdentity struct {
-	JID types.JID
-	LID types.JID
+	JID string
+	LID string
 }
 
 // groupInfoResponse is GET .../info: the group as WhatsApp has it now, plus the
@@ -166,8 +163,8 @@ type actionResponse struct {
 }
 
 // groupAdminRequest is the one body POST .../admin accepts. `action` selects
-// which parameters are read, and validate resolves them into the exact values
-// the whatsmeow call takes so no action parses the same body twice.
+// which parameters are read, and validate resolves them into the exact values the
+// bridge call takes so no action parses the same body twice.
 type groupAdminRequest struct {
 	Action      string   `json:"action"`
 	Name        string   `json:"name"`
@@ -178,14 +175,15 @@ type groupAdminRequest struct {
 	JIDs        []string `json:"jids"`
 	WaMessageID string   `json:"waMessageId"`
 
-	photo        []byte
-	participants []types.JID
-	change       whatsmeow.ParticipantChange
+	// participants is the validated, canonical spelling of JIDs, in the order the
+	// caller asked for them: the answer is reported in that order and the bridge is
+	// asked about exactly these addresses.
+	participants []string
 }
 
 // validate checks the named action and resolves its parameters. An unknown
 // action, or parameters an action cannot use, is the caller's error: it is
-// answered with invalid_request and never reaches WhatsApp.
+// answered with invalid_request and never reaches the bridge.
 func (r *groupAdminRequest) validate() error {
 	switch r.Action {
 	case actionRename:
@@ -205,28 +203,26 @@ func (r *groupAdminRequest) validate() error {
 			return fmt.Errorf("%w: locked is required", errInvalidRequest)
 		}
 	case actionPhoto:
-		photo, err := decodePhotoDataURL(r.DataURL)
-		if err != nil {
+		if err := validatePhotoDataURL(r.DataURL); err != nil {
 			return err
 		}
-		r.photo = photo
 	case actionMembers:
-		change, err := participantChange(r.Membership)
+		verb, err := membershipVerb(r.Membership)
 		if err != nil {
 			return err
 		}
 		if len(r.JIDs) == 0 {
 			return fmt.Errorf("%w: jids is required", errInvalidRequest)
 		}
-		r.participants = make([]types.JID, 0, len(r.JIDs))
+		r.participants = make([]string, 0, len(r.JIDs))
 		for _, raw := range r.JIDs {
-			jid, err := participantTarget(raw)
+			participant, err := participantTarget(raw)
 			if err != nil {
 				return err
 			}
-			r.participants = append(r.participants, jid)
+			r.participants = append(r.participants, participant)
 		}
-		r.change = change
+		r.Membership = verb
 	case actionLeave:
 	case actionRevoke:
 		r.WaMessageID = strings.TrimSpace(r.WaMessageID)
@@ -239,105 +235,99 @@ func (r *groupAdminRequest) validate() error {
 	return nil
 }
 
-// decodePhotoDataURL accepts the data URL the BFF stages an approved photo as.
-// A bare base64 string is refused rather than guessed at, so the bytes that
-// reach a group are always the image the operator saw.
-func decodePhotoDataURL(dataURL string) ([]byte, error) {
+// validatePhotoDataURL accepts the data URL the BFF stages an approved photo as.
+// A bare base64 string is refused rather than guessed at, so the bytes that reach
+// a group are always the image the operator saw. The payload is decoded here even
+// though the bridge decodes it again: that is what refuses a photo past the size
+// cap and a body that only looks like base64 before either costs a round trip.
+func validatePhotoDataURL(dataURL string) error {
 	header, payload, ok := strings.Cut(dataURL, ",")
 	if !ok || !strings.HasPrefix(header, "data:image/") || !strings.HasSuffix(header, ";base64") {
-		return nil, fmt.Errorf("%w: dataUrl must be a base64 image data URL", errInvalidRequest)
+		return fmt.Errorf("%w: dataUrl must be a base64 image data URL", errInvalidRequest)
 	}
 	if base64.StdEncoding.DecodedLen(len(payload)) > maxGroupPhotoBytes {
-		return nil, fmt.Errorf("%w: photo is larger than %d bytes", errInvalidRequest, maxGroupPhotoBytes)
+		return fmt.Errorf("%w: photo is larger than %d bytes", errInvalidRequest, maxGroupPhotoBytes)
 	}
 	photo, err := base64.StdEncoding.DecodeString(payload)
 	if err != nil {
-		return nil, fmt.Errorf("%w: dataUrl is not valid base64", errInvalidRequest)
+		return fmt.Errorf("%w: dataUrl is not valid base64", errInvalidRequest)
 	}
 	if len(photo) == 0 {
-		return nil, fmt.Errorf("%w: photo is empty", errInvalidRequest)
+		return fmt.Errorf("%w: photo is empty", errInvalidRequest)
 	}
-	return photo, nil
+	return nil
 }
 
-// participantChange maps the membership verb onto whatsmeow's own constant,
-// which is what decides the protocol node the library sends.
-func participantChange(verb string) (whatsmeow.ParticipantChange, error) {
+// membershipVerb validates the membership verb, which is also the exact string
+// the bridge takes: both vocabularies are the same four words.
+func membershipVerb(verb string) (string, error) {
 	switch verb {
-	case string(whatsmeow.ParticipantChangeAdd):
-		return whatsmeow.ParticipantChangeAdd, nil
-	case string(whatsmeow.ParticipantChangeRemove):
-		return whatsmeow.ParticipantChangeRemove, nil
-	case string(whatsmeow.ParticipantChangePromote):
-		return whatsmeow.ParticipantChangePromote, nil
-	case string(whatsmeow.ParticipantChangeDemote):
-		return whatsmeow.ParticipantChangeDemote, nil
+	case "add", "remove", "promote", "demote":
+		return verb, nil
 	default:
 		return "", fmt.Errorf("%w: membership must be add, remove, promote or demote", errInvalidRequest)
 	}
 }
 
 // participantTarget accepts the two addresses a human may name for a person: the
-// phone JID or its LID. A group JID is not a participant, so it is refused.
-func participantTarget(raw string) (types.JID, error) {
-	jid, err := types.ParseJID(strings.TrimSpace(raw))
-	if err != nil || jid.User == "" ||
-		(jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer) {
-		return types.EmptyJID, fmt.Errorf("%w: %q is not a participant jid", errInvalidRequest, raw)
+// phone JID or its LID. A group JID is not a participant, so it is refused. The
+// returned spelling is the canonical one, which is what the answer is matched
+// against.
+func participantTarget(raw string) (string, error) {
+	address, err := parseAddress(raw)
+	if err != nil || !address.isUser() {
+		return "", fmt.Errorf("%w: %q is not a participant jid", errInvalidRequest, raw)
 	}
-	return jid, nil
+	return address.String(), nil
 }
 
 // groupTarget parses the group JID a route was addressed to. The path is caller
 // input too, so a non-group JID is the same invalid_request a bad body is.
-func groupTarget(raw string) (types.JID, error) {
-	jid, err := types.ParseJID(raw)
-	if err != nil || jid.User == "" || jid.Server != types.GroupServer {
-		return types.EmptyJID, fmt.Errorf("%w: %q is not a group jid", errInvalidRequest, raw)
+func groupTarget(raw string) (waAddress, error) {
+	address, err := parseAddress(raw)
+	if err != nil || !address.isGroup() {
+		return waAddress{}, fmt.Errorf("%w: %q is not a group jid", errInvalidRequest, raw)
 	}
-	return jid, nil
-}
-
-// jidOrEmpty reads a stored JID string. An absent or unparsable one becomes
-// EmptyJID, which matches no participant: a missing bot identity must not fail a
-// read of the group itself.
-func jidOrEmpty(raw string) types.JID {
-	jid, err := types.ParseJID(raw)
-	if err != nil {
-		return types.EmptyJID
-	}
-	return jid
+	return address, nil
 }
 
 // ---- the two reads -------------------------------------------------------
 
-// handleGroupInfo serves GET /instances/{id}/groups/{groupJid}/info from the
-// live account, not from the stored row: the BFF asks it just before offering a
-// write, so a stale name or a lost admin right must not come from our cache.
+// handleGroupInfo serves GET /instances/{id}/groups/{groupJid}/info from the live
+// account, not from the stored row: the BFF asks it just before offering a write,
+// so a stale name or a lost admin right must not come from our cache.
+//
+// Two of the response's fields have no source in the bridge's contract — the topic
+// and the participants' display names — so they are reported empty instead of
+// being invented; every field the dashboard branches on (the name, the two flags,
+// the count, the bot's rights) is live.
 func (a *api) handleGroupInfo(w http.ResponseWriter, r *http.Request, instanceID, groupJID string) {
 	group, err := groupTarget(groupJID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, codeInvalidRequest, err.Error())
 		return
 	}
-	client, ok := a.liveGroupClient(w, r, instanceID)
+	instance, ok := a.groupInstance(w, r, instanceID)
 	if !ok {
 		return
 	}
-	info, err := client.GetGroupInfo(r.Context(), group)
-	if err != nil {
-		a.writeGroupReadError(w, err)
+	bridge, ok := a.liveBridge(w)
+	if !ok {
 		return
 	}
-	admin, super := botAdminFlags(info, a.bot(instanceID))
+	info, err := bridge.GroupInfo(r.Context(), group.String())
+	if err != nil {
+		a.writeGroupReadError(w, classifyGroupFailure(err))
+		return
+	}
+	admin, super := botAdminFlags(info, botIdentity{JID: instance.BotJID, LID: instance.BotLID})
 	writeJSON(w, http.StatusOK, groupInfoResponse{
 		OK:               true,
 		GroupJID:         group.String(),
-		Name:             info.Name,
-		Topic:            info.Topic,
-		IsAnnounce:       info.IsAnnounce,
-		IsLocked:         info.IsLocked,
-		ParticipantCount: participantCount(info),
+		Name:             info.Subject,
+		IsAnnounce:       info.Announce,
+		IsLocked:         info.Locked,
+		ParticipantCount: len(info.Participants),
 		BotIsAdmin:       admin,
 		BotIsSuperAdmin:  super,
 	})
@@ -352,48 +342,46 @@ func (a *api) handleGroupParticipants(w http.ResponseWriter, r *http.Request, in
 		writeError(w, http.StatusBadRequest, codeInvalidRequest, err.Error())
 		return
 	}
-	client, ok := a.liveGroupClient(w, r, instanceID)
+	if _, ok := a.groupInstance(w, r, instanceID); !ok {
+		return
+	}
+	bridge, ok := a.liveBridge(w)
 	if !ok {
 		return
 	}
-	info, err := client.GetGroupInfo(r.Context(), group)
+	info, err := bridge.GroupInfo(r.Context(), group.String())
 	if err != nil {
-		a.writeGroupReadError(w, err)
+		a.writeGroupReadError(w, classifyGroupFailure(err))
 		return
 	}
 	rows := make([]groupParticipantRow, 0, len(info.Participants))
 	for _, participant := range info.Participants {
+		admin := participant.Admin == participantAdmin || participant.Admin == participantSuperAdmin
 		rows = append(rows, groupParticipantRow{
-			JID:          participant.JID.String(),
-			IsAdmin:      participant.IsAdmin,
-			IsSuperAdmin: participant.IsSuperAdmin,
-			DisplayName:  participant.DisplayName,
+			JID:          normalizeAddress(participant.JID),
+			IsAdmin:      admin,
+			IsSuperAdmin: participant.Admin == participantSuperAdmin,
 		})
 	}
 	writeJSON(w, http.StatusOK, groupParticipantsResponse{OK: true, GroupJID: group.String(), Participants: rows})
 }
 
-// participantCount reports WhatsApp's own count when it sent one, and otherwise
-// the participants it listed — never a number that disagrees with the list the
-// BFF can fetch beside it.
-func participantCount(info *types.GroupInfo) int {
-	if info.ParticipantCount > 0 || len(info.Participants) == 0 {
-		return info.ParticipantCount
-	}
-	return len(info.Participants)
-}
-
-// botAdminFlags reports the bot's own rights from the membership WhatsApp just
-// returned. A superadmin is an admin too, which is how WhatsApp reports it.
-func botAdminFlags(info *types.GroupInfo, bot botIdentity) (admin, super bool) {
+// botAdminFlags reports the bot's own rights from the membership the bridge
+// returned. A superadmin is an admin too, which is how WhatsApp reports it, and an
+// account the group does not list — or one whose own identity is not known — is
+// not an admin.
+func botAdminFlags(info bridgeGroupInfo, bot botIdentity) (admin, super bool) {
 	for _, participant := range info.Participants {
 		if !sameAccount(participant.JID, bot.JID) && !sameAccount(participant.JID, bot.LID) {
 			continue
 		}
-		if participant.IsSuperAdmin {
+		switch participant.Admin {
+		case participantSuperAdmin:
 			return true, true
+		case participantAdmin:
+			return true, false
 		}
-		return participant.IsAdmin, false
+		return false, false
 	}
 	return false, false
 }
@@ -402,9 +390,9 @@ func botAdminFlags(info *types.GroupInfo, bot botIdentity) (admin, super bool) {
 
 // handleGroupAdmin serves POST /instances/{id}/groups/{groupJid}/admin, the one
 // write route for every group capability. It validates the action before it
-// resolves the client, so a malformed request is answered as the caller's error
-// even when the instance is offline, and it performs exactly the one action the
-// body names.
+// resolves the bridge, so a malformed request is answered as the caller's error
+// even when nothing is reachable, and it performs exactly the one action the body
+// names.
 func (a *api) handleGroupAdmin(w http.ResponseWriter, r *http.Request, instanceID, groupJID string) {
 	var request groupAdminRequest
 	if !decodeBodyLimited(w, r, &request, groupAdminBodyMaxBytes) {
@@ -419,11 +407,14 @@ func (a *api) handleGroupAdmin(w http.ResponseWriter, r *http.Request, instanceI
 		writeError(w, http.StatusBadRequest, codeInvalidRequest, err.Error())
 		return
 	}
-	client, ok := a.liveGroupAdmin(w, r, instanceID)
+	if _, ok := a.groupInstance(w, r, instanceID); !ok {
+		return
+	}
+	bridge, ok := a.liveBridge(w)
 	if !ok {
 		return
 	}
-	payload, err := applyGroupAdmin(r.Context(), client, group, request)
+	payload, err := applyGroupAdmin(r.Context(), bridge, group, request)
 	if err != nil {
 		a.writeGroupAdminError(w, err)
 		return
@@ -431,70 +422,75 @@ func (a *api) handleGroupAdmin(w http.ResponseWriter, r *http.Request, instanceI
 	writeJSON(w, http.StatusOK, payload)
 }
 
-// applyGroupAdmin performs the one action the request resolved to and reports
-// what WhatsApp answered. It is separate from the handler so the exact call each
-// action makes is provable against a recording client rather than through the
+// applyGroupAdmin performs the one action the request resolved to and reports what
+// WhatsApp answered. It is separate from the handler so the exact bridge call each
+// action makes is provable against a recording bridge rather than through the
 // handler's return value.
-func applyGroupAdmin(ctx context.Context, client groupAdminClient, group types.JID, request groupAdminRequest) (any, error) {
+func applyGroupAdmin(ctx context.Context, bridge *hermesBridge, group waAddress, request groupAdminRequest) (any, error) {
 	switch request.Action {
 	case actionRename:
-		if err := client.SetGroupName(ctx, group, request.Name); err != nil {
+		if err := bridge.RenameGroup(ctx, group.String(), request.Name); err != nil {
 			return nil, classifyGroupFailure(err)
 		}
 	case actionAnnounce:
-		if err := client.SetGroupAnnounce(ctx, group, *request.Announce); err != nil {
+		if err := bridge.SetGroupSettings(ctx, group.String(), request.Announce, nil); err != nil {
 			return nil, classifyGroupFailure(err)
 		}
 	case actionLocked:
-		if err := client.SetGroupLocked(ctx, group, *request.Locked); err != nil {
+		if err := bridge.SetGroupSettings(ctx, group.String(), nil, request.Locked); err != nil {
 			return nil, classifyGroupFailure(err)
 		}
 	case actionPhoto:
-		pictureID, err := client.SetGroupPhoto(ctx, group, request.photo)
+		pictureID, err := bridge.SetGroupPhoto(ctx, group.String(), request.DataURL)
 		if err != nil {
 			return nil, classifyGroupFailure(err)
 		}
 		return actionResponse{OK: true, PictureID: pictureID}, nil
 	case actionMembers:
-		updated, err := client.UpdateGroupParticipants(ctx, group, request.participants, request.change)
+		answer, err := bridge.UpdateParticipants(ctx, group.String(), request.Membership, request.participants)
 		if err != nil {
 			return nil, classifyGroupFailure(err)
 		}
-		return membershipOutcomes(request.participants, updated), nil
+		return membershipOutcomes(request.participants, answer), nil
 	case actionLeave:
-		if err := client.LeaveGroup(ctx, group); err != nil {
+		if err := bridge.LeaveGroup(ctx, group.String()); err != nil {
 			return nil, classifyGroupFailure(err)
 		}
 	case actionRevoke:
-		response, err := client.RevokeMessage(ctx, group, types.MessageID(request.WaMessageID))
+		messageID, err := bridge.RevokeMessage(ctx, group.String(), request.WaMessageID)
 		if err != nil {
 			return nil, classifyRevokeFailure(err)
 		}
-		return actionResponse{OK: true, RevokeMessageID: string(response.ID)}, nil
+		return actionResponse{OK: true, RevokeMessageID: messageID}, nil
 	}
 	return actionResponse{OK: true}, nil
 }
 
-// membershipOutcomes reports WhatsApp's answer for every JID that was asked
+// membershipOutcomes reports the bridge's answer for every JID that was asked
 // about, in the order it was asked. A JID the answer never mentioned is
 // `unreported`, which is a failure to confirm rather than a success.
-func membershipOutcomes(requested []types.JID, updated []types.GroupParticipant) membershipResponse {
+//
+// The overall `ok` is derived from those outcomes rather than taken from the
+// bridge's own: the invariant the BFF acts on is that a partial change can never be
+// read as a complete one, and deriving it here is what makes that true however the
+// bridge spells its answer.
+func membershipOutcomes(requested []string, answer bridgeMembersAnswer) membershipResponse {
 	response := membershipResponse{
 		OK:      true,
 		Results: make([]membershipOutcome, 0, len(requested)),
 		Failed:  []string{},
 	}
 	for _, want := range requested {
-		outcome := membershipOutcome{JID: want.String(), Status: membershipUnreported}
-		for _, participant := range updated {
-			if !participantMatches(participant, want) {
+		outcome := membershipOutcome{JID: want, Status: membershipUnreported}
+		for _, result := range answer.Results {
+			if !sameAccount(result.JID, want) {
 				continue
 			}
-			if participant.Error != 0 {
-				outcome.Status = membershipFailed
-				outcome.ErrorCode = participant.Error
-			} else {
+			if result.OK {
 				outcome.Status = membershipOK
+			} else {
+				outcome.Status = membershipFailed
+				outcome.ErrorCode = membershipErrorCode(result.Error)
 			}
 			break
 		}
@@ -507,35 +503,19 @@ func membershipOutcomes(requested []types.JID, updated []types.GroupParticipant)
 	return response
 }
 
-// participantMatches asks whether WhatsApp's answer is about the JID the caller
-// named. The answer may address that account by its phone JID or by its LID,
-// whichever WhatsApp prefers for the group, so both are matched — a confirmed
-// change must not be reported as unreported because the address changed shape.
-func participantMatches(participant types.GroupParticipant, want types.JID) bool {
-	return sameAccount(participant.JID, want) ||
-		sameAccount(participant.PhoneNumber, want) ||
-		sameAccount(participant.LID, want)
-}
-
-// sameAccount matches a participant to a JID under either address WhatsApp may
-// use for one account: the phone JID or its LID. It is the only comparison the
-// group surface needs, and it deliberately ignores the device suffix.
-func sameAccount(candidate, want types.JID) bool {
-	if candidate.IsEmpty() || want.IsEmpty() {
-		return false
-	}
-	return candidate.User == want.User && candidate.Server == want.Server
-}
-
 // ---- refusals ------------------------------------------------------------
 
 // writeGroupReadError maps a failed live read onto the same vocabulary the writes
-// use, so the BFF reads one set of codes across the whole surface.
+// use, so the BFF reads one set of codes across the whole surface. A bridge this
+// worker cannot reach is `instance_offline`: the Hermes session *is* the WhatsApp
+// connection the read would have used, and there is none to ask.
 func (a *api) writeGroupReadError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, whatsmeow.ErrGroupNotFound), errors.Is(err, whatsmeow.ErrNotInGroup):
+	case errors.Is(err, errBridgeUnreachable), errors.Is(err, errNoBridge):
+		writeError(w, http.StatusConflict, codeInstanceOffline, err.Error())
+	case errors.Is(err, errGroupNotFound):
 		writeError(w, http.StatusNotFound, codeGroupNotFound, err.Error())
-	case errors.Is(err, whatsmeow.ErrIQForbidden), errors.Is(err, whatsmeow.ErrIQNotAuthorized):
+	case errors.Is(err, errNotGroupAdmin):
 		writeError(w, http.StatusForbidden, codeNotAdmin, err.Error())
 	default:
 		writeError(w, http.StatusBadGateway, codeGroupAdminFailed, err.Error())
@@ -549,6 +529,8 @@ func (a *api) writeGroupAdminError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, errInstanceNotFound):
 		writeError(w, http.StatusNotFound, codeNotFound, err.Error())
+	case errors.Is(err, errBridgeUnreachable), errors.Is(err, errNoBridge):
+		writeError(w, http.StatusConflict, codeInstanceOffline, err.Error())
 	case errors.Is(err, errGroupNotFound):
 		writeError(w, http.StatusNotFound, codeGroupNotFound, err.Error())
 	case errors.Is(err, errNotGroupAdmin):
@@ -562,23 +544,26 @@ func (a *api) writeGroupAdminError(w http.ResponseWriter, err error) {
 	}
 }
 
-// classifyGroupFailure turns a whatsmeow error into the documented refusal. The
-// library reports "you are not in that group" and "that group does not exist"
-// the same way for every group call, which is the one thing the owner has to act
-// on; anything else is a change we cannot confirm.
+// classifyGroupFailure turns a bridge answer into the documented refusal. The
+// bridge reports "you are not in that group" and "that group does not exist" the
+// same way for every group call, which is the one thing the owner has to act on;
+// anything else is a change we cannot confirm.
+//
+// A bridge this worker could not reach is passed through untouched: it is not a
+// group-level refusal, and the handlers answer it as `instance_offline` — there
+// was no live session to ask.
 func classifyGroupFailure(err error) error {
 	switch {
 	case err == nil:
 		return nil
-	case errors.Is(err, whatsmeow.ErrGroupNotFound), errors.Is(err, whatsmeow.ErrNotInGroup):
-		return fmt.Errorf("%w: %v", errGroupNotFound, err)
-	case errors.Is(err, whatsmeow.ErrIQForbidden), errors.Is(err, whatsmeow.ErrIQNotAuthorized):
-		return fmt.Errorf("%w: %v", errNotGroupAdmin, err)
-	case errors.Is(err, whatsmeow.ErrInvalidImageFormat):
-		return fmt.Errorf("%w: %v", errInvalidRequest, err)
-	default:
-		return fmt.Errorf("%w: %v", errGroupAdminFailed, err)
+	case errors.Is(err, errBridgeUnreachable), errors.Is(err, errNoBridge):
+		return err
 	}
+	var refusal *bridgeRefusal
+	if errors.As(err, &refusal) {
+		return refusal.asGroupFailure()
+	}
+	return fmt.Errorf("%w: %v", errGroupAdminFailed, err)
 }
 
 // classifyRevokeFailure is separate from classifyGroupFailure only in its
@@ -586,63 +571,91 @@ func classifyGroupFailure(err error) error {
 // being removed rather than against the group's settings.
 func classifyRevokeFailure(err error) error {
 	switch {
-	case errors.Is(err, whatsmeow.ErrGroupNotFound), errors.Is(err, whatsmeow.ErrNotInGroup):
-		return fmt.Errorf("%w: %v", errGroupNotFound, err)
-	case errors.Is(err, whatsmeow.ErrIQForbidden), errors.Is(err, whatsmeow.ErrIQNotAuthorized):
-		return fmt.Errorf("%w: %v", errNotGroupAdmin, err)
+	case errors.Is(err, errBridgeUnreachable), errors.Is(err, errNoBridge):
+		return err
+	}
+	var refusal *bridgeRefusal
+	if errors.As(err, &refusal) {
+		return refusal.asRevokeFailure()
+	}
+	return fmt.Errorf("%w: %v", errRevokeFailed, err)
+}
+
+// WhatsApp's own reasons, as the text the bridge forwards them in. Baileys raises
+// one error per refusal whose message is the server's error text, so this is the
+// only place the two refusals an owner can act on survive the trip.
+const (
+	refusalNotAuthorized = "not-authorized"
+	refusalForbidden     = "forbidden"
+	refusalItemNotFound  = "item-not-found"
+)
+
+// asGroupFailure reads a bridge refusal as the group refusal the owner can act on.
+func (e *bridgeRefusal) asGroupFailure() error { return e.classify(errGroupAdminFailed) }
+
+// asRevokeFailure is asGroupFailure with the revoke's own fallback: an unknown
+// message id is not a group setting that could not be changed, and the BFF shows
+// it against the message being removed.
+func (e *bridgeRefusal) asRevokeFailure() error { return e.classify(errRevokeFailed) }
+
+// classify reads a refusal against the two reasons an owner can act on, falling
+// back to the caller's own refusal.
+//
+// WHY the message and not the status: the bridge answers every library refusal
+// with the same 500, so WhatsApp's "not-authorized" and "item-not-found" arrive as
+// text and nothing else. The match is deliberately narrow — an unrecognised
+// message stays an unconfirmed change rather than being reported as a right the
+// operator does not have, or as a group that no longer exists.
+func (e *bridgeRefusal) classify(fallback error) error {
+	switch e.reason() {
+	case refusalNotAuthorized, refusalForbidden:
+		return fmt.Errorf("%w: %v", errNotGroupAdmin, e)
+	case refusalItemNotFound:
+		return fmt.Errorf("%w: %v", errGroupNotFound, e)
 	default:
-		return fmt.Errorf("%w: %v", errRevokeFailed, err)
+		return fmt.Errorf("%w: %v", fallback, e)
 	}
 }
 
-// ---- client resolution ---------------------------------------------------
-
-// bot resolves the linked account's own addressing for an instance. A nil
-// resolver leaves it unknown, and no participant then matches it.
-func (a *api) bot(instanceID string) botIdentity {
-	if a.botFor == nil {
-		return botIdentity{}
-	}
-	return a.botFor(instanceID)
-}
-
-// liveGroupClient resolves the live client a read needs, writing the refusal
-// when the instance is unknown or has no client.
-func (a *api) liveGroupClient(w http.ResponseWriter, r *http.Request, instanceID string) (groupClient, bool) {
-	if client := a.client(instanceID); client != nil {
-		return client, true
-	}
-	a.writeNoLiveClient(w, r, instanceID)
-	return nil, false
-}
-
-// liveGroupAdmin resolves the live client a write needs, writing the refusal
-// when the instance is unknown or has no client.
-func (a *api) liveGroupAdmin(w http.ResponseWriter, r *http.Request, instanceID string) (groupAdminClient, bool) {
-	if client := a.admin(instanceID); client != nil {
-		return client, true
-	}
-	a.writeNoLiveClient(w, r, instanceID)
-	return nil, false
-}
-
-// admin resolves the live client for an instance as the write surface, or nil.
-func (a *api) admin(instanceID string) groupAdminClient {
-	if a.adminFor == nil {
-		return nil
-	}
-	return a.adminFor(instanceID)
-}
-
-// writeNoLiveClient separates the two reasons an instance has no client: an
-// unknown instance is a not_found, while an instance we know but cannot reach is
-// one the caller may retry against.
-func (a *api) writeNoLiveClient(w http.ResponseWriter, r *http.Request, instanceID string) {
-	if a.manager != nil {
-		if _, err := a.manager.getInstance(r.Context(), instanceID); err != nil {
-			a.writeInstanceError(w, err)
-			return
+// reason is the one marker in the refusal's message, lower-cased so the two
+// spellings a library may use (`not-authorized`, `Not-Authorized`) land together.
+func (e *bridgeRefusal) reason() string {
+	message := strings.ToLower(e.Message)
+	for _, marker := range []string{refusalNotAuthorized, refusalForbidden, refusalItemNotFound} {
+		if strings.Contains(message, marker) {
+			return marker
 		}
 	}
-	writeError(w, http.StatusConflict, codeInstanceOffline, "instance has no live whatsapp client")
+	return ""
+}
+
+// ---- resolution ----------------------------------------------------------
+
+// groupInstance resolves the instance a group call names. An unknown id is a
+// not_found, exactly as it was when a missing session was what refused the call,
+// and the row is also where the linked account's own identity comes from — which
+// is what the info read answers `botIsAdmin` with when no session holds it.
+func (a *api) groupInstance(w http.ResponseWriter, r *http.Request, instanceID string) (instanceSnapshot, bool) {
+	if a.manager == nil {
+		// The harness that wires this surface without a manager has no instance
+		// rows to check; it is the group read model's own tests, not a worker.
+		return instanceSnapshot{}, true
+	}
+	instance, err := a.manager.getInstance(r.Context(), instanceID)
+	if err != nil {
+		a.writeInstanceError(w, err)
+		return instanceSnapshot{}, false
+	}
+	return instance, true
+}
+
+// liveBridge resolves the bridge every live group call goes through. A worker
+// assembled without one cannot serve this surface at all, and says so in the same
+// words as an instance with no live session.
+func (a *api) liveBridge(w http.ResponseWriter) (*hermesBridge, bool) {
+	if a.bridge != nil {
+		return a.bridge, true
+	}
+	writeError(w, http.StatusConflict, codeInstanceOffline, errNoBridge.Error())
+	return nil, false
 }

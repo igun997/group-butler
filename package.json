@@ -12,7 +12,7 @@
     "dev:down": "docker compose -f infra/dev/docker-compose.yml down",
     "bootstrap": "bun run --cwd apps/web bootstrap",
     "auth:hash": "bun run --cwd apps/web auth:hash",
-    "test": "bun test scripts/dev.test.ts scripts/prod.test.ts && bun run --cwd packages/shared test && bun run --cwd apps/web test",
+    "test": "bun test scripts/dev.test.ts scripts/prod.test.ts infra/hermes/patch-bridge.test.ts && bun run --cwd packages/shared test && bun run --cwd apps/web test",
     "test:worker": "cd apps/worker && go test ./... -short",
     "lint": "bun run --cwd packages/shared lint && bun run --cwd apps/web lint",
     "check": "bun run --cwd apps/web check"

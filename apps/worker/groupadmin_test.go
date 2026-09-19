@@ -1,17 +1,12 @@
 package main
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/types"
 )
 
 const (
@@ -22,190 +17,36 @@ const (
 	participantsPath = "/instances/inst_1/groups/" + adminGroupJID + "/participants"
 )
 
-// ---- fakes ---------------------------------------------------------------
-
-// fakeAdminClient is the whatsmeow group surface the admin routes reach. Every
-// call is recorded, so each route is proved by the call WhatsApp would have
-// received — the arguments and all — rather than by the handler's return value.
-// It embeds the lifecycle fake, so the same value can be the live session's
-// client: the routes are then driven through the wiring production uses.
-type fakeAdminClient struct {
-	*fakeClient
-
-	info    *types.GroupInfo
-	infoErr error
-	infoJID types.JID
-
-	nameCalls     []recordedName
-	announceCalls []recordedFlag
-	lockedCalls   []recordedFlag
-	photoCalls    []recordedPhoto
-	memberCalls   []recordedMembers
-	leaveCalls    []types.JID
-	revokeCalls   []recordedRevoke
-
-	// writeErr is what every write answers; a test sets the whatsmeow error it
-	// wants the route to translate.
-	writeErr error
-	// photoID is the picture id SetGroupPhoto answers with.
-	photoID string
-	// members is the per-participant answer UpdateGroupParticipants returns.
-	members []types.GroupParticipant
-}
-
-type recordedName struct {
-	jid  types.JID
-	name string
-}
-
-type recordedFlag struct {
-	jid  types.JID
-	flag bool
-}
-
-type recordedPhoto struct {
-	jid    types.JID
-	avatar []byte
-}
-
-type recordedMembers struct {
-	jid    types.JID
-	action whatsmeow.ParticipantChange
-	jids   []types.JID
-}
-
-type recordedRevoke struct {
-	chat types.JID
-	id   types.MessageID
-}
-
-func (f *fakeAdminClient) GetGroupInfo(_ context.Context, jid types.JID) (*types.GroupInfo, error) {
-	f.infoJID = jid
-	if f.infoErr != nil {
-		return nil, f.infoErr
-	}
-	if f.info == nil {
-		return nil, whatsmeow.ErrGroupNotFound
-	}
-	return f.info, nil
-}
-
-func (f *fakeAdminClient) SetGroupName(_ context.Context, jid types.JID, name string) error {
-	f.nameCalls = append(f.nameCalls, recordedName{jid: jid, name: name})
-	return f.writeErr
-}
-
-func (f *fakeAdminClient) SetGroupAnnounce(_ context.Context, jid types.JID, announce bool) error {
-	f.announceCalls = append(f.announceCalls, recordedFlag{jid: jid, flag: announce})
-	return f.writeErr
-}
-
-func (f *fakeAdminClient) SetGroupLocked(_ context.Context, jid types.JID, locked bool) error {
-	f.lockedCalls = append(f.lockedCalls, recordedFlag{jid: jid, flag: locked})
-	return f.writeErr
-}
-
-func (f *fakeAdminClient) SetGroupPhoto(_ context.Context, jid types.JID, avatar []byte) (string, error) {
-	f.photoCalls = append(f.photoCalls, recordedPhoto{jid: jid, avatar: avatar})
-	return f.photoID, f.writeErr
-}
-
-func (f *fakeAdminClient) UpdateGroupParticipants(_ context.Context, jid types.JID, jids []types.JID, action whatsmeow.ParticipantChange) ([]types.GroupParticipant, error) {
-	f.memberCalls = append(f.memberCalls, recordedMembers{jid: jid, action: action, jids: jids})
-	return f.members, f.writeErr
-}
-
-func (f *fakeAdminClient) LeaveGroup(_ context.Context, jid types.JID) error {
-	f.leaveCalls = append(f.leaveCalls, jid)
-	return f.writeErr
-}
-
-func (f *fakeAdminClient) RevokeMessage(_ context.Context, chat types.JID, id types.MessageID) (whatsmeow.SendResponse, error) {
-	f.revokeCalls = append(f.revokeCalls, recordedRevoke{chat: chat, id: id})
-	return whatsmeow.SendResponse{ID: types.MessageID("wa_revoke_1")}, f.writeErr
-}
-
-// writeCalls counts every write the fake recorded, which is how a refused
-// request is proved never to have reached WhatsApp.
-func (f *fakeAdminClient) writeCalls() int {
-	return len(f.nameCalls) + len(f.announceCalls) + len(f.lockedCalls) +
-		len(f.photoCalls) + len(f.memberCalls) + len(f.leaveCalls) + len(f.revokeCalls)
-}
-
-// ---- the client surface's group-admin methods ----------------------------
-//
-// whatsmeowClient covers the group-admin writes the POST .../admin route makes,
-// so the session fake must answer them. No test drives that route through a
-// session — the admin surface is proved against fakeAdminClient above, which
-// records every call — so reaching one of these is a mistake and says so.
-
-func (c *fakeClient) SetGroupName(context.Context, types.JID, string) error {
-	return errors.New("group admin is not exercised through the session fake")
-}
-
-func (c *fakeClient) SetGroupAnnounce(context.Context, types.JID, bool) error {
-	return errors.New("group admin is not exercised through the session fake")
-}
-
-func (c *fakeClient) SetGroupLocked(context.Context, types.JID, bool) error {
-	return errors.New("group admin is not exercised through the session fake")
-}
-
-func (c *fakeClient) SetGroupPhoto(context.Context, types.JID, []byte) (string, error) {
-	return "", errors.New("group admin is not exercised through the session fake")
-}
-
-func (c *fakeClient) UpdateGroupParticipants(context.Context, types.JID, []types.JID, whatsmeow.ParticipantChange) ([]types.GroupParticipant, error) {
-	return nil, errors.New("group admin is not exercised through the session fake")
-}
-
-func (c *fakeClient) LeaveGroup(context.Context, types.JID) error {
-	return errors.New("group admin is not exercised through the session fake")
-}
-
-func (c *fakeClient) RevokeMessage(context.Context, types.JID, types.MessageID) (whatsmeow.SendResponse, error) {
-	return whatsmeow.SendResponse{}, errors.New("group admin is not exercised through the session fake")
-}
-
 // ---- harness -------------------------------------------------------------
 
+// adminRow is one instance the group surface may address, carrying the identity the
+// linked account was last known by — which is what the info read matches the bot's
+// own rights against now that the session lives in Hermes.
+func adminRow(id, botJID, botLID string) InstanceRow {
+	return InstanceRow{ID: id, OrganizationID: "org_default", Status: stateConnected, BotJID: botJID, BotLID: botLID}
+}
+
 // adminSession wires the group surface the way a running worker does: a manager
-// that knows the named instances, a connected session whose client is the
-// recording fake, and the control-plane handler the manager itself builds. No
-// test-only seam stands between the route and the client, so a route that works
-// here works in production.
-func adminSession(t *testing.T, client *fakeAdminClient, bot botIdentity, instances ...string) *api {
+// whose configured bridge is this server, and instance rows that name the accounts
+// a call may address. Nothing test-only stands between the route and the bridge, so
+// a route that works here works in production.
+func adminSession(t *testing.T, bridge *fakeBridge, rows ...InstanceRow) *api {
+	t.Helper()
+	return bridge.manager(t, newFakeGroupStore(), newFakeInstanceRepo(rows...)).api()
+}
+
+// adminAPI is adminSession with the one identity every test but the LID one uses.
+func adminAPI(t *testing.T, bridge *fakeBridge, instances ...string) *api {
 	t.Helper()
 	rows := make([]InstanceRow, 0, len(instances))
 	for _, id := range instances {
-		rows = append(rows, InstanceRow{ID: id, OrganizationID: "org_default", Status: stateConnected})
+		rows = append(rows, adminRow(id, adminBotJID, ""))
 	}
-	mgr := testManager(newFakeInstanceRepo(rows...), newFakePairingStore(), nil, newFakeClient())
-	if client != nil {
-		session := testSession(mgr, client)
-		session.status = stateConnected
-		session.botJID = bot.JID.String()
-		session.botLID = bot.LID.String()
-		mgr.put(session)
-	}
-	return mgr.api()
+	return adminSession(t, bridge, rows...)
 }
 
-// newAdminAPI is adminSession with the one bot identity every test but the LID
-// one uses.
-func newAdminAPI(t *testing.T, client *fakeAdminClient, instances ...string) *api {
-	t.Helper()
-	return adminSession(t, client, botIdentity{JID: types.NewJID("628990000009", types.DefaultUserServer)}, instances...)
-}
-
-// newFakeAdminClient is the recorded group surface with the lifecycle fake
-// behind it, so it can be a session's client.
-func newFakeAdminClient() *fakeAdminClient {
-	return &fakeAdminClient{fakeClient: newFakeClient()}
-}
-
-// adminRefusal is the one error envelope every route on this surface answers
-// with, decoded so the code — not the status alone — is asserted.
+// adminRefusal is the one error envelope every route on this surface answers with,
+// decoded so the code — not the status alone — is asserted.
 type adminRefusal struct {
 	Error string `json:"error"`
 	Code  string `json:"code"`
@@ -223,20 +64,18 @@ func decodeRefusal(t *testing.T, rec *httptest.ResponseRecorder) adminRefusal {
 // ---- reads ---------------------------------------------------------------
 
 func TestGroupInfoEndpointServesTheLiveGroup(t *testing.T) {
-	client := &fakeAdminClient{fakeClient: newFakeClient(), info: &types.GroupInfo{
-		JID:              types.NewJID("120363043123456789", types.GroupServer),
-		GroupName:        types.GroupName{Name: "Ops Team"},
-		GroupTopic:       types.GroupTopic{Topic: "Only ops talk here"},
-		GroupAnnounce:    types.GroupAnnounce{IsAnnounce: true},
-		GroupLocked:      types.GroupLocked{IsLocked: true},
-		ParticipantCount: 3,
-		Participants: []types.GroupParticipant{
-			{JID: types.NewJID("628990000009", types.DefaultUserServer), IsAdmin: true},
-			{JID: types.NewJID("628111111111", types.DefaultUserServer)},
-			{JID: types.NewJID("628222222222", types.DefaultUserServer)},
-		},
-	}}
-	handler := newAdminAPI(t, client, "inst_1")
+	bridge := newFakeBridge(t).answering(http.StatusOK, `{
+		"ok": true,
+		"subject": "Ops Team",
+		"announce": true,
+		"locked": true,
+		"participants": [
+			{"jid": "628990000009@s.whatsapp.net", "admin": "admin"},
+			{"jid": "628111111111@s.whatsapp.net", "admin": null},
+			{"jid": "628222222222@s.whatsapp.net", "admin": null}
+		]
+	}`)
+	handler := adminAPI(t, bridge, "inst_1")
 
 	rec := callJSON(t, handler, http.MethodGet, infoPath, "dev-secret", "")
 	if rec.Code != http.StatusOK {
@@ -259,34 +98,38 @@ func TestGroupInfoEndpointServesTheLiveGroup(t *testing.T) {
 	if !body.OK || body.GroupJID != adminGroupJID {
 		t.Errorf("ok = %t, groupJid = %q, want true and %q", body.OK, body.GroupJID, adminGroupJID)
 	}
-	if body.Name != "Ops Team" || body.Topic != "Only ops talk here" {
-		t.Errorf("name = %q, topic = %q", body.Name, body.Topic)
+	if body.Name != "Ops Team" {
+		t.Errorf("name = %q, want the subject the bridge reported", body.Name)
+	}
+	// The bridge's contract carries no topic, so the field the BFF's schema
+	// requires is answered empty rather than dropped or invented.
+	if body.Topic != "" {
+		t.Errorf("topic = %q, want empty: the bridge reports none", body.Topic)
 	}
 	if !body.IsAnnounce || !body.IsLocked {
 		t.Errorf("isAnnounce = %t, isLocked = %t, want both true (the live flags)", body.IsAnnounce, body.IsLocked)
 	}
 	if body.ParticipantCount != 3 {
-		t.Errorf("participantCount = %d, want 3", body.ParticipantCount)
+		t.Errorf("participantCount = %d, want 3 (the membership just listed)", body.ParticipantCount)
 	}
 	if !body.BotIsAdmin || body.BotIsSuperAdmin {
 		t.Errorf("botIsAdmin = %t, botIsSuperAdmin = %t, want true and false", body.BotIsAdmin, body.BotIsSuperAdmin)
 	}
-	if got := client.infoJID.String(); got != adminGroupJID {
-		t.Errorf("GetGroupInfo asked for %q, want %q", got, adminGroupJID)
+
+	call := bridge.only(t)
+	if call.method != http.MethodGet || call.path != "/group/"+adminGroupJID {
+		t.Errorf("call = %s %s, want GET /group/%s", call.method, call.path, adminGroupJID)
 	}
 }
 
 // A group that addresses its members by LID must still recognise the bot, so the
 // admin flags are matched against the bot's LID as well as its phone JID.
 func TestGroupInfoEndpointMatchesTheBotByLID(t *testing.T) {
-	client := &fakeAdminClient{fakeClient: newFakeClient(), info: &types.GroupInfo{
-		JID:              types.NewJID("120363043123456789", types.GroupServer),
-		ParticipantCount: 1,
-		Participants: []types.GroupParticipant{
-			{JID: types.NewJID("111222333", types.HiddenUserServer), IsAdmin: true, IsSuperAdmin: true},
-		},
-	}}
-	handler := adminSession(t, client, botIdentity{LID: types.NewJID("111222333", types.HiddenUserServer)}, "inst_1")
+	bridge := newFakeBridge(t).answering(http.StatusOK, `{
+		"ok": true, "subject": "Ops",
+		"participants": [{"jid": "111222333@lid", "admin": "superadmin"}]
+	}`)
+	handler := adminSession(t, bridge, adminRow("inst_1", "", "111222333@lid"))
 
 	rec := callJSON(t, handler, http.MethodGet, infoPath, "dev-secret", "")
 	if rec.Code != http.StatusOK {
@@ -304,16 +147,40 @@ func TestGroupInfoEndpointMatchesTheBotByLID(t *testing.T) {
 	}
 }
 
+// The identity the read matches against comes from the instance row, so a row that
+// does not know it answers "not an admin" rather than matching a member by accident.
+func TestGroupInfoEndpointReportsNoRightsWithoutAKnownIdentity(t *testing.T) {
+	bridge := newFakeBridge(t).answering(http.StatusOK, `{
+		"ok": true, "subject": "Ops",
+		"participants": [{"jid": "628111111111@s.whatsapp.net", "admin": "superadmin"}]
+	}`)
+	handler := adminSession(t, bridge, adminRow("inst_1", "", ""))
+
+	rec := callJSON(t, handler, http.MethodGet, infoPath, "dev-secret", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		BotIsAdmin      bool `json:"botIsAdmin"`
+		BotIsSuperAdmin bool `json:"botIsSuperAdmin"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.BotIsAdmin || body.BotIsSuperAdmin {
+		t.Errorf("botIsAdmin = %t, botIsSuperAdmin = %t, want both false", body.BotIsAdmin, body.BotIsSuperAdmin)
+	}
+}
+
 func TestGroupParticipantsEndpointServesTheLiveMembership(t *testing.T) {
-	client := &fakeAdminClient{fakeClient: newFakeClient(), info: &types.GroupInfo{
-		JID:              types.NewJID("120363043123456789", types.GroupServer),
-		ParticipantCount: 2,
-		Participants: []types.GroupParticipant{
-			{JID: types.NewJID("628111111111", types.DefaultUserServer), IsAdmin: true, DisplayName: "anon-11"},
-			{JID: types.NewJID("628222222222", types.DefaultUserServer), IsAdmin: true, IsSuperAdmin: true},
-		},
-	}}
-	handler := newAdminAPI(t, client, "inst_1")
+	bridge := newFakeBridge(t).answering(http.StatusOK, `{
+		"ok": true, "subject": "Ops",
+		"participants": [
+			{"jid": "628111111111@s.whatsapp.net", "admin": "admin"},
+			{"jid": "628222222222@s.whatsapp.net", "admin": "superadmin"}
+		]
+	}`)
+	handler := adminAPI(t, bridge, "inst_1")
 
 	rec := callJSON(t, handler, http.MethodGet, participantsPath, "dev-secret", "")
 	if rec.Code != http.StatusOK {
@@ -342,22 +209,24 @@ func TestGroupParticipantsEndpointServesTheLiveMembership(t *testing.T) {
 	if first.JID != "628111111111@s.whatsapp.net" || !first.IsAdmin || first.IsSuperAdmin {
 		t.Errorf("first = %+v, want an admin 628111111111", first)
 	}
-	if first.DisplayName != "anon-11" {
-		t.Errorf("displayName = %q, want the name WhatsApp supplied", first.DisplayName)
-	}
 	if second.JID != "628222222222@s.whatsapp.net" || !second.IsSuperAdmin || !second.IsAdmin {
 		t.Errorf("second = %+v, want a superadmin 628222222222", second)
 	}
-	if second.DisplayName != "" {
-		t.Errorf("displayName = %q, want it absent when WhatsApp supplies none", second.DisplayName)
+	// Display names have no source in the bridge's contract: the field stays absent
+	// rather than being filled with something that is not a name.
+	if first.DisplayName != "" || second.DisplayName != "" {
+		t.Errorf("displayName = %q/%q, want it absent: the bridge reports no names", first.DisplayName, second.DisplayName)
+	}
+	if got := bridge.recorded()[0].path; got != "/group/"+adminGroupJID {
+		t.Errorf("read %s, want the group the path named", got)
 	}
 }
 
 // A group with no members is an empty list, not a null the BFF would have to
 // special-case.
 func TestGroupParticipantsEndpointAnswersAnEmptyList(t *testing.T) {
-	client := &fakeAdminClient{fakeClient: newFakeClient(), info: &types.GroupInfo{JID: types.NewJID("120363043123456789", types.GroupServer)}}
-	handler := newAdminAPI(t, client, "inst_1")
+	bridge := newFakeBridge(t).answering(http.StatusOK, `{"ok":true,"subject":"Ops","participants":[]}`)
+	handler := adminAPI(t, bridge, "inst_1")
 
 	rec := callJSON(t, handler, http.MethodGet, participantsPath, "dev-secret", "")
 	if rec.Code != http.StatusOK {
@@ -368,24 +237,30 @@ func TestGroupParticipantsEndpointAnswersAnEmptyList(t *testing.T) {
 	}
 }
 
-// Both reads tell the three refusals apart: an unknown instance, a group this
-// account cannot see, and an instance with no live client at all.
+// Both reads tell the refusals apart: an unknown instance, a group this account
+// cannot see, a bot that is not an admin, a bridge whose session is down — and a
+// bridge that is not there at all, which is the instance-offline answer too,
+// because the Hermes session *is* the WhatsApp connection the read would have used.
 func TestGroupReadsReportRefusalsHonestly(t *testing.T) {
 	cases := []struct {
 		name       string
-		client     *fakeAdminClient
+		answer     func(*fakeBridge)
 		instances  []string
 		wantStatus int
 		wantCode   string
 	}{
-		{"unknown instance", nil, nil, http.StatusNotFound, codeNotFound},
-		{"not a participant", &fakeAdminClient{fakeClient: newFakeClient(), infoErr: whatsmeow.ErrNotInGroup}, []string{"inst_1"}, http.StatusNotFound, codeGroupNotFound},
-		{"group does not exist", &fakeAdminClient{fakeClient: newFakeClient(), infoErr: whatsmeow.ErrGroupNotFound}, []string{"inst_1"}, http.StatusNotFound, codeGroupNotFound},
-		{"instance offline", nil, []string{"inst_1"}, http.StatusConflict, codeInstanceOffline},
+		{"unknown instance", func(f *fakeBridge) { f.answering(http.StatusOK, `{"ok":true}`) }, nil, http.StatusNotFound, codeNotFound},
+		{"not a participant", func(f *fakeBridge) { f.refusing("item-not-found") }, []string{"inst_1"}, http.StatusNotFound, codeGroupNotFound},
+		{"not an admin", func(f *fakeBridge) { f.refusing("not-authorized") }, []string{"inst_1"}, http.StatusForbidden, codeNotAdmin},
+		{"not confirmed", func(f *fakeBridge) { f.refusing("partial-server-error") }, []string{"inst_1"}, http.StatusBadGateway, codeGroupAdminFailed},
+		{"bridge session down", func(f *fakeBridge) { f.notConnected() }, []string{"inst_1"}, http.StatusConflict, codeInstanceOffline},
+		{"bridge not listening", func(f *fakeBridge) { f.server.Close() }, []string{"inst_1"}, http.StatusConflict, codeInstanceOffline},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			handler := newAdminAPI(t, tc.client, tc.instances...)
+			bridge := newFakeBridge(t)
+			tc.answer(bridge)
+			handler := adminAPI(t, bridge, tc.instances...)
 			for _, path := range []string{infoPath, participantsPath} {
 				rec := callJSON(t, handler, http.MethodGet, path, "dev-secret", "")
 				if rec.Code != tc.wantStatus {
@@ -399,64 +274,86 @@ func TestGroupReadsReportRefusalsHonestly(t *testing.T) {
 	}
 }
 
+// The path is caller input, so a non-group JID is refused before the bridge is
+// asked anything.
+func TestGroupReadsRejectANonGroupPath(t *testing.T) {
+	bridge := newFakeBridge(t).answering(http.StatusOK, `{"ok":true}`)
+	handler := adminAPI(t, bridge, "inst_1")
+
+	rec := callJSON(t, handler, http.MethodGet, "/instances/inst_1/groups/"+adminBotJID+"/info", "dev-secret", "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s, want 400", rec.Code, rec.Body.String())
+	}
+	if got := decodeRefusal(t, rec).Code; got != codeInvalidRequest {
+		t.Errorf("code = %q, want %q", got, codeInvalidRequest)
+	}
+	if calls := bridge.recorded(); len(calls) != 0 {
+		t.Errorf("the bridge was asked about a non-group path: %+v", calls)
+	}
+}
+
 // ---- writes --------------------------------------------------------------
 
-func TestGroupAdminRenameReachesWhatsmeow(t *testing.T) {
-	client := newFakeAdminClient()
-	handler := newAdminAPI(t, client, "inst_1")
+func TestGroupAdminRenameReachesTheBridge(t *testing.T) {
+	bridge := newFakeBridge(t).answering(http.StatusOK, `{"ok":true}`)
+	handler := adminAPI(t, bridge, "inst_1")
 
 	rec := callJSON(t, handler, http.MethodPost, adminPath, "dev-secret", `{"action":"rename","name":"  Ops Team  "}`)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"ok":true`) {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	if len(client.nameCalls) != 1 {
-		t.Fatalf("SetGroupName calls = %d, want 1", len(client.nameCalls))
+	call := bridge.only(t)
+	if call.path != "/group/rename" {
+		t.Fatalf("call = %s %s, want POST /group/rename", call.method, call.path)
 	}
-	call := client.nameCalls[0]
-	if call.jid.String() != adminGroupJID || call.name != "Ops Team" {
-		t.Errorf("SetGroupName(%s, %q), want (%s, %q)", call.jid, call.name, adminGroupJID, "Ops Team")
+	if call.body["jid"] != adminGroupJID || call.body["subject"] != "Ops Team" {
+		t.Errorf("body = %#v, want the group and the trimmed name", call.body)
 	}
 }
 
-func TestGroupAdminAnnounceAndLockedReachWhatsmeow(t *testing.T) {
+func TestGroupAdminAnnounceAndLockedReachTheBridge(t *testing.T) {
 	for _, tc := range []struct {
-		body string
-		want bool
+		body   string
+		field  string
+		absent string
+		want   bool
 	}{
-		{`{"action":"announce","announce":true}`, true},
-		{`{"action":"announce","announce":false}`, false},
+		{`{"action":"announce","announce":true}`, "announce", "locked", true},
+		{`{"action":"announce","announce":false}`, "announce", "locked", false},
+		{`{"action":"locked","locked":true}`, "locked", "announce", true},
+		{`{"action":"locked","locked":false}`, "locked", "announce", false},
 	} {
-		client := newFakeAdminClient()
-		handler := newAdminAPI(t, client, "inst_1")
+		bridge := newFakeBridge(t).answering(http.StatusOK, `{"ok":true}`)
+		handler := adminAPI(t, bridge, "inst_1")
 		rec := callJSON(t, handler, http.MethodPost, adminPath, "dev-secret", tc.body)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("%s: status = %d, body = %s", tc.body, rec.Code, rec.Body.String())
 		}
-		if len(client.announceCalls) != 1 || client.announceCalls[0].flag != tc.want {
-			t.Fatalf("%s: SetGroupAnnounce calls = %+v, want one with %t", tc.body, client.announceCalls, tc.want)
+		call := bridge.only(t)
+		if call.path != "/group/settings" {
+			t.Fatalf("%s: call = %s, want POST /group/settings", tc.body, call.path)
 		}
-		if client.announceCalls[0].jid.String() != adminGroupJID {
-			t.Errorf("%s: announce addressed %s, want %s", tc.body, client.announceCalls[0].jid, adminGroupJID)
+		if call.body["jid"] != adminGroupJID {
+			t.Errorf("%s: jid = %v, want %s", tc.body, call.body["jid"], adminGroupJID)
 		}
-	}
-
-	client := newFakeAdminClient()
-	handler := newAdminAPI(t, client, "inst_1")
-	rec := callJSON(t, handler, http.MethodPost, adminPath, "dev-secret", `{"action":"locked","locked":false}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
-	}
-	if len(client.lockedCalls) != 1 || client.lockedCalls[0].flag {
-		t.Fatalf("SetGroupLocked calls = %+v, want one with false", client.lockedCalls)
+		if got, ok := call.body[tc.field].(bool); !ok || got != tc.want {
+			t.Errorf("%s: body[%q] = %#v, want %t", tc.body, tc.field, call.body[tc.field], tc.want)
+		}
+		// One action, one switch: sending the other one would change a setting the
+		// owner did not approve.
+		if _, ok := call.body[tc.absent]; ok {
+			t.Errorf("%s: body carries %q, want only %q", tc.body, tc.absent, tc.field)
+		}
 	}
 }
 
 func TestGroupAdminPhotoDecodesTheDataURL(t *testing.T) {
 	raw := []byte{0xff, 0xd8, 0xff, 0xe0, 0x01, 0x02, 0x03}
-	client := &fakeAdminClient{fakeClient: newFakeClient(), photoID: "pic_1"}
-	handler := newAdminAPI(t, client, "inst_1")
+	dataURL := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(raw)
+	bridge := newFakeBridge(t).answering(http.StatusOK, `{"ok":true,"pictureId":"pic_1"}`)
+	handler := adminAPI(t, bridge, "inst_1")
 
-	body := `{"action":"photo","dataUrl":"data:image/jpeg;base64,` + base64.StdEncoding.EncodeToString(raw) + `"}`
+	body := `{"action":"photo","dataUrl":"` + dataURL + `"}`
 	rec := callJSON(t, handler, http.MethodPost, adminPath, "dev-secret", body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
@@ -471,26 +368,27 @@ func TestGroupAdminPhotoDecodesTheDataURL(t *testing.T) {
 	if !response.OK || response.PictureID != "pic_1" {
 		t.Errorf("response = %+v, want ok with pictureId pic_1", response)
 	}
-	if len(client.photoCalls) != 1 {
-		t.Fatalf("SetGroupPhoto calls = %d, want 1", len(client.photoCalls))
+	call := bridge.only(t)
+	if call.path != "/group/photo" || call.body["jid"] != adminGroupJID {
+		t.Errorf("call = %s %+v, want POST /group/photo for %s", call.path, call.body, adminGroupJID)
 	}
-	call := client.photoCalls[0]
-	if call.jid.String() != adminGroupJID {
-		t.Errorf("photo addressed %s, want %s", call.jid, adminGroupJID)
-	}
-	if string(call.avatar) != string(raw) {
-		t.Errorf("avatar = %v, want the decoded image bytes %v", call.avatar, raw)
+	if call.body["dataUrl"] != dataURL {
+		t.Errorf("dataUrl = %v, want the image the operator approved", call.body["dataUrl"])
 	}
 }
 
 // Membership answers per JID: a partial result must never be reported as a full
 // one, and the JIDs WhatsApp did not confirm are named.
 func TestGroupAdminMembershipReportsEveryJID(t *testing.T) {
-	client := &fakeAdminClient{fakeClient: newFakeClient(), members: []types.GroupParticipant{
-		{JID: types.NewJID("628111111111", types.DefaultUserServer)},
-		{JID: types.NewJID("628222222222", types.DefaultUserServer), Error: 403},
-	}}
-	handler := newAdminAPI(t, client, "inst_1")
+	bridge := newFakeBridge(t).answering(http.StatusOK, `{
+		"ok": false,
+		"results": [
+			{"jid": "628111111111@s.whatsapp.net", "ok": true, "error": ""},
+			{"jid": "628222222222@s.whatsapp.net", "ok": false, "error": "403"}
+		],
+		"failed": ["628222222222@s.whatsapp.net"]
+	}`)
+	handler := adminAPI(t, bridge, "inst_1")
 
 	body := `{"action":"members","membership":"add","jids":["628111111111@s.whatsapp.net","628222222222@s.whatsapp.net","628333333333@s.whatsapp.net"]}`
 	rec := callJSON(t, handler, http.MethodPost, adminPath, "dev-secret", body)
@@ -534,34 +432,31 @@ func TestGroupAdminMembershipReportsEveryJID(t *testing.T) {
 		t.Errorf("failed = %v, want the two JIDs that were not confirmed", response.Failed)
 	}
 
-	if len(client.memberCalls) != 1 {
-		t.Fatalf("UpdateGroupParticipants calls = %d, want 1", len(client.memberCalls))
+	call := bridge.only(t)
+	if call.path != "/group/participants" {
+		t.Fatalf("call = %s, want POST /group/participants", call.path)
 	}
-	call := client.memberCalls[0]
-	if call.action != whatsmeow.ParticipantChangeAdd || call.jid.String() != adminGroupJID {
-		t.Errorf("UpdateGroupParticipants(%s, %v, %s), want add on %s", call.jid, call.jids, call.action, adminGroupJID)
+	if call.body["jid"] != adminGroupJID || call.body["membership"] != "add" {
+		t.Errorf("body = %#v, want the group and the verb", call.body)
 	}
-	if len(call.jids) != 3 || call.jids[0].String() != want[0].jid || call.jids[2].String() != want[2].jid {
-		t.Errorf("participants = %v, want the three requested JIDs in order", call.jids)
+	if !equalJSON(call.body["participants"], []string{"628111111111@s.whatsapp.net", "628222222222@s.whatsapp.net", "628333333333@s.whatsapp.net"}) {
+		t.Errorf("participants = %#v, want the three requested JIDs in order", call.body["participants"])
 	}
 }
 
-func TestGroupAdminMembershipCarriesTheVerbToWhatsmeow(t *testing.T) {
-	for verb, want := range map[string]whatsmeow.ParticipantChange{
-		"add":     whatsmeow.ParticipantChangeAdd,
-		"remove":  whatsmeow.ParticipantChangeRemove,
-		"promote": whatsmeow.ParticipantChangePromote,
-		"demote":  whatsmeow.ParticipantChangeDemote,
-	} {
-		client := &fakeAdminClient{fakeClient: newFakeClient(), members: []types.GroupParticipant{{JID: types.NewJID("628111111111", types.DefaultUserServer)}}}
-		handler := newAdminAPI(t, client, "inst_1")
+func TestGroupAdminMembershipCarriesTheVerbToTheBridge(t *testing.T) {
+	for _, verb := range []string{"add", "remove", "promote", "demote"} {
+		bridge := newFakeBridge(t).answering(http.StatusOK, `{
+			"ok": true, "results": [{"jid": "628111111111@s.whatsapp.net", "ok": true, "error": ""}], "failed": []
+		}`)
+		handler := adminAPI(t, bridge, "inst_1")
 		body := `{"action":"members","membership":"` + verb + `","jids":["628111111111@s.whatsapp.net"]}`
 		rec := callJSON(t, handler, http.MethodPost, adminPath, "dev-secret", body)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("%s: status = %d, body = %s", verb, rec.Code, rec.Body.String())
 		}
-		if len(client.memberCalls) != 1 || client.memberCalls[0].action != want {
-			t.Fatalf("%s: calls = %+v, want action %s", verb, client.memberCalls, want)
+		if got := bridge.only(t).body["membership"]; got != verb {
+			t.Fatalf("%s: bridge received membership %v, want the same verb", verb, got)
 		}
 		if !strings.Contains(rec.Body.String(), `"ok":true`) || !strings.Contains(rec.Body.String(), `"failed":[]`) {
 			t.Errorf("%s: body = %s, want a confirmed change with no failures", verb, rec.Body.String())
@@ -569,15 +464,14 @@ func TestGroupAdminMembershipCarriesTheVerbToWhatsmeow(t *testing.T) {
 	}
 }
 
-// A member WhatsApp answers about under the account's other address is still
-// confirmed: the caller must not see a spurious failure because a LID and a
-// phone JID name the same person.
-func TestGroupAdminMembershipMatchesTheAccountsOtherAddress(t *testing.T) {
-	client := &fakeAdminClient{fakeClient: newFakeClient(), members: []types.GroupParticipant{{
-		JID:         types.NewJID("111222333", types.HiddenUserServer),
-		PhoneNumber: types.NewJID("628111111111", types.DefaultUserServer),
-	}}}
-	handler := newAdminAPI(t, client, "inst_1")
+// The answer is matched by address. A bridge that answers about a JID nobody asked
+// about leaves the requested one unconfirmed — the worker never upgrades an
+// unmentioned JID to a success, which is what keeps a partial change partial.
+func TestGroupAdminMembershipTreatsAnUnmentionedAddressAsUnconfirmed(t *testing.T) {
+	bridge := newFakeBridge(t).answering(http.StatusOK, `{
+		"ok": true, "results": [{"jid": "111222333@lid", "ok": true, "error": ""}], "failed": []
+	}`)
+	handler := adminAPI(t, bridge, "inst_1")
 
 	body := `{"action":"members","membership":"add","jids":["628111111111@s.whatsapp.net"]}`
 	rec := callJSON(t, handler, http.MethodPost, adminPath, "dev-secret", body)
@@ -587,7 +481,6 @@ func TestGroupAdminMembershipMatchesTheAccountsOtherAddress(t *testing.T) {
 	var response struct {
 		OK      bool `json:"ok"`
 		Results []struct {
-			JID    string `json:"jid"`
 			Status string `json:"status"`
 		} `json:"results"`
 		Failed []string `json:"failed"`
@@ -595,24 +488,25 @@ func TestGroupAdminMembershipMatchesTheAccountsOtherAddress(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if !response.OK || len(response.Results) != 1 || response.Results[0].Status != membershipOK {
-		t.Errorf("response = %+v, want one confirmed result", response)
+	if response.OK || len(response.Results) != 1 || response.Results[0].Status != membershipUnreported {
+		t.Errorf("response = %+v, want one unconfirmed result", response)
 	}
-	if len(response.Failed) != 0 {
-		t.Errorf("failed = %v, want none", response.Failed)
+	if len(response.Failed) != 1 || response.Failed[0] != "628111111111@s.whatsapp.net" {
+		t.Errorf("failed = %v, want the JID that was not confirmed", response.Failed)
 	}
 }
 
-func TestGroupAdminLeaveAndRevokeReachWhatsmeow(t *testing.T) {
-	client := newFakeAdminClient()
-	handler := newAdminAPI(t, client, "inst_1")
+func TestGroupAdminLeaveAndRevokeReachTheBridge(t *testing.T) {
+	bridge := newFakeBridge(t).answering(http.StatusOK, `{"ok":true,"revokeMessageId":"3EB0A1B2C3"}`)
+	handler := adminAPI(t, bridge, "inst_1")
 
 	rec := callJSON(t, handler, http.MethodPost, adminPath, "dev-secret", `{"action":"leave"}`)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"ok":true`) {
 		t.Fatalf("leave: status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	if len(client.leaveCalls) != 1 || client.leaveCalls[0].String() != adminGroupJID {
-		t.Fatalf("LeaveGroup calls = %v, want one for %s", client.leaveCalls, adminGroupJID)
+	call := bridge.only(t)
+	if call.path != "/group/leave" || call.body["jid"] != adminGroupJID {
+		t.Fatalf("leave: call = %s %+v, want POST /group/leave for %s", call.path, call.body, adminGroupJID)
 	}
 
 	rec = callJSON(t, handler, http.MethodPost, adminPath, "dev-secret", `{"action":"revoke","waMessageId":"3EB0A1B2C3"}`)
@@ -626,15 +520,12 @@ func TestGroupAdminLeaveAndRevokeReachWhatsmeow(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if !response.OK || response.RevokeMessageID != "wa_revoke_1" {
+	if !response.OK || response.RevokeMessageID != "3EB0A1B2C3" {
 		t.Errorf("response = %+v, want ok with the revoke's own message id", response)
 	}
-	if len(client.revokeCalls) != 1 {
-		t.Fatalf("RevokeMessage calls = %d, want 1", len(client.revokeCalls))
-	}
-	call := client.revokeCalls[0]
-	if call.chat.String() != adminGroupJID || call.id != types.MessageID("3EB0A1B2C3") {
-		t.Errorf("RevokeMessage(%s, %s), want (%s, 3EB0A1B2C3)", call.chat, call.id, adminGroupJID)
+	call = bridge.recorded()[1]
+	if call.path != "/message/revoke" || call.body["jid"] != adminGroupJID || call.body["messageId"] != "3EB0A1B2C3" {
+		t.Errorf("revoke: call = %s %+v, want the group and the message id", call.path, call.body)
 	}
 }
 
@@ -646,20 +537,29 @@ func TestGroupAdminRefusalsBecomeDocumentedCodes(t *testing.T) {
 	cases := []struct {
 		name       string
 		body       string
-		client     *fakeAdminClient
+		answer     func(*fakeBridge)
 		wantStatus int
 		wantCode   string
 	}{
-		{"not an admin", `{"action":"rename","name":"Ops"}`, &fakeAdminClient{fakeClient: newFakeClient(), writeErr: whatsmeow.ErrIQForbidden}, http.StatusForbidden, codeNotAdmin},
-		{"left the group", `{"action":"leave"}`, &fakeAdminClient{fakeClient: newFakeClient(), writeErr: whatsmeow.ErrNotInGroup}, http.StatusNotFound, codeGroupNotFound},
-		{"group gone", `{"action":"locked","locked":true}`, &fakeAdminClient{fakeClient: newFakeClient(), writeErr: whatsmeow.ErrGroupNotFound}, http.StatusNotFound, codeGroupNotFound},
-		{"membership refused", `{"action":"members","membership":"promote","jids":["628111111111@s.whatsapp.net"]}`, &fakeAdminClient{fakeClient: newFakeClient(), writeErr: whatsmeow.ErrIQForbidden}, http.StatusForbidden, codeNotAdmin},
-		{"revoke of an unknown message", `{"action":"revoke","waMessageId":"3EB0"}`, &fakeAdminClient{fakeClient: newFakeClient(), writeErr: errors.New("unknown message")}, http.StatusBadGateway, codeRevokeFailed},
-		{"write not confirmed", `{"action":"announce","announce":true}`, &fakeAdminClient{fakeClient: newFakeClient(), writeErr: errors.New("partial-server-error")}, http.StatusBadGateway, codeGroupAdminFailed},
+		{"not an admin", `{"action":"rename","name":"Ops"}`, func(f *fakeBridge) { f.refusing("forbidden") }, http.StatusForbidden, codeNotAdmin},
+		{"left the group", `{"action":"leave"}`, func(f *fakeBridge) { f.refusing("item-not-found") }, http.StatusNotFound, codeGroupNotFound},
+		{"group gone", `{"action":"locked","locked":true}`, func(f *fakeBridge) { f.refusing("item-not-found") }, http.StatusNotFound, codeGroupNotFound},
+		{"membership refused", `{"action":"members","membership":"promote","jids":["628111111111@s.whatsapp.net"]}`, func(f *fakeBridge) { f.refusing("not-authorized") }, http.StatusForbidden, codeNotAdmin},
+		{"revoke of an unknown message", `{"action":"revoke","waMessageId":"3EB0"}`, func(f *fakeBridge) { f.refusing("unknown message") }, http.StatusBadGateway, codeRevokeFailed},
+		{"write not confirmed", `{"action":"announce","announce":true}`, func(f *fakeBridge) { f.refusing("partial-server-error") }, http.StatusBadGateway, codeGroupAdminFailed},
+		{"bridge session down", `{"action":"leave"}`, func(f *fakeBridge) { f.notConnected() }, http.StatusConflict, codeInstanceOffline},
+		{"bridge not listening", `{"action":"leave"}`, func(f *fakeBridge) { f.server.Close() }, http.StatusConflict, codeInstanceOffline},
+		{"unknown instance", `{"action":"leave"}`, func(f *fakeBridge) { f.answering(http.StatusOK, `{"ok":true}`) }, http.StatusNotFound, codeNotFound},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			handler := newAdminAPI(t, tc.client, "inst_1")
+			bridge := newFakeBridge(t)
+			tc.answer(bridge)
+			instances := []string{"inst_1"}
+			if tc.name == "unknown instance" {
+				instances = nil
+			}
+			handler := adminAPI(t, bridge, instances...)
 			rec := callJSON(t, handler, http.MethodPost, adminPath, "dev-secret", tc.body)
 			if rec.Code == http.StatusInternalServerError {
 				t.Fatalf("status = 500, body = %s, want a documented refusal", rec.Body.String())
@@ -674,9 +574,9 @@ func TestGroupAdminRefusalsBecomeDocumentedCodes(t *testing.T) {
 	}
 }
 
-// An unusable body is the caller's error and never reaches WhatsApp, so a bug in
+// An unusable body is the caller's error and never reaches the bridge, so a bug in
 // staging cannot move a group.
-func TestGroupAdminInvalidRequestsReachNoClient(t *testing.T) {
+func TestGroupAdminInvalidRequestsReachNoBridge(t *testing.T) {
 	bodies := map[string]string{
 		"unknown action":              `{"action":"delete-everything"}`,
 		"missing action":              `{}`,
@@ -694,8 +594,8 @@ func TestGroupAdminInvalidRequestsReachNoClient(t *testing.T) {
 	}
 	for name, body := range bodies {
 		t.Run(name, func(t *testing.T) {
-			client := newFakeAdminClient()
-			handler := newAdminAPI(t, client, "inst_1")
+			bridge := newFakeBridge(t).answering(http.StatusOK, `{"ok":true}`)
+			handler := adminAPI(t, bridge, "inst_1")
 			rec := callJSON(t, handler, http.MethodPost, adminPath, "dev-secret", body)
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, body = %s, want 400", rec.Code, rec.Body.String())
@@ -703,28 +603,28 @@ func TestGroupAdminInvalidRequestsReachNoClient(t *testing.T) {
 			if got := decodeRefusal(t, rec).Code; got != codeInvalidRequest {
 				t.Errorf("code = %q, want %q", got, codeInvalidRequest)
 			}
-			if calls := client.writeCalls(); calls != 0 {
-				t.Errorf("write calls = %d, want 0", calls)
+			if calls := bridge.recorded(); len(calls) != 0 {
+				t.Errorf("an unusable body reached the bridge: %+v", calls)
 			}
 		})
 	}
 }
 
 // The path names the chat, so a non-group JID is refused the same way a bad body
-// is: it never reaches WhatsApp.
+// is: it never reaches the bridge.
 func TestGroupAdminRejectsANonGroupPath(t *testing.T) {
-	client := newFakeAdminClient()
-	handler := newAdminAPI(t, client, "inst_1")
+	bridge := newFakeBridge(t).answering(http.StatusOK, `{"ok":true}`)
+	handler := adminAPI(t, bridge, "inst_1")
 
-	rec := callJSON(t, handler, http.MethodPost, "/instances/inst_1/groups/628990000009@s.whatsapp.net/admin", "dev-secret", `{"action":"leave"}`)
+	rec := callJSON(t, handler, http.MethodPost, "/instances/inst_1/groups/"+adminBotJID+"/admin", "dev-secret", `{"action":"leave"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, body = %s, want 400", rec.Code, rec.Body.String())
 	}
 	if got := decodeRefusal(t, rec).Code; got != codeInvalidRequest {
 		t.Errorf("code = %q, want %q", got, codeInvalidRequest)
 	}
-	if client.writeCalls() != 0 {
-		t.Errorf("write calls = %d, want 0", client.writeCalls())
+	if calls := bridge.recorded(); len(calls) != 0 {
+		t.Errorf("the bridge was asked about a non-group path: %+v", calls)
 	}
 }
 
@@ -732,8 +632,8 @@ func TestGroupAdminRejectsANonGroupPath(t *testing.T) {
 // control-plane route: these endpoints are destructive, so an unauthenticated
 // caller must not reach one.
 func TestGroupAdminSurfaceRequiresBearer(t *testing.T) {
-	client := &fakeAdminClient{fakeClient: newFakeClient(), info: &types.GroupInfo{JID: types.NewJID("120363043123456789", types.GroupServer)}}
-	handler := newAdminAPI(t, client, "inst_1")
+	bridge := newFakeBridge(t).answering(http.StatusOK, `{"ok":true}`)
+	handler := adminAPI(t, bridge, "inst_1")
 
 	for _, request := range []struct{ method, path, body string }{
 		{http.MethodGet, infoPath, ""},
@@ -745,15 +645,15 @@ func TestGroupAdminSurfaceRequiresBearer(t *testing.T) {
 			t.Errorf("%s %s: status = %d, want 401", request.method, request.path, rec.Code)
 		}
 	}
-	if client.writeCalls() != 0 || !client.infoJID.IsEmpty() {
-		t.Errorf("an unauthorized request reached the client: writes = %d, info = %s", client.writeCalls(), client.infoJID)
+	if calls := bridge.recorded(); len(calls) != 0 {
+		t.Errorf("an unauthorized request reached the bridge: %+v", calls)
 	}
 }
 
 // A method the route does not serve is a 405, not a silent write.
 func TestGroupAdminRejectsWrongMethods(t *testing.T) {
-	client := newFakeAdminClient()
-	handler := newAdminAPI(t, client, "inst_1")
+	bridge := newFakeBridge(t).answering(http.StatusOK, `{"ok":true}`)
+	handler := adminAPI(t, bridge, "inst_1")
 
 	if rec := callJSON(t, handler, http.MethodGet, adminPath, "dev-secret", ""); rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("GET admin: status = %d, want 405", rec.Code)
@@ -763,7 +663,7 @@ func TestGroupAdminRejectsWrongMethods(t *testing.T) {
 			t.Errorf("POST %s: status = %d, want 405", path, rec.Code)
 		}
 	}
-	if client.writeCalls() != 0 {
-		t.Errorf("write calls = %d, want 0", client.writeCalls())
+	if calls := bridge.recorded(); len(calls) != 0 {
+		t.Errorf("a wrong method reached the bridge: %+v", calls)
 	}
 }

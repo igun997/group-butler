@@ -5,17 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"time"
-
-	"go.mau.fi/whatsmeow/types"
 )
-
-// groupClient is the whatsmeow surface the group paths need (§14.2). The ISP
-// round trips live behind it so reconciliation and repair are provable without a
-// socket, a live account or an event loop; *whatsmeow.Client satisfies it as-is.
-type groupClient interface {
-	GetJoinedGroups(ctx context.Context) ([]*types.GroupInfo, error)
-	GetGroupInfo(ctx context.Context, jid types.JID) (*types.GroupInfo, error)
-}
 
 // SyncSummary is the §6.6.6 report of one full sync: what the snapshot held and
 // what it changed. `Unchanged` is the write-amplification witness — a steady
@@ -41,16 +31,24 @@ type SyncSummary struct {
 
 // runGroupSync performs the authoritative membership snapshot (§6.6.5):
 //
-//  1. one GetJoinedGroups call (no pagination: it returns every group);
+//  1. one `GET /groups` call — every group the linked account participates in.
+//     The Hermes bridge asks WhatsApp for it on the account the console uses,
+//     which is the same question the worker used to put to its own session;
 //  2. every returned group is merged into its stored observation and upserted;
 //  3. stored groups the instance is still believed to be in but that the
 //     response does not mention are marked `left`, keeping their name;
-//  4. a failed call writes nothing about membership at all — a timed-out IQ must
-//     never look like "we left every group". The caller records
+//  4. a failed call writes nothing about membership at all — an unreachable
+//     bridge must never look like "we left every group". The caller records
 //     `runtime.groupSync.lastError` and backs off; this function only reports.
 //
+// `SubjectRejected` is always zero now: the refusal rule exists to keep a
+// snapshot that is older than a stored rename from winning, and the bridge's
+// contract carries no rename stamp to compare — a `GET /groups` answer is a live
+// read of WhatsApp's current state, so it is what the name is (§6.6.4). The
+// field stays on the wire because the BFF's schema has it.
+//
 // `prune` is GROUP_SYNC_PRUNE: operators can keep rule 3 off entirely.
-func runGroupSync(ctx context.Context, client groupClient, store groupStoreAPI, orgID, instanceID string, source SyncSource, prune bool) (SyncSummary, error) {
+func runGroupSync(ctx context.Context, bridge *hermesBridge, store groupStoreAPI, orgID, instanceID string, source SyncSource, prune bool) (SyncSummary, error) {
 	started := now()
 	summary := SyncSummary{Source: source}
 	finish := func() SyncSummary {
@@ -58,9 +56,9 @@ func runGroupSync(ctx context.Context, client groupClient, store groupStoreAPI, 
 		return summary
 	}
 
-	groups, err := client.GetJoinedGroups(ctx)
+	groups, err := bridge.Groups(ctx)
 	if err != nil {
-		return finish(), fmt.Errorf("group sync: get joined groups: %w", err)
+		return finish(), fmt.Errorf("group sync: list groups: %w", err)
 	}
 	// One timestamp for the whole snapshot: a sync's writes must agree on when
 	// they were observed, or the staleness thresholds measure our own loop.
@@ -71,19 +69,23 @@ func runGroupSync(ctx context.Context, client groupClient, store groupStoreAPI, 
 
 	at := now().UTC()
 	returned := make(map[string]bool, len(groups))
-	for _, info := range groups {
-		if info == nil || info.JID.Server != types.GroupServer {
+	for _, entry := range groups {
+		address, err := parseAddress(entry.JID)
+		if err != nil || !address.isGroup() {
 			// A membership snapshot can only contain groups; anything else is a
-			// parser surprise and must not become a document.
+			// contract surprise and must not become a document.
 			continue
 		}
-		jid := info.JID.String()
+		jid := address.String()
 		returned[jid] = true
 		cur, exists := stored[jid]
-		merged, changes, rejected := mergeSnapshot(cur, info, source, at)
-		if rejected {
-			summary.SubjectRejected++
-		}
+		merged, changes := mergeSnapshot(cur, groupSnapshot{
+			JID:              jid,
+			Subject:          entry.Subject,
+			Announce:         entry.Announce,
+			Locked:           entry.Locked,
+			ParticipantCount: entry.ParticipantCount,
+		}, source, at)
 		summary.Total++
 		switch {
 		case !exists:
@@ -128,46 +130,46 @@ func runGroupSync(ctx context.Context, client groupClient, store groupStoreAPI, 
 }
 
 // mergeSnapshot folds one authoritative snapshot entry into the stored
-// observation, and reports the fields it changed plus whether the snapshot's
-// name had to be refused as stale (§6.6.5 rule 1).
+// observation and reports the fields it changed.
 //
 // The snapshot owns membership and metadata outright, so those are refreshed
-// wholesale. The name is different: a snapshot can be older than a rename event
-// that arrived first, so it goes through the same ordering rule as an event
-// (§6.6.4). The ingest-owned counters are carried over from the stored
-// observation, because a snapshot carries no traffic counts and inventing zeroes
-// would erase them.
-func mergeSnapshot(cur Observed, info *types.GroupInfo, source SyncSource, at time.Time) (Observed, []string, bool) {
-	snap := ObservedFromGroupInfo(info, source, at)
+// wholesale — with one exception. The name is compared rather than copied when it
+// is unchanged, because the stamp beside it means "when this name was set" and a
+// live read that sees the same name has learnt nothing new about it; a rename we
+// have just observed is stamped with the moment we observed it. The previous name
+// goes into the capped ring either way (§6.6.4).
+//
+// Field by field: the bridge's contract carries identity, subject, the two
+// switches and the member count, so `topic`, `isEphemeral`, `groupCreatedAt` and
+// the membership list keep their stored values — the merge never invents what it
+// did not read. The ingest-owned counters are likewise carried over from the
+// stored observation, because a snapshot carries no traffic counts and inventing
+// zeroes would erase them.
+func mergeSnapshot(cur Observed, entry groupSnapshot, source SyncSource, at time.Time) (Observed, []string) {
+	snap := observedFromSnapshot(entry, source, at)
 	next := cur
 	changes := make([]string, 0, 8)
-	rejected := false
 
-	if snap.Subject != "" {
-		// A snapshot is a "sync" observation: it is fetched later than any
-		// unstamped value we hold, which is what acceptSubject grants.
-		accepted := acceptSubject(
-			subjectUpdate{name: cur.Subject, setAt: cur.SubjectUpdatedAt, source: cur.SubjectSource, observedAt: cur.SubjectObservedAt},
-			subjectUpdate{name: snap.Subject, setAt: snap.SubjectUpdatedAt, source: SubjectFromSync, observedAt: at},
-		)
-		switch {
-		case !accepted:
-			rejected = true
-		case snap.Subject != cur.Subject || !snap.SubjectUpdatedAt.Equal(cur.SubjectUpdatedAt) || cur.SubjectSource == SubjectFromFallback:
-			if snap.Subject != cur.Subject && cur.Subject != "" {
-				next.SubjectHistory = appendSubjectHistory(cur.SubjectHistory, SubjectHistoryEntry{
-					Name: cur.Subject, At: cur.SubjectUpdatedAt, By: cur.SubjectSetBy,
-				})
-			}
-			next.Subject = snap.Subject
-			next.SubjectSearch = snap.SubjectSearch
-			next.SubjectUpdatedAt = snap.SubjectUpdatedAt
-			next.SubjectObservedAt = snap.SubjectObservedAt
-			next.SubjectSetBy = snap.SubjectSetBy
-			next.SubjectSetByLID = snap.SubjectSetByLID
-			next.SubjectSource = snap.SubjectSource
-			changes = append(changes, "subject")
+	if snap.Subject != "" && snap.Subject != cur.Subject {
+		if cur.Subject != "" {
+			next.SubjectHistory = appendSubjectHistory(cur.SubjectHistory, SubjectHistoryEntry{
+				Name: cur.Subject, At: cur.SubjectUpdatedAt, By: cur.SubjectSetBy,
+			})
 		}
+		next.Subject = snap.Subject
+		next.SubjectSearch = snap.SubjectSearch
+		next.SubjectUpdatedAt = at
+		next.SubjectObservedAt = at
+		next.SubjectSetBy = ""
+		next.SubjectSetByLID = ""
+		next.SubjectSource = snap.SubjectSource
+		changes = append(changes, "subject")
+	} else if snap.Subject != "" && cur.SubjectSource == SubjectFromFallback {
+		// The name we had was a placeholder (a group first seen through a message
+		// that never carried one). Learning the real name is a change, and it
+		// keeps the stored stamp: the name has not moved, it has been confirmed.
+		next.SubjectSource = snap.SubjectSource
+		changes = append(changes, "subject")
 	}
 	if snap.State != cur.State {
 		next.State = snap.State
@@ -183,10 +185,6 @@ func mergeSnapshot(cur Observed, info *types.GroupInfo, source SyncSource, at ti
 		next.ParticipantCountDirty = false
 		changes = append(changes, "participantCountDirty")
 	}
-	if snap.Topic != cur.Topic || !snap.TopicUpdatedAt.Equal(cur.TopicUpdatedAt) {
-		next.Topic, next.TopicUpdatedAt = snap.Topic, snap.TopicUpdatedAt
-		changes = append(changes, "topic")
-	}
 	if snap.IsAnnounce != cur.IsAnnounce {
 		next.IsAnnounce = snap.IsAnnounce
 		changes = append(changes, "announce")
@@ -195,20 +193,7 @@ func mergeSnapshot(cur Observed, info *types.GroupInfo, source SyncSource, at ti
 		next.IsLocked = snap.IsLocked
 		changes = append(changes, "locked")
 	}
-	if snap.IsEphemeral != cur.IsEphemeral {
-		next.IsEphemeral = snap.IsEphemeral
-		changes = append(changes, "ephemeral")
-	}
-	if snap.IsDefaultSubGroup != cur.IsDefaultSubGroup {
-		next.IsDefaultSubGroup = snap.IsDefaultSubGroup
-		changes = append(changes, "isDefaultSubGroup")
-	}
-	if cur.GroupCreatedAt.IsZero() && !snap.GroupCreatedAt.IsZero() {
-		// Creation is immutable: it is recorded once and never rewritten.
-		next.GroupCreatedAt = snap.GroupCreatedAt
-		changes = append(changes, "groupCreatedAt")
-	}
 	next.LastSyncedAt = snap.LastSyncedAt
 	next.LastSyncSource = snap.LastSyncSource
-	return next, changes, rejected
+	return next, changes
 }

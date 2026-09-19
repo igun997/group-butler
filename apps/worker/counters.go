@@ -67,13 +67,14 @@ func (m *manager) recordStored(ctx context.Context, docs []MessageDoc) {
 
 // recordMedia writes one attachment's outcome into both places §10 reads. Only
 // media the pipeline actually holds is counted: `pending` is work not yet done,
-// `failed` is work to retry, and `unavailable` is bytes WhatsApp will not give
-// us — none of them is a stored attachment, and counting one would report an
-// object the bucket does not have (R3).
+// `failed` is a record worth retrying, and `unavailable` is bytes WhatsApp will
+// not give us — none of them is a stored attachment, and counting one would
+// report an object the bucket does not have (R3).
 //
 // The stamp is the moment the pipeline resolved the attachment rather than the
-// message's own timestamp: this is the work the worker did, so a janitor retry
-// of an older message is today's media, not the day that message arrived.
+// message's own timestamp: this is the work the worker did, so counting an older
+// message that arrived late is still today's media, not the day that message was
+// sent.
 func (m *manager) recordMedia(ctx context.Context, doc MessageDoc, media Media) {
 	var dayCounter, runtimeCounter string
 	switch media.Status {
@@ -86,6 +87,38 @@ func (m *manager) recordMedia(ctx context.Context, doc MessageDoc, media Media) 
 	}
 	m.bumpDay(ctx, doc.InstanceID, doc.GroupJID, dayCounter, 1, now())
 	m.bumpRuntime(ctx, doc.InstanceID, map[string]int64{runtimeCounter: 1})
+}
+
+// countMediaOutcomes counts the attachments a flush just persisted.
+//
+// It runs off the flush path — two counter writes per attachment are Mongo round
+// trips, and the ingest goroutine must not wait for them — and it is deliberately
+// a plain goroutine rather than another queue: the counter write already tolerates
+// failure (bumpDay logs and moves on), so a lost one costs a number, never a
+// message.
+func (m *manager) countMediaOutcomes(docs []MessageDoc) {
+	if m.stats == nil && m.instances == nil {
+		return
+	}
+	media := make([]MessageDoc, 0, len(docs))
+	for _, doc := range docs {
+		switch doc.Media.Status {
+		case MediaStored, MediaUnparsed:
+			media = append(media, doc)
+		}
+	}
+	if len(media) == 0 {
+		return
+	}
+	go func() {
+		// Its own context: a flush may be running because the process is leaving,
+		// and the work it already paid for must still be counted.
+		ctx, cancel := context.WithTimeout(context.Background(), ingestFlushTimeout)
+		defer cancel()
+		for _, doc := range media {
+			m.recordMedia(ctx, doc, doc.Media)
+		}
+	}()
 }
 
 // recordSend writes one dispatch outcome. Both directions are recorded: a

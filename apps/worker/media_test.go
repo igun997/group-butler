@@ -7,15 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-
-	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/proto/waE2E"
-	"google.golang.org/protobuf/proto"
 )
 
 type fakeDownloader struct {
@@ -170,16 +165,6 @@ func TestStoreMedia_DownloadFailureIsUnavailableNotFatal(t *testing.T) {
 	}
 	if got.DeclaredType != "image" {
 		t.Errorf("DeclaredType = %q, want image", got.DeclaredType)
-	}
-}
-
-func TestMediaDescriptorFromMessage(t *testing.T) {
-	msg := &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
-		Mimetype: proto.String("image/jpeg"), Caption: proto.String("chart"), FileLength: proto.Uint64(2048),
-	}}
-	desc, ok := describeMedia(msg)
-	if !ok || desc.Kind != "image" || desc.DeclaredType != "image" || desc.Mime != "image/jpeg" {
-		t.Fatalf("describeMedia = %+v ok=%v", desc, ok)
 	}
 }
 
@@ -585,23 +570,11 @@ func TestClassifyDownloadFailure(t *testing.T) {
 		{"expired", errors.New("attachment expired"), MediaUnavailable, "expired"},
 		{"consumed view-once", errors.New("view once already consumed"), MediaUnavailable, "view_once"},
 		{"over the cap", errMediaTooLarge, MediaUnavailable, "too_large"},
-		{"unknown refusal", errors.New("whatsapp said no"), MediaUnavailable, "download_failed"},
+		{"a cache file the bridge never wrote", errors.New("read hermes attachment: no such file or directory"), MediaUnavailable, "download_failed"},
 		{"timeout", context.DeadlineExceeded, MediaFailed, ""},
 		{"reset stream", errors.New("read tcp: connection reset by peer"), MediaFailed, ""},
 		{"throttled", errors.New("429 Too Many Requests: slow down"), MediaFailed, ""},
 		{"cancelled shutdown", context.Canceled, MediaFailed, ""},
-		{"media gone (410)", whatsmeow.ErrMediaDownloadFailedWith410, MediaUnavailable, "expired"},
-		{"media forbidden (403)", whatsmeow.ErrMediaDownloadFailedWith403, MediaUnavailable, "expired"},
-		{"media missing (404)", whatsmeow.ErrMediaDownloadFailedWith404, MediaUnavailable, "expired"},
-		{"no longer on the phone", whatsmeow.ErrMediaNotAvailableOnPhone, MediaUnavailable, "expired"},
-		{"nothing downloadable", whatsmeow.ErrNothingDownloadableFound, MediaUnavailable, "unsupported_type"},
-		{"no url present", whatsmeow.ErrNoURLPresent, MediaUnavailable, "unsupported_type"},
-		{"unknown media type", whatsmeow.ErrUnknownMediaType, MediaUnavailable, "unsupported_type"},
-		{"corrupt hmac", whatsmeow.ErrInvalidMediaHMAC, MediaUnavailable, "download_failed"},
-		{"plaintext hash mismatch", whatsmeow.ErrInvalidMediaSHA256, MediaUnavailable, "download_failed"},
-		{"truncated payload", whatsmeow.ErrTooShortFile, MediaUnavailable, "download_failed"},
-		{"host having a bad day (503)", whatsmeow.DownloadHTTPError{Response: &http.Response{StatusCode: http.StatusServiceUnavailable}}, MediaFailed, ""},
-		{"host throttling (429)", whatsmeow.DownloadHTTPError{Response: &http.Response{StatusCode: http.StatusTooManyRequests}}, MediaFailed, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -724,65 +697,6 @@ func TestCopyCappedAbortsPastTheLimit(t *testing.T) {
 	}
 	if consumed := (1 << 20) - src.Len(); consumed > 11 {
 		t.Errorf("read %d bytes past a 10-byte cap: an oversized attachment must not be streamed to the end (§6.3.2)", consumed)
-	}
-}
-
-func TestDescribeMediaMapsEveryDownloadableVariant(t *testing.T) {
-	// Each node is built once so the descriptor can be expected to carry that
-	// exact node: the authenticated download request is built from it.
-	image := &waE2E.ImageMessage{Mimetype: proto.String("image/jpeg"), FileLength: proto.Uint64(7)}
-	ptv := &waE2E.VideoMessage{Mimetype: proto.String("video/mp4"), FileLength: proto.Uint64(8)}
-	voice := &waE2E.AudioMessage{Mimetype: proto.String("audio/ogg; codecs=opus"), FileLength: proto.Uint64(9)}
-	document := &waE2E.DocumentMessage{
-		Mimetype: proto.String("application/pdf"), FileName: proto.String("invoice.pdf"), FileLength: proto.Uint64(10),
-	}
-	sticker := &waE2E.StickerMessage{Mimetype: proto.String("image/webp"), FileLength: proto.Uint64(11)}
-	wrapped := &waE2E.ImageMessage{Mimetype: proto.String("image/jpeg"), FileLength: proto.Uint64(7)}
-
-	cases := []struct {
-		name string
-		msg  *waE2E.Message
-		want MediaDescriptor
-	}{
-		{"image", &waE2E.Message{ImageMessage: image},
-			MediaDescriptor{Kind: KindImage, DeclaredType: KindImage, Mime: "image/jpeg", Size: 7, Node: image}},
-		{"video note", &waE2E.Message{PtvMessage: ptv},
-			MediaDescriptor{Kind: KindPtv, DeclaredType: KindPtv, Mime: "video/mp4", Size: 8, Node: ptv}},
-		{"voice note", &waE2E.Message{AudioMessage: voice},
-			MediaDescriptor{Kind: KindAudio, DeclaredType: KindAudio, Mime: "audio/ogg; codecs=opus", Size: 9, Node: voice}},
-		{"document", &waE2E.Message{DocumentMessage: document},
-			MediaDescriptor{Kind: KindDocument, DeclaredType: KindDocument, Mime: "application/pdf", FileName: "invoice.pdf", Size: 10, Node: document}},
-		{"sticker", &waE2E.Message{StickerMessage: sticker},
-			MediaDescriptor{Kind: KindSticker, DeclaredType: KindSticker, Mime: "image/webp", Size: 11, Node: sticker}},
-		{"view-once wrapper", &waE2E.Message{ViewOnceMessage: &waE2E.FutureProofMessage{
-			Message: &waE2E.Message{ImageMessage: wrapped},
-		}}, MediaDescriptor{
-			Kind: KindImage, DeclaredType: declaredViewOnce, Mime: "image/jpeg", Size: 7, ViewOnce: true, Node: wrapped,
-		}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, ok := describeMedia(tc.msg)
-			if !ok {
-				t.Fatalf("describeMedia(%s) reported no media", tc.name)
-			}
-			if got != tc.want {
-				t.Errorf("describeMedia = %+v, want %+v", got, tc.want)
-			}
-			if got.Node == nil {
-				t.Error("the descriptor carries no node: nothing could build the authenticated download request")
-			}
-		})
-	}
-
-	for _, msg := range []*waE2E.Message{
-		nil,
-		{Conversation: proto.String("no media here")},
-		{DocumentMessage: nil},
-	} {
-		if got, ok := describeMedia(msg); ok {
-			t.Errorf("describeMedia(%v) = %+v, want no descriptor", msg, got)
-		}
 	}
 }
 

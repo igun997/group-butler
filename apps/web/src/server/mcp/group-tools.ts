@@ -1414,7 +1414,15 @@ const PERFORMED_NOTE =
  * accept and no field that could widen its access.
  */
 export function createGroupMcpServer(context: ToolChatContext, deps: GroupToolDeps = {}): McpServer {
-  const server = new McpServer({ name: "butler-groups", version: "1.0.0" });
+  return registerGroupTools(new McpServer({ name: "butler-groups", version: "1.0.0" }), context, deps);
+}
+
+/**
+ * The same registrations on a server the caller already owns, so one endpoint
+ * can offer this family beside the media one. `createGroupMcpServer` is this
+ * with a server of its own.
+ */
+export function registerGroupTools(server: McpServer, context: ToolChatContext, deps: GroupToolDeps = {}): McpServer {
   const refShape = context.chatKind === "group" ? {} : groupRefShape;
   /** What these tools call the group they act on: the job's own, or the one the call names. */
   const group = context.chatKind === "group" ? "this group" : "the named group";

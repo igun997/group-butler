@@ -2,271 +2,49 @@ package main
 
 import (
 	"context"
-	"errors"
-	"sync"
+	"net/http"
 	"testing"
-	"time"
-
-	"go.mau.fi/whatsmeow/proto/waE2E"
-	"go.mau.fi/whatsmeow/types"
-	"google.golang.org/protobuf/proto"
 )
 
-// ---- fakes ---------------------------------------------------------------
+// The timer-driven reconcile is the offline-rename safety net, and it is the only
+// scheduled loop left that touches the group read model. These tests drive the
+// loop with a ticker a test controls, against a real bridge server, so a pass is
+// proved by the call the worker made and the rows it wrote.
 
-type fakeMediaStore struct {
-	mu          sync.Mutex
-	candidates  []mediaCandidate
-	saved       []Media
-	maxAttempts int
-}
-
-func (f *fakeMediaStore) pendingMedia(_ context.Context, _ string, maxAttempts int) ([]mediaCandidate, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.maxAttempts = maxAttempts
-	return f.candidates, nil
-}
-
-func (f *fakeMediaStore) saveMedia(_ context.Context, _ MessageDoc, media Media) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.saved = append(f.saved, media)
-	return nil
-}
-
-func (f *fakeMediaStore) savedMedia() []Media {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]Media(nil), f.saved...)
-}
-
-// manualTicker is the injectable periodic-loop seam: a test pushes the exact
-// number of ticks it wants, so nothing sleeps and nothing is timing-dependent.
-type manualTicker struct {
-	ch      chan time.Time
-	stopped chan struct{}
-	once    sync.Once
-}
-
-func newManualTicker() *manualTicker {
-	return &manualTicker{ch: make(chan time.Time, 4), stopped: make(chan struct{})}
-}
-
-func (m *manualTicker) new(time.Duration) (<-chan time.Time, func()) {
-	return m.ch, func() { m.once.Do(func() { close(m.stopped) }) }
-}
-
-func (m *manualTicker) tick() { m.ch <- time.Now() }
-
-func waitFor(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
-		}
-		time.Sleep(time.Millisecond)
-	}
-}
-
-// ---- GROUP_SYNC_INTERVAL scheduler ---------------------------------------
-
-func TestGroupSyncSchedulerSyncsConnectedInstancesOnTick(t *testing.T) {
-	client := newFakeClient()
+func TestGroupSyncSchedulerSyncsOnTick(t *testing.T) {
+	bridge := newFakeBridge(t).answering(http.StatusOK, groupsAnswer(bridgeGroup("120363043000000001", "A", 3)))
 	mgr := testManagerWithDeps(newFakeGroupStore(), nil, nil)
+	mgr.bridge = bridge.client(t)
+	mgr.cfg.HermesInstanceID = "inst_hermes"
 	ticker := newManualTicker()
 	mgr.newTicker = ticker.new
-	s := testSession(mgr, client)
-	s.status = stateConnected
-	mgr.put(s)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); mgr.runGroupSyncScheduler(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
 
 	ticker.tick()
-	waitFor(t, "the interval sync to call GetJoinedGroups", func() bool { return client.groupCallCount() > 0 })
-
-	cancel()
-	waitFor(t, "the scheduler to stop", func() bool {
-		select {
-		case <-done:
-			return true
-		default:
-			return false
-		}
+	waitFor(t, "the interval sync to ask the bridge for the group list", func() bool {
+		return len(bridge.recorded()) > 0
 	})
-	select {
-	case <-ticker.stopped:
-	default:
-		t.Error("the scheduler must stop its ticker when its context is cancelled")
+	if call := bridge.recorded()[0]; call.path != "/groups" || call.method != http.MethodGet {
+		t.Errorf("the scheduler asked %s %s, want GET /groups", call.method, call.path)
 	}
 }
 
-func TestGroupSyncSchedulerSkipsOfflineInstances(t *testing.T) {
-	client := newFakeClient()
+// A worker assembled without a bridge address has nothing to ask: the pass must
+// report the failure rather than record an empty membership.
+func TestGroupSyncSchedulerReportsAMissingBridge(t *testing.T) {
 	mgr := testManagerWithDeps(newFakeGroupStore(), nil, nil)
-	s := testSession(mgr, client)
-	s.status = stateDisconnected
-	mgr.put(s)
-
-	mgr.syncAllConnected(context.Background())
-
-	if got := client.groupCallCount(); got != 0 {
-		t.Fatalf("GetJoinedGroups calls = %d, want 0 for an offline instance", got)
+	if mgr.bridge != nil {
+		t.Fatal("this worker was built with a bridge it was not configured for")
 	}
-}
-
-// ---- MEDIA_JANITOR_INTERVAL retry loop -----------------------------------
-
-func pngBytes() []byte {
-	return []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 'I', 'H', 'D', 'R', 0, 0, 0, 4, 0, 0, 0, 3}
-}
-
-func storedImageCandidate(t *testing.T, instanceID, messageID string) mediaCandidate {
-	t.Helper()
-	msg := &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
-		Mimetype:   proto.String("image/png"),
-		FileLength: proto.Uint64(3),
-	}}
-	raw, _, err := rawFields(msg)
-	if err != nil {
-		t.Fatalf("rawFields: %v", err)
-	}
-	return mediaCandidate{
-		OrganizationID: "org_default",
-		InstanceID:     instanceID,
-		WaMessageID:    messageID,
-		GroupJID:       "120363043123456789@g.us",
-		Raw:            raw.Message,
-	}
-}
-
-func TestMediaJanitorEnqueuesPendingAttachmentsForLiveInstances(t *testing.T) {
-	store := &fakeMediaStore{candidates: []mediaCandidate{
-		storedImageCandidate(t, "online", "3EB0JAN1"),
-		storedImageCandidate(t, "offline", "3EB0JAN2"),
-	}}
-	mgr := testManagerWithDeps(newFakeGroupStore(), nil, nil)
-	mgr.media = newMediaRunner(mgr.cfg, &fakeUploader{}, store, "org_default", mgr)
-
-	online := testSession(mgr, newFakeClient())
-	online.status = stateConnected
-	online.id = "online"
-	mgr.put(online)
-	offline := testSession(mgr, newFakeClient())
-	offline.status = stateDisconnected
-	offline.id = "offline"
-	mgr.put(offline)
-
-	mgr.janitorSweep(context.Background())
-
-	if store.maxAttempts != mgr.cfg.MediaMaxAttempts {
-		t.Errorf("janitor queried attempts < %d, want MEDIA_MAX_ATTEMPTS=%d", store.maxAttempts, mgr.cfg.MediaMaxAttempts)
-	}
-	if got := len(mgr.media.jobs); got != 1 {
-		t.Fatalf("queued retries = %d, want 1 (offline instances cannot download)", got)
-	}
-}
-
-func TestMediaJanitorSweepsOnTick(t *testing.T) {
-	store := &fakeMediaStore{candidates: []mediaCandidate{storedImageCandidate(t, "inst_1", "3EB0JAN3")}}
-	mgr := testManagerWithDeps(newFakeGroupStore(), nil, nil)
-	mgr.media = newMediaRunner(mgr.cfg, &fakeUploader{}, store, "org_default", mgr)
-	ticker := newManualTicker()
-	mgr.newTicker = ticker.new
-
-	s := testSession(mgr, newFakeClient())
-	s.status = stateConnected
-	mgr.put(s)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { defer close(done); mgr.runMediaJanitor(ctx) }()
-
-	ticker.tick()
-	waitFor(t, "the janitor to queue a retry", func() bool { return len(mgr.media.jobs) == 1 })
-
-	cancel()
-	waitFor(t, "the janitor to stop", func() bool {
-		select {
-		case <-done:
-			return true
-		default:
-			return false
-		}
-	})
-}
-
-// TestMediaJanitorRetryLandsTheStoredStatus is the whole-loop proof: the tick
-// queues a retry, the worker downloads through the existing pipeline and the
-// result is persisted with the attempt counted.
-func TestMediaJanitorRetryLandsTheStoredStatus(t *testing.T) {
-	store := &fakeMediaStore{candidates: []mediaCandidate{storedImageCandidate(t, "inst_1", "3EB0JAN4")}}
-	mgr := testManagerWithDeps(newFakeGroupStore(), nil, nil)
-	uploader := &fakeUploader{}
-	mgr.media = newMediaRunner(mgr.cfg, uploader, store, "org_default", mgr)
-
-	client := newFakeClient()
-	client.download = pngBytes()
-	s := testSession(mgr, client)
-	s.status = stateConnected
-	mgr.put(s)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go mgr.media.run(ctx)
-
-	mgr.janitorSweep(ctx)
-	waitFor(t, "the retry to be persisted", func() bool { return len(store.savedMedia()) == 1 })
-
-	saved := store.savedMedia()[0]
-	if saved.Status != MediaStored {
-		t.Fatalf("persisted media = %+v, want stored", saved)
-	}
-	if saved.Width != 4 || saved.Height != 3 {
-		t.Errorf("dimensions = %dx%d, want the bytes that were downloaded", saved.Width, saved.Height)
-	}
-}
-
-// The retry path is only useful to the console if the counter moves with it:
-// this drives the janitor's queued retry end to end and reads both documents the
-// numbers live in, rather than trusting the runner to have reported.
-func TestMediaJanitorRetryCountsTheStoredAttachment(t *testing.T) {
-	store := &fakeMediaStore{candidates: []mediaCandidate{storedImageCandidate(t, "inst_1", "3EB0JAN5")}}
-	stats := &fakeDayCounters{}
-	repo := newFakeInstanceRepo()
-	mgr := testManagerWithDeps(newFakeGroupStore(), stats, nil)
-	mgr.instances = repo
-	mgr.media = newMediaRunner(mgr.cfg, &fakeUploader{}, store, "org_default", mgr)
-
-	client := newFakeClient()
-	client.download = pngBytes()
-	s := testSession(mgr, client)
-	s.status = stateConnected
-	mgr.put(s)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go mgr.media.run(ctx)
-
-	mgr.janitorSweep(ctx)
-	waitFor(t, "the stored attachment's counters", func() bool {
-		return repo.counters["inst_1"][runtimeCounterMediaStored] == 1
-	})
-
-	calls := stats.recorded()
-	if len(calls) != 1 {
-		t.Fatalf("day bumps = %d, want one for one stored attachment: %+v", len(calls), calls)
-	}
-	if calls[0].counter != dayCounterMediaStored {
-		t.Errorf("counter = %q, want %q", calls[0].counter, dayCounterMediaStored)
-	}
-	// The retry carries the group the message belongs to, so the outcome lands on
-	// the same day row the live path would have written.
-	if calls[0].groupJID != "120363043123456789@g.us" {
-		t.Errorf("group = %q, want the group the attachment was sent to", calls[0].groupJID)
+	if err := mgr.runGroupSyncOnce(context.Background(), SyncOnTimer); err == nil {
+		t.Fatal("a sync with no bridge must be reported as a failure")
 	}
 }
 
@@ -274,34 +52,31 @@ func TestMediaJanitorRetryCountsTheStoredAttachment(t *testing.T) {
 // that arrived moves it: a refused call must leave the last observed total
 // standing, never record the refusal as an empty membership (§6.6.5, R11).
 func TestGroupSyncRecordsTheGroupsAPassObserved(t *testing.T) {
-	client := newFakeClient()
-	client.groups = []*types.GroupInfo{
-		groupInfo("120363043123456789", "Ops Team", 12),
-		groupInfo("120363043000000001", "Ops Team Two", 5),
-	}
+	bridge := newFakeBridge(t).answering(http.StatusOK, groupsAnswer(
+		bridgeGroup("120363043123456789", "Ops Team", 12),
+		bridgeGroup("120363043000000001", "Ops Team Two", 5),
+	))
 	stats := &fakeDayCounters{}
 	repo := newFakeInstanceRepo()
-	mgr := testManagerWithDeps(newFakeGroupStore(), stats, nil)
-	mgr.instances = repo
-	s := testSession(mgr, client)
-	s.status = stateConnected
-	mgr.put(s)
+	mgr := testManagerWithDeps(newFakeGroupStore(), stats, repo)
+	mgr.bridge = bridge.client(t)
+	mgr.cfg.HermesInstanceID = "inst_hermes"
 
-	if err := mgr.runGroupSyncOnce(context.Background(), s, SyncOnTimer); err != nil {
+	if err := mgr.runGroupSyncOnce(context.Background(), SyncOnTimer); err != nil {
 		t.Fatalf("runGroupSyncOnce: %v", err)
 	}
-	if got := repo.groupSync["inst_1"].GroupsObserved; got != 2 {
+	if got := repo.groupSync["inst_hermes"].GroupsObserved; got != 2 {
 		t.Fatalf("groupsObserved = %d, want the 2 groups the snapshot held", got)
 	}
 
-	client.groupErr = errors.New("group sync: get joined groups: iq refused")
-	if err := mgr.runGroupSyncOnce(context.Background(), s, SyncOnTimer); err == nil {
+	bridge.refusing("rate-overlimit")
+	if err := mgr.runGroupSyncOnce(context.Background(), SyncOnTimer); err == nil {
 		t.Fatal("a refused sync must be reported")
 	}
-	if got := repo.groupSync["inst_1"].GroupsObserved; got != 2 {
+	if got := repo.groupSync["inst_hermes"].GroupsObserved; got != 2 {
 		t.Errorf("groupsObserved = %d, want the last snapshot's total", got)
 	}
-	if got := repo.groupSyncError["inst_1"]; got == "" {
+	if got := repo.groupSyncError["inst_hermes"]; got == "" {
 		t.Error("a refused sync must record why it failed")
 	}
 	if got := stats.count(); got != 0 {
@@ -309,37 +84,15 @@ func TestGroupSyncRecordsTheGroupsAPassObserved(t *testing.T) {
 	}
 }
 
-func TestMediaJanitorIsInertWhenMediaIsDisabled(t *testing.T) {
-	mgr := testManagerWithDeps(newFakeGroupStore(), nil, nil)
-	ticker := newManualTicker()
-	mgr.newTicker = ticker.new
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { defer close(done); mgr.runMediaJanitor(ctx) }()
-	// With no media runner the loop returns immediately rather than ticking.
-	waitFor(t, "the janitor to return when media is disabled", func() bool {
-		select {
-		case <-done:
-			return true
-		default:
-			return false
-		}
-	})
-	cancel()
-}
-
 // A tick has to reach the operator, not just the work: this is the wiring the
 // console reads, and a refactor that kept syncing without recording would leave
 // /scheduler claiming the loop never ran.
 func TestGroupSyncSchedulerRecordsThePassItRan(t *testing.T) {
-	client := newFakeClient()
+	bridge := newFakeBridge(t).answering(http.StatusOK, groupsAnswer())
 	mgr := testManagerWithDeps(newFakeGroupStore(), nil, nil)
+	mgr.bridge = bridge.client(t)
 	ticker := newManualTicker()
 	mgr.newTicker = ticker.new
-	s := testSession(mgr, client)
-	s.status = stateConnected
-	mgr.put(s)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -372,5 +125,31 @@ func TestGroupSyncSchedulerRecordsThePassItRan(t *testing.T) {
 	}
 	if got.LastError != "" {
 		t.Fatalf("last error = %q, want a clean pass", got.LastError)
+	}
+}
+
+// A clean pass must actually clear the ticker it registered: a loop that left its
+// ticker running would keep firing after shutdown.
+func TestGroupSyncSchedulerStopsItsTickerOnExit(t *testing.T) {
+	bridge := newFakeBridge(t).answering(http.StatusOK, groupsAnswer())
+	mgr := testManagerWithDeps(newFakeGroupStore(), nil, nil)
+	mgr.bridge = bridge.client(t)
+	ticker := newManualTicker()
+	mgr.newTicker = ticker.new
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); mgr.runGroupSyncScheduler(ctx) }()
+	waitFor(t, "the scheduler to stop", func() bool {
+		cancel()
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
+	})
+	if !ticker.stopped() {
+		t.Error("the scheduler left its ticker running")
 	}
 }

@@ -1,5 +1,6 @@
 import type { Db } from "mongodb";
 import { COLLECTIONS } from "../collections";
+import { newId } from "../ids";
 
 /**
  * The `runtime.groupSync` summary of §5.1, as the dashboard shows it: what the
@@ -25,6 +26,9 @@ export type InstanceDoc = {
   _id: string;
   organizationId: string;
   label?: string;
+  /** How this account was linked. Hermes pairs by QR only. */
+  mode?: string;
+  createdAt?: Date;
   /**
    * Set by the worker when an instance is removed (`manager.go`), which keeps the
    * row because the captured history and the audit trail still point at it. Every
@@ -33,6 +37,17 @@ export type InstanceDoc = {
   deletedAt?: Date | null;
   runtime?: {
     status?: string;
+    /**
+     * The identity the account was linked as. The pairing snapshot answers these
+     * verbatim — they are the fields the console shows on the connected screen —
+     * so they are read here rather than derived.
+     */
+    phoneNumber?: string;
+    botJid?: string;
+    botLid?: string;
+    pairingError?: string | null;
+    connectedAt?: Date;
+    lastSeenAt?: Date;
     groupSync?: {
       groupsObserved?: number;
       groupsLeft?: number;
@@ -45,7 +60,12 @@ export type InstanceDoc = {
 /** Go's zero `time.Time`; the worker writes it for a stamp it never set. */
 const NO_STAMP_MS = new Date("0001-01-01T00:00:00Z").getTime();
 
-function stamp(value: Date | undefined): string | null {
+/**
+ * A stored stamp as ISO, or `null` when it was never set. Exported because the
+ * pairing snapshot answers the same identity stamps the row holds, and a second
+ * conversion there would be a second answer to "was this ever set".
+ */
+export function stampIso(value: Date | undefined): string | null {
   if (!(value instanceof Date)) return null;
   const time = value.getTime();
   return Number.isFinite(time) && time > NO_STAMP_MS ? value.toISOString() : null;
@@ -56,7 +76,7 @@ function groupSyncOf(runtime: InstanceDoc["runtime"]): InstanceGroupSync {
   return {
     groupsObserved: sync?.groupsObserved ?? 0,
     groupsLeft: sync?.groupsLeft ?? 0,
-    lastSyncAt: stamp(sync?.lastSyncAt),
+    lastSyncAt: stampIso(sync?.lastSyncAt),
     lastError: sync?.lastError ?? null,
   };
 }
@@ -99,6 +119,44 @@ export async function getInstanceRuntime(
     .findOne({ _id: instanceId, organizationId, deletedAt: null });
   if (!doc) return null;
   return { status: doc.runtime?.status ?? "disconnected", groupSync: groupSyncOf(doc.runtime) };
+}
+
+/**
+ * One stored instance document, or `null` when it is unknown or removed. The
+ * pairing routes need the row itself — label, mode, createdAt and the last
+ * recorded runtime — because they answer with a whole `InstanceSnapshot` and must
+ * fill the fields the live pairing does not speak for.
+ */
+export async function getInstanceDoc(db: Db, organizationId: string, instanceId: string): Promise<InstanceDoc | null> {
+  return db.collection<InstanceDoc>(COLLECTIONS.instances).findOne({ _id: instanceId, organizationId, deletedAt: null });
+}
+
+/**
+ * The row for a newly created instance, stamped `disconnected` until a pairing
+ * connects it.
+ *
+ * The BFF writes this itself: the worker used to, because it owned the device
+ * the row described, and it no longer holds one. What is left is the console's
+ * own data — a label, a mode, and the tenant it belongs to — which is the BFF's
+ * to write, with the session to be filled in later by whichever agent pairs.
+ */
+export async function createInstance(
+  db: Db,
+  organizationId: string,
+  input: { label: string; mode: string },
+): Promise<InstanceDoc> {
+  const now = new Date();
+  const doc: InstanceDoc = {
+    _id: newId(),
+    organizationId,
+    label: input.label,
+    mode: input.mode,
+    runtime: { status: "disconnected" },
+    deletedAt: null,
+    createdAt: now,
+  };
+  await db.collection<InstanceDoc>(COLLECTIONS.instances).insertOne(doc);
+  return doc;
 }
 
 /**

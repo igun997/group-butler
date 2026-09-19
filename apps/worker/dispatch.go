@@ -7,8 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/types"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -244,48 +242,47 @@ func (d *sendDispatcher) failed(ctx context.Context, id, class string, cause err
 	return nil
 }
 
-var errDispatchInstanceOffline = errors.New("send instance is not connected")
-
-// sendText performs one send through a live session. `quote` names the message
-// this send answers — the dispatcher resolved it from the request's provenance
-// and the stored message — and the zero value sends the plain text the request
-// asks for.
+// sendText performs one send through the Hermes bridge, which owns the WhatsApp
+// connection now. `quote` names the message this send answers — the dispatcher
+// resolved it from the request's provenance and the stored message — and the zero
+// value sends the plain text the request asks for.
+//
+// The id this returns is the one the bridge's send assigned: the worker no longer
+// chooses it, because the process that holds the socket is the one that knows what
+// WhatsApp accepted.
 func (m *manager) sendText(ctx context.Context, request dispatchRequest, quote quotedMessage) (string, error) {
-	session := m.get(request.InstanceID)
-	if session == nil || session.snapshot().Status != stateConnected {
-		return "", errDispatchInstanceOffline
-	}
-	to, message, err := buildTextEnvelope(outboundText{
-		ID: request.ID, GroupJID: request.GroupJID, ChatKind: request.ChatKind, Text: request.Text,
-		Quote: quote,
+	send, err := buildOutboundSend(outboundText{
+		GroupJID: request.GroupJID, ChatKind: request.ChatKind, Text: request.Text, Quote: quote,
 	})
 	if err != nil {
 		return "", err
 	}
-	_ = session.client.SendChatPresence(ctx, to, types.ChatPresenceComposing, types.ChatPresenceMediaText)
-	defer func() {
-		_ = session.client.SendChatPresence(context.WithoutCancel(ctx), to, types.ChatPresencePaused, types.ChatPresenceMediaText)
-	}()
-	response, err := session.client.SendMessage(ctx, to, message, whatsmeow.SendRequestExtra{ID: types.MessageID(request.ID)})
-	if err != nil {
-		return "", err
+	if m.bridge == nil {
+		return "", errNoBridge
 	}
-	if response.ID == "" {
-		return "", errors.New("whatsapp acknowledged send without a message id")
-	}
-	return string(response.ID), nil
+	return m.bridge.SendText(ctx, send.ChatID, send.Text, send.Reply)
 }
 
+// classifySendFailure decides whether a failed send may be retried, which is the
+// one thing the console's retry button acts on. Only the failures that cannot have
+// reached WhatsApp are `rejected`; everything else is `ambiguous`, because a
+// delivery that may have happened is not one a retry may double-post.
 func classifySendFailure(err error) string {
-	// Both of these are decided before anything reaches WhatsApp: an offline
-	// instance, and a request whose quoted message the worker does not hold.
-	// Neither can have been delivered, so a later approval may safely retry
-	// them.
-	if errors.Is(err, errDispatchInstanceOffline) || errors.Is(err, errQuoteTargetUnavailable) {
+	// Decided before anything was handed over: a request whose quoted message the
+	// worker does not hold, and a bridge that refused the call outright — it is not
+	// there, or its WhatsApp session is down. Nothing can have been sent.
+	if errors.Is(err, errQuoteTargetUnavailable) || errors.Is(err, errBridgeNotConnected) {
 		return "rejected"
 	}
-	// An error after SendMessage begins may mean WhatsApp accepted the request but
-	// its acknowledgement was lost. Retrying would double-post; a new approval is
-	// the only safe recovery path.
+	// A call that timed out is the one case the worker cannot reason about: the
+	// bridge was up, the send went out, and no acknowledgement came back. It may
+	// have been delivered, so a new approval is the only safe recovery path.
+	if errors.Is(err, errBridgeTimeout) {
+		return "ambiguous"
+	}
+	// A connection this worker could not even open is the same as a refusal.
+	if errors.Is(err, errBridgeUnreachable) || errors.Is(err, errNoBridge) {
+		return "rejected"
+	}
 	return "ambiguous"
 }

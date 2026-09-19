@@ -11,13 +11,9 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"strings"
 	"time"
 	"unicode/utf8"
-
-	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/proto/waE2E"
 )
 
 const (
@@ -87,19 +83,14 @@ type MediaDescriptor struct {
 	MessageID    string
 	GroupJID     string
 	ViewOnce     bool
-
-	// Node is the protobuf media node the authenticated download request is
-	// built from: it carries the direct path, media key and hashes WhatsApp
-	// encrypts the attachment with. The pipeline passes it through untouched and
-	// never reads it; a descriptor that was not built from a message has none.
-	Node whatsmeow.DownloadableMessage
 }
 
 // mediaDownloader streams one attachment. Nothing here materialises the whole
 // thing: the pipeline copies the stream itself under MEDIA_MAX_BYTES and aborts
-// at the cap, and the production implementation (whatsmeowDownloader) writes
-// the ciphertext into a capped scratch file, so neither side can hold an
-// attachment larger than the cap (§6.3.2).
+// at the cap, so neither side can hold an attachment larger than the cap
+// (§6.3.2). The only implementation is the Hermes cache file reader
+// (externalFileDownloader): the bridge downloads the bytes, and this worker
+// stores them.
 //
 // The returned reader belongs to the caller, which must close it: closing is
 // what releases a downloader's scratch space. The MIME is deliberately not part
@@ -405,42 +396,19 @@ func classifyDownloadFailure(err error) (MediaStatus, string) {
 }
 
 // permanentDownloadReason names the failures no retry can change; it returns ""
-// for a transient one. The whatsmeow sentinels are matched as values rather than
-// by message text, so the mapping cannot drift when the library rewords one.
+// for a transient one.
+//
+// The one terminal failure the pipeline can produce itself is the size cap: the
+// bytes were too large to store, and fetching them again would fetch the same
+// bytes. Everything else is read off the error, because the downloader is a
+// local file reader (external_ingest.go) whose errors have no structured form.
 func permanentDownloadReason(err error) string {
-	switch {
-	case errors.Is(err, errMediaTooLarge):
+	if errors.Is(err, errMediaTooLarge) {
 		return reasonTooLarge
-	case errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403),
-		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404),
-		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410),
-		errors.Is(err, whatsmeow.ErrMediaNotAvailableOnPhone):
-		// The media host no longer has the object: expired, revoked, or a
-		// view-once that was consumed somewhere else.
-		return reasonExpired
-	case errors.Is(err, whatsmeow.ErrNothingDownloadableFound),
-		errors.Is(err, whatsmeow.ErrNoURLPresent),
-		errors.Is(err, whatsmeow.ErrUnknownMediaType):
-		// The node itself carries nothing fetchable.
-		return reasonUnsupportedType
-	case errors.Is(err, whatsmeow.ErrInvalidMediaHMAC),
-		errors.Is(err, whatsmeow.ErrInvalidMediaEncSHA256),
-		errors.Is(err, whatsmeow.ErrInvalidMediaSHA256),
-		errors.Is(err, whatsmeow.ErrFileLengthMismatch),
-		errors.Is(err, whatsmeow.ErrTooShortFile):
-		// Bytes arrived but do not match the hashes the message declared.
-		return reasonDownloadFailed
 	}
 	if isTransientMediaError(err) {
 		return ""
 	}
-	var httpErr whatsmeow.DownloadHTTPError
-	if errors.As(err, &httpErr) {
-		// Any other status the media host answered with.
-		return reasonExpired
-	}
-	// Whatever downloader is in use (a test, or a wrapper that re-words a
-	// refusal) still has to land inside the §5.1 vocabulary.
 	msg := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(msg, "view once"), strings.Contains(msg, "viewonce"):
@@ -462,11 +430,6 @@ func isTransientMediaError(err error) bool {
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled),
 		errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, io.EOF):
 		return true
-	}
-	var httpErr whatsmeow.DownloadHTTPError
-	if errors.As(err, &httpErr) {
-		// Back-pressure from the media host, not a verdict about the object.
-		return httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode >= 500
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) {
@@ -754,63 +717,4 @@ func copyCapped(dst io.Writer, src io.Reader, max int64) (int64, error) {
 		return n, errMediaTooLarge
 	}
 	return n, nil
-}
-
-// describeMedia turns the media node of one message into the descriptor the
-// pipeline works from, mapping every downloadable variant to the type WhatsApp
-// declared for it (§6.3.1). It reports false when the node holds nothing
-// downloadable — text, a location, a poll — which keeps `media.status:"none"`.
-// The message id and group JID belong to the event, so the caller adds them.
-//
-// Kind here is what the parser can know before the bytes exist; the pipeline
-// replaces it with the kind the stored bytes prove, keeping this value in
-// `declaredType` (§6.3.4).
-func describeMedia(msg *waE2E.Message) (MediaDescriptor, bool) {
-	inner, viewOnce := unwrapMessage(msg)
-	if inner == nil {
-		return MediaDescriptor{}, false
-	}
-	_, mediaKind, declared := classifyKind(inner)
-	if mediaKind == "" {
-		return MediaDescriptor{}, false
-	}
-	desc := MediaDescriptor{Kind: mediaKind, DeclaredType: declared, ViewOnce: viewOnce}
-	switch mediaKind {
-	case KindPtv:
-		if m := inner.GetPtvMessage(); m != nil {
-			desc.Node = m
-			desc.Mime, desc.Size, desc.ViewOnce = m.GetMimetype(), int64(m.GetFileLength()), desc.ViewOnce || m.GetViewOnce()
-		}
-	case KindVideo:
-		if m := inner.GetVideoMessage(); m != nil {
-			desc.Node = m
-			desc.Mime, desc.Size, desc.ViewOnce = m.GetMimetype(), int64(m.GetFileLength()), desc.ViewOnce || m.GetViewOnce()
-		}
-	case KindImage:
-		if m := inner.GetImageMessage(); m != nil {
-			desc.Node = m
-			desc.Mime, desc.Size, desc.ViewOnce = m.GetMimetype(), int64(m.GetFileLength()), desc.ViewOnce || m.GetViewOnce()
-		}
-	case KindAudio:
-		if m := inner.GetAudioMessage(); m != nil {
-			desc.Node = m
-			desc.Mime, desc.Size = m.GetMimetype(), int64(m.GetFileLength())
-		}
-	case KindDocument:
-		if m := inner.GetDocumentMessage(); m != nil {
-			desc.Node = m
-			desc.Mime, desc.FileName, desc.Size = m.GetMimetype(), m.GetFileName(), int64(m.GetFileLength())
-		}
-	case KindSticker:
-		if m := inner.GetStickerMessage(); m != nil {
-			desc.Node = m
-			desc.Mime, desc.Size = m.GetMimetype(), int64(m.GetFileLength())
-		}
-	}
-	if desc.ViewOnce && desc.DeclaredType != declaredViewOnce {
-		// A view-once node is declared as the wrapper, not as the image or video
-		// it wraps; the dashboard filters on exactly that value (§6.3.1).
-		desc.DeclaredType = declaredViewOnce
-	}
-	return desc, true
 }
