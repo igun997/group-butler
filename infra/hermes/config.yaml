@@ -282,6 +282,9 @@ dashboard:
   public_url: ''
 privacy:
   redact_pii: false
+video_gen:
+  provider: fal
+  use_gateway: false
 tts:
   provider: edge
   edge:
