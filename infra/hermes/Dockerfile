@@ -11,9 +11,9 @@
 # bump fails the build here instead of shipping an unpatched bridge to production.
 FROM nousresearch/hermes-agent:v2026.6.5 AS production
 
-# The patcher and the two snippets it splices in. `node` ships in the base image,
-# so this needs nothing installed.
-COPY patch-bridge.mjs bridge-archive-forwarder.js bridge-group-actions.js /tmp/bridge-patch/
+# The bridge patch, the Python adapter compatibility patch, and the two bridge
+# snippets they splice into the pinned Hermes release.
+COPY patch-bridge.mjs patch-whatsapp.mjs bridge-archive-forwarder.js bridge-group-actions.js /tmp/bridge-patch/
 
 # Read the shipped bridge, write the patched one beside it, prove it parses, and
 # only then put it in place — so a broken patch can never become the file the
@@ -23,7 +23,11 @@ RUN set -eu; \
     node /tmp/bridge-patch/patch-bridge.mjs "$BRIDGE" /tmp/bridge-patch/bridge.patched.js; \
     node --check /tmp/bridge-patch/bridge.patched.js; \
     mv /tmp/bridge-patch/bridge.patched.js "$BRIDGE"; \
-    chmod 0644 "$BRIDGE"; \
+    WHATSAPP=/opt/hermes/gateway/platforms/whatsapp.py; \
+    node /tmp/bridge-patch/patch-whatsapp.mjs "$WHATSAPP" /tmp/bridge-patch/whatsapp.patched.py; \
+    python -m py_compile /tmp/bridge-patch/whatsapp.patched.py; \
+    mv /tmp/bridge-patch/whatsapp.patched.py "$WHATSAPP"; \
+    chmod 0644 "$BRIDGE" "$WHATSAPP"; \
     rm -rf /tmp/bridge-patch
 
 # The pairing/status service. Started by the container's command rather than

@@ -13,6 +13,11 @@ providers:
 fallback_providers: []
 credential_pool_strategies: {}
 toolsets: []
+platform_toolsets:
+  whatsapp:
+    # Keep Hermes's evolving WhatsApp defaults, plus the opt-in video generator.
+    - hermes-whatsapp
+    - video_gen
 agent:
   max_turns: 90
   gateway_timeout: 1800
