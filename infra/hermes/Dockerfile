@@ -42,6 +42,14 @@ COPY butler-start.sh /opt/hermes/docker/butler-start.sh
 RUN chmod 0755 /opt/hermes/docker/butler-start.sh
 COPY pairing-service.mjs /opt/hermes/docker/butler-pairing.mjs
 
+# Bake document generators into the image; runtime installs disappear on deploy.
+COPY verify-document-runtime.py /tmp/verify-document-runtime.py
+RUN uv pip install --python /opt/hermes/.venv/bin/python --no-cache \
+        python-docx==1.2.0 \
+        reportlab==5.0.1 && \
+    /opt/hermes/.venv/bin/python /tmp/verify-document-runtime.py && \
+    rm /tmp/verify-document-runtime.py
+
 # The bridge's dependencies, installed at build time. The pairing wizard installs
 # them on first use otherwise, which takes minutes during which it prints nothing --
 # so a fresh volume looks exactly like a hang, on the one screen where the operator
