@@ -280,8 +280,12 @@ dashboard:
   public_url: ''
 privacy:
   redact_pii: false
+image_gen:
+  provider: fal
+  model: fal-ai/gpt-image-2
 video_gen:
   provider: fal
+  model: seedance-2.0
   use_gateway: false
 tts:
   provider: edge
